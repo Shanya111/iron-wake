@@ -1,0 +1,50 @@
+# Секреты — никогда не коммитить
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+*.spec
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
+ENV/
+
+# Pytest / покрытие
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Логи
+*.log
+logs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+desktop.ini
