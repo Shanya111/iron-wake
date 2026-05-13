@@ -8,6 +8,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -73,10 +74,13 @@ def start_keyboard() -> InlineKeyboardMarkup:
 
 
 def direction_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="Выше порога", callback_data="alert_dir_above"),
-        InlineKeyboardButton(text="Ниже порога", callback_data="alert_dir_below"),
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Выше порога", callback_data="alert_dir_above"),
+            InlineKeyboardButton(text="Ниже порога", callback_data="alert_dir_below"),
+        ],
+        [InlineKeyboardButton(text="Отмена", callback_data="alert_dir_cancel")],
+    ])
 
 
 def confirm_keyboard() -> InlineKeyboardMarkup:
@@ -267,6 +271,13 @@ async def alert_direction_text(message: Message):
     )
 
 
+@dp.callback_query(F.data == "alert_dir_cancel", StateFilter(AlertStates.waiting_direction))
+async def alert_direction_cancel_cb(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("Настройка алерта отменена.", reply_markup=start_keyboard())
+    await call.answer()
+
+
 @dp.callback_query(F.data.in_({"alert_dir_above", "alert_dir_below"}), StateFilter(AlertStates.waiting_direction))
 async def alert_direction_cb(call: CallbackQuery, state: FSMContext):
     direction = "выше" if call.data == "alert_dir_above" else "ниже"
@@ -317,6 +328,12 @@ async def echo(message: Message):
 
 
 async def main():
+    await bot.set_my_commands([
+        BotCommand(command="start",  description="Главное меню"),
+        BotCommand(command="alert",  description="Настроить алерт"),
+        BotCommand(command="cancel", description="Отмена"),
+        BotCommand(command="help",   description="Помощь"),
+    ])
     await dp.start_polling(bot)
 
 
