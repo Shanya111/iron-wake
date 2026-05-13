@@ -3,7 +3,10 @@ import os
 import random
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -15,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 # Заметки хранятся в памяти: {user_id: [список строк]}
 notes: dict[int, list[str]] = {}
@@ -48,6 +51,12 @@ JOKES = [
 ]
 
 
+class AlertStates(StatesGroup):
+    waiting_rate = State()
+    waiting_direction = State()
+    waiting_confirm = State()
+
+
 def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -61,6 +70,20 @@ def start_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Помощь", callback_data="help"),
         ],
     ])
+
+
+def direction_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Выше порога", callback_data="alert_dir_above"),
+        InlineKeyboardButton(text="Ниже порога", callback_data="alert_dir_below"),
+    ]])
+
+
+def confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Сохранить", callback_data="alert_save"),
+        InlineKeyboardButton(text="Отмена", callback_data="alert_cancel"),
+    ]])
 
 
 @dp.message(CommandStart())
@@ -78,6 +101,8 @@ async def cmd_help(message: Message):
         "/start — главное меню\n"
         "/help — эта справка\n"
         "/about — о боте\n"
+        "/alert — настроить алерт по курсу USD/JPY\n"
+        "/cancel — отменить текущий сценарий\n"
         "/quote — цитата трейдера\n"
         "/tip — торговый совет\n"
         "/joke — шутка про трейдинг\n"
@@ -191,6 +216,8 @@ async def cb_help(call: CallbackQuery):
         "/start — главное меню\n"
         "/help — эта справка\n"
         "/about — о боте\n"
+        "/alert — настроить алерт по курсу USD/JPY\n"
+        "/cancel — отменить текущий сценарий\n"
         "/quote — цитата трейдера\n"
         "/tip — торговый совет\n"
         "/joke — шутка про трейдинг\n"
@@ -201,7 +228,90 @@ async def cb_help(call: CallbackQuery):
     await call.answer()
 
 
-@dp.message(F.text)
+# ── Сценарий /alert ────────────────────────────────────────────────────────────
+
+@dp.message(Command("alert"))
+async def cmd_alert(message: Message, state: FSMContext):
+    await state.set_state(AlertStates.waiting_rate)
+    await message.answer("Введи пороговый курс USD/JPY (например: 155.00):")
+
+
+@dp.message(Command("cancel"), StateFilter(AlertStates))
+async def cmd_cancel(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Настройка алерта отменена.", reply_markup=start_keyboard())
+
+
+@dp.message(AlertStates.waiting_rate)
+async def alert_rate_input(message: Message, state: FSMContext):
+    try:
+        rate = float(message.text.replace(",", "."))
+        if rate <= 0:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await message.answer("Введи корректное число, например 155.00:")
+        return
+    await state.update_data(rate=rate)
+    await state.set_state(AlertStates.waiting_direction)
+    await message.answer(
+        f"Пороговый курс: {rate:.2f}\n\nУведомить когда курс...",
+        reply_markup=direction_keyboard(),
+    )
+
+
+@dp.message(AlertStates.waiting_direction)
+async def alert_direction_text(message: Message):
+    await message.answer(
+        "Нажми одну из кнопок:",
+        reply_markup=direction_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.in_({"alert_dir_above", "alert_dir_below"}), StateFilter(AlertStates.waiting_direction))
+async def alert_direction_cb(call: CallbackQuery, state: FSMContext):
+    direction = "выше" if call.data == "alert_dir_above" else "ниже"
+    data = await state.get_data()
+    await state.update_data(direction=direction)
+    await state.set_state(AlertStates.waiting_confirm)
+    await call.message.answer(
+        f"Алерт — USD/JPY {direction} {data['rate']:.2f}\n\nСохранить?",
+        reply_markup=confirm_keyboard(),
+    )
+    await call.answer()
+
+
+@dp.message(AlertStates.waiting_confirm)
+async def alert_confirm_text(message: Message):
+    await message.answer(
+        "Нажми одну из кнопок:",
+        reply_markup=confirm_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "alert_save", StateFilter(AlertStates.waiting_confirm))
+async def alert_save_cb(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    rate = data["rate"]
+    direction = data["direction"]
+    await state.clear()
+    print(f"Новый алерт: {rate:.2f} {direction}")
+    await call.message.answer(
+        f"Алерт сохранён!\nУведомлю когда USD/JPY {direction} {rate:.2f}",
+        reply_markup=start_keyboard(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "alert_cancel", StateFilter(AlertStates.waiting_confirm))
+async def alert_cancel_cb(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("Настройка алерта отменена.", reply_markup=start_keyboard())
+    await call.answer()
+
+
+# ── Эхо (только вне FSM-сценариев) ───────────────────────────────────────────
+
+@dp.message(F.text, StateFilter(None))
 async def echo(message: Message):
     await message.answer(message.text)
 
