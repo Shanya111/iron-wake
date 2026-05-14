@@ -1,7 +1,9 @@
 import asyncio
 import os
 import random
+from pathlib import Path
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -19,6 +21,34 @@ from dotenv import load_dotenv
 import database
 
 load_dotenv()
+
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
+OPENROUTER_MODEL = "deepseek/deepseek-v4-flash:free"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# Читаем системный промпт один раз при загрузке модуля
+_prompt_path = Path(__file__).parent / "system_prompt.md"
+SYSTEM_PROMPT = _prompt_path.read_text(encoding="utf-8") if _prompt_path.exists() else ""
+
+
+async def ask_openrouter(user_text: str) -> str:
+    """Отправляет запрос в OpenRouter и возвращает ответ модели."""
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_text},
+        ],
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data["choices"][0]["message"]["content"]
 
 bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
 dp = Dispatcher(storage=MemoryStorage())
@@ -323,11 +353,18 @@ async def alert_cancel_cb(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-# ── Эхо (только вне FSM-сценариев) ───────────────────────────────────────────
+# ── Свободный текст → OpenRouter (только вне FSM-сценариев) ──────────────────
 
 @dp.message(F.text, StateFilter(None))
-async def echo(message: Message):
-    await message.answer(message.text)
+async def free_text(message: Message):
+    thinking = await message.answer("Думаю...")
+    try:
+        reply = await ask_openrouter(message.text)
+        await thinking.delete()
+        await message.answer(reply)
+    except Exception:
+        await thinking.delete()
+        await message.answer("Не получилось ответить, попробуй через минуту")
 
 
 async def main():

@@ -7,20 +7,23 @@ Telegram-бот для мониторинга валютной пары USD/JPY.
 - Отслеживает зоны маржинальности
 - Уведомляет в Telegram когда происходит значимое движение
 
-## Стек (планируемый)
-- Python
-- Telegram Bot API (библиотека python-telegram-bot)
-- Источник данных — решается позже (возможно ccxt или yfinance)
+## Стек
+- Python + aiogram 3 (FSM, inline-кнопки)
+- SQLite через database.py
+- OpenRouter API → модель `deepseek/deepseek-v4-flash:free` — обработка свободного текста
+- Источник рыночных данных — решается позже (возможно ccxt или yfinance)
 
 ## Структура файлов
 
 ```
 iron-wake/
-├── bot.py          — точка входа, все обработчики aiogram, FSM-сценарии
-├── database.py     — работа с SQLite: init_db(), upsert_alert()
-├── bot.db          — SQLite-база данных (в .gitignore, создаётся автоматически)
-├── схема.md        — схема текущего функционала бота
-└── схема-алерт.md  — схема FSM-сценария /alert
+├── bot.py           — точка входа, все обработчики aiogram, FSM-сценарии, вызов OpenRouter
+├── database.py      — работа с SQLite: init_db(), upsert_alert()
+├── bot.db           — SQLite-база данных (в .gitignore, создаётся автоматически)
+├── system_prompt.md — системный промпт для LLM (читается при старте бота)
+├── .env             — секреты: TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY
+├── схема.md         — схема текущего функционала бота
+└── схема-алерт.md   — схема FSM-сценария /alert
 ```
 
 ### Таблица `alerts` (bot.db)
@@ -39,6 +42,52 @@ iron-wake/
 - Простой и читаемый код — всё должно быть понятно без знания Python
 - Модульная структура — легко добавлять новые пары и метрики
 - Комментарии на русском
+
+## LLM-интеграция
+
+Свободный текст пользователя (всё что не команда и не кнопка) обрабатывается через **OpenRouter**.
+
+| Параметр | Значение |
+|---|---|
+| Провайдер | [OpenRouter](https://openrouter.ai) |
+| Модель | `deepseek/deepseek-v4-flash:free` |
+| Системный промпт | `system_prompt.md` (читается при старте) |
+| Переменная окружения | `OPENROUTER_API_KEY` в `.env` |
+| Таймаут | 30 секунд |
+
+Логика в `bot.py`: функция `ask_openrouter()` делает POST на `https://openrouter.ai/api/v1/chat/completions`. Пока модель думает — пользователю приходит «Думаю...», которое удаляется после ответа. При ошибке — «Не получилось ответить, попробуй через минуту».
+
+### Маршрутизация сообщений
+
+```mermaid
+flowchart TD
+    U(["Пользователь пишет в бот"])
+
+    U --> TYPE{Тип сообщения}
+
+    TYPE -->|"Команда (/start, /alert...)"| CMD["Обработчик команды\n(aiogram router)"]
+    TYPE -->|"Нажатие inline-кнопки"| CB["Обработчик callback_query\n(aiogram router)"]
+    TYPE -->|"Свободный текст\n(вне FSM)"| THINK["Бот: «Думаю...»"]
+
+    CMD --> FSM["FSM-сценарий\nили прямой ответ"]
+    CB --> FSM
+
+    THINK --> OR[("OpenRouter API\ndeepseek/deepseek-v4-flash:free")]
+    OR --> SYS["system_prompt.md\n(системный промпт)"]
+    SYS --> OR
+    OR -->|"Ответ получен"| DEL["Удалить «Думаю...»"]
+    OR -->|"Ошибка / таймаут"| ERR["«Не получилось ответить,\nпопробуй через минуту»"]
+    DEL --> REPLY["Бот: ответ модели"]
+
+    FSM:::bot
+    REPLY:::bot
+    ERR:::err
+    OR:::llm
+
+    classDef bot fill:#e4f9e8,stroke:#27ae60,color:#333
+    classDef err fill:#f9e4e4,stroke:#c0392b,color:#333
+    classDef llm fill:#f0e8ff,stroke:#8e44ad,color:#333
+```
 
 ## Архитектура
 
