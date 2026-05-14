@@ -16,6 +16,8 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+import database
+
 load_dotenv()
 
 bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
@@ -305,6 +307,7 @@ async def alert_save_cb(call: CallbackQuery, state: FSMContext):
     rate = data["rate"]
     direction = data["direction"]
     await state.clear()
+    database.upsert_alert(call.from_user.id, rate, direction)
     print(f"Новый алерт: {rate:.2f} {direction}")
     await call.message.answer(
         f"Алерт сохранён!\nУведомлю когда USD/JPY {direction} {rate:.2f}",
@@ -328,6 +331,7 @@ async def echo(message: Message):
 
 
 async def main():
+    database.init_db()
     await bot.set_my_commands([
         BotCommand(command="start",  description="Главное меню"),
         BotCommand(command="alert",  description="Настроить алерт"),

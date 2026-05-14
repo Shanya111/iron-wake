@@ -12,6 +12,29 @@ Telegram-бот для мониторинга валютной пары USD/JPY.
 - Telegram Bot API (библиотека python-telegram-bot)
 - Источник данных — решается позже (возможно ccxt или yfinance)
 
+## Структура файлов
+
+```
+iron-wake/
+├── bot.py          — точка входа, все обработчики aiogram, FSM-сценарии
+├── database.py     — работа с SQLite: init_db(), upsert_alert()
+├── bot.db          — SQLite-база данных (в .gitignore, создаётся автоматически)
+├── схема.md        — схема текущего функционала бота
+└── схема-алерт.md  — схема FSM-сценария /alert
+```
+
+### Таблица `alerts` (bot.db)
+
+| Поле | Тип | Описание |
+|---|---|---|
+| id | INTEGER PK | Автоинкремент |
+| user_id | INTEGER UNIQUE | Telegram ID пользователя |
+| threshold | REAL | Пороговый курс USD/JPY |
+| direction | TEXT | «выше» или «ниже» |
+| created_at | TEXT | Дата и время сохранения (ISO 8601) |
+
+Один пользователь — один алерт. При повторном сохранении запись обновляется.
+
 ## Принципы
 - Простой и читаемый код — всё должно быть понятно без знания Python
 - Модульная структура — легко добавлять новые пары и метрики
@@ -58,16 +81,20 @@ flowchart TD
     CONFIRM --> INPUT_CONFIRM{Пользователь вводит...}
 
     INPUT_CONFIRM -->|"/cancel"| CANCELLED
-    INPUT_CONFIRM -->|кнопка «Сохранить»| SAVED["Бот: Алерт сохранён!\nУведомлю когда USD/JPY {direction} {порог}"]
+    INPUT_CONFIRM -->|кнопка «Сохранить»| DB[("SQLite: alerts\nupsert_alert()")]
     INPUT_CONFIRM -->|кнопка «Отмена»| CANCELLED
     INPUT_CONFIRM -->|текст вместо кнопки| ERR_CONFIRM["Бот: Нажми одну из кнопок\n[ Сохранить ] [ Отмена ]"]
     ERR_CONFIRM --> INPUT_CONFIRM
 
+    DB --> SAVED["Бот: Алерт сохранён!\nУведомлю когда USD/JPY {direction} {порог}"]
+
     CANCELLED:::cancel
     SAVED:::success
+    DB:::db
 
     classDef cancel fill:#f9e4e4,stroke:#c0392b,color:#333
     classDef success fill:#e4f9e8,stroke:#27ae60,color:#333
+    classDef db fill:#e8f4fd,stroke:#2980b9,color:#333
 ```
 
 ### Планируемый функционал:
