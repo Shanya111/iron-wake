@@ -5,6 +5,7 @@ from pathlib import Path
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -25,6 +26,9 @@ load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_MODEL = "deepseek/deepseek-v4-flash:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+_admin_raw = os.getenv("ADMIN_ID", "")
+ADMIN_ID: int | None = int(_admin_raw) if _admin_raw.strip().isdigit() else None
 
 # Читаем системный промпт один раз при загрузке модуля
 _prompt_path = Path(__file__).parent / "system_prompt.md"
@@ -122,12 +126,43 @@ def confirm_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
+def consent_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Согласен ✅", callback_data="consent_yes"),
+        InlineKeyboardButton(text="Не согласен ❌", callback_data="consent_no"),
+    ]])
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
+    user = message.from_user
+    database.save_user(user.id, user.full_name)
     await message.answer(
-        f"Привет, {message.from_user.first_name}! Я iron-wake — бот для мониторинга USD/JPY.\n\nВыбери действие:",
+        f"Привет, {user.first_name}! Я iron-wake — бот для мониторинга USD/JPY.\n\nВыбери действие:",
         reply_markup=start_keyboard(),
     )
+    await message.answer(
+        "Этот бот сохраняет твой chat_id и настройки алертов для работы уведомлений. "
+        "Нажимая «Согласен», ты даёшь согласие на обработку этих данных. "
+        "Подробности — команда /privacy.",
+        reply_markup=consent_keyboard(),
+    )
+
+
+@dp.callback_query(F.data == "consent_yes")
+async def cb_consent_yes(call: CallbackQuery):
+    database.set_consent(call.from_user.id, 1)
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("Отлично, согласие записано. Можешь пользоваться ботом!")
+    await call.answer()
+
+
+@dp.callback_query(F.data == "consent_no")
+async def cb_consent_no(call: CallbackQuery):
+    database.set_consent(call.from_user.id, 0)
+    await call.message.edit_reply_markup(reply_markup=None)
+    await call.message.answer("Понял, уведомления отключены. Бот работает в базовом режиме.")
+    await call.answer()
 
 
 @dp.message(Command("help"))
@@ -137,6 +172,9 @@ async def cmd_help(message: Message):
         "/start — главное меню\n"
         "/help — эта справка\n"
         "/about — о боте\n"
+        "/privacy — политика конфиденциальности\n"
+        "/unsubscribe — отписаться от уведомлений\n"
+        "/myid — узнать свой Telegram ID\n"
         "/alert — настроить алерт по курсу USD/JPY\n"
         "/cancel — отменить текущий сценарий\n"
         "/quote — цитата трейдера\n"
@@ -156,6 +194,57 @@ async def cmd_about(message: Message):
         "уведомляет о значимых движениях рынка.\n\n"
         "Автор: Аким — вайбкодер, трейдер, термист."
     )
+
+
+@dp.message(Command("privacy"))
+async def cmd_privacy(message: Message):
+    await message.answer(
+        "Политика конфиденциальности: бот iron-wake собирает chat_id и настройки алертов "
+        "исключительно для отправки уведомлений о курсе USD/JPY. "
+        "Данные не передаются третьим лицам. "
+        "Для отключения — /unsubscribe."
+    )
+
+
+@dp.message(Command("unsubscribe"))
+async def cmd_unsubscribe(message: Message):
+    database.set_consent(message.from_user.id, 0)
+    await message.answer(
+        "Ты отписан от уведомлений. Данные сохранены, но рассылок не будет. Вернуться — /start."
+    )
+
+
+@dp.message(Command("myid"))
+async def cmd_myid(message: Message):
+    await message.answer(f"Твой Telegram ID: {message.from_user.id}")
+
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    if ADMIN_ID is None:
+        await message.answer("Нет доступа.")
+        return
+    if message.from_user.id != ADMIN_ID:
+        await message.answer("Нет доступа.")
+        return
+
+    text = message.text.removeprefix("/broadcast").strip()
+    if not text:
+        await message.answer("Укажи текст: /broadcast Ваше сообщение")
+        return
+
+    users = database.get_active_consented_users()
+    sent = 0
+    blocked = 0
+    for chat_id in users:
+        try:
+            await bot.send_message(chat_id, text)
+            sent += 1
+        except Exception:
+            database.mark_inactive(chat_id)
+            blocked += 1
+
+    await message.answer(f"Отправлено: {sent}, заблокировано: {blocked}")
 
 
 @dp.message(Command("quote"))
@@ -252,6 +341,9 @@ async def cb_help(call: CallbackQuery):
         "/start — главное меню\n"
         "/help — эта справка\n"
         "/about — о боте\n"
+        "/privacy — политика конфиденциальности\n"
+        "/unsubscribe — отписаться от уведомлений\n"
+        "/myid — узнать свой Telegram ID\n"
         "/alert — настроить алерт по курсу USD/JPY\n"
         "/cancel — отменить текущий сценарий\n"
         "/quote — цитата трейдера\n"
@@ -367,13 +459,61 @@ async def free_text(message: Message):
         await message.answer("Не получилось ответить, попробуй через минуту")
 
 
+async def check_alerts():
+    """Проверяет все активные алерты и уведомляет пользователей при срабатывании."""
+    try:
+        rate = database.get_usd_jpy_rate()
+    except Exception as e:
+        print(f"[check_alerts] ошибка получения курса: {e}")
+        return
+
+    print(f"[check_alerts] текущий курс USD/JPY = {rate}")
+
+    alerts = database.get_pending_alerts()
+    print(f"[check_alerts] активных алертов: {len(alerts)}")
+    for a in alerts:
+        print(f"  • user_id={a['user_id']}  порог={a['threshold']}  направление={a['direction']}")
+
+    for alert in alerts:
+        user_id = alert["user_id"]
+        threshold = alert["threshold"]
+        direction = alert["direction"]
+
+        triggered = (
+            (direction == "выше" and rate >= threshold) or
+            (direction == "ниже" and rate <= threshold)
+        )
+        if not triggered:
+            continue
+
+        print(f"  [!] СРАБОТАЛ: user_id={user_id}  {direction} {threshold}  курс={rate}")
+        database.mark_alert_triggered(user_id)
+        try:
+            await bot.send_message(
+                user_id,
+                f"🔔 Алерт сработал! USD/JPY = {rate}. "
+                f"Твой порог {threshold} ({direction}) пробит.",
+            )
+        except Exception as e:
+            print(f"[check_alerts] не удалось отправить {user_id}: {e}")
+
+
 async def main():
     database.init_db()
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(check_alerts, "interval", minutes=5)
+    scheduler.start()
+    await check_alerts()  # однократный прогон при старте для теста
+
     await bot.set_my_commands([
-        BotCommand(command="start",  description="Главное меню"),
-        BotCommand(command="alert",  description="Настроить алерт"),
-        BotCommand(command="cancel", description="Отмена"),
-        BotCommand(command="help",   description="Помощь"),
+        BotCommand(command="start",       description="Главное меню"),
+        BotCommand(command="alert",       description="Настроить алерт"),
+        BotCommand(command="cancel",      description="Отмена"),
+        BotCommand(command="help",        description="Помощь"),
+        BotCommand(command="privacy",     description="Политика конфиденциальности"),
+        BotCommand(command="unsubscribe", description="Отписаться от уведомлений"),
+        BotCommand(command="myid",        description="Узнать свой Telegram ID"),
     ])
     await dp.start_polling(bot)
 

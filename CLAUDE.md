@@ -3,25 +3,29 @@
 Telegram-бот для мониторинга валютной пары USD/JPY.
 
 ## Что делает
-- Следит за объёмами торгов по паре USD/JPY
-- Отслеживает зоны маржинальности
-- Уведомляет в Telegram когда происходит значимое движение
+- Следит за курсом USD/JPY через yfinance (тикер `USDJPY=X`)
+- Позволяет настроить алерт — уведомление когда курс пробьёт заданный порог
+- Уведомляет в Telegram первым (бот пишет пользователю сам)
+- Обрабатывает свободный текст через LLM
+- Поддерживает рассылку администратором по всем согласившимся пользователям
 
 ## Стек
 - Python + aiogram 3 (FSM, inline-кнопки)
 - SQLite через database.py
+- APScheduler (`AsyncIOScheduler`) — фоновая проверка алертов каждые 5 минут
+- yfinance — получение текущего курса USD/JPY (`USDJPY=X`)
 - OpenRouter API → модель `deepseek/deepseek-v4-flash:free` — обработка свободного текста
-- Источник рыночных данных — решается позже (возможно ccxt или yfinance)
 
 ## Структура файлов
 
 ```
 iron-wake/
-├── bot.py           — точка входа, все обработчики aiogram, FSM-сценарии, вызов OpenRouter
-├── database.py      — работа с SQLite: init_db(), upsert_alert()
+├── bot.py           — точка входа, все обработчики aiogram, FSM-сценарии, планировщик
+├── database.py      — работа с SQLite: init_db(), upsert_alert(), save_user() и др.
 ├── bot.db           — SQLite-база данных (в .gitignore, создаётся автоматически)
 ├── system_prompt.md — системный промпт для LLM (читается при старте бота)
-├── .env             — секреты: TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY
+├── .env             — секреты: TELEGRAM_BOT_TOKEN, OPENROUTER_API_KEY, ADMIN_ID
+├── .env.example     — пример переменных окружения (без значений)
 ├── схема.md         — схема текущего функционала бота
 └── схема-алерт.md   — схема FSM-сценария /alert
 ```
@@ -35,8 +39,22 @@ iron-wake/
 | threshold | REAL | Пороговый курс USD/JPY |
 | direction | TEXT | «выше» или «ниже» |
 | created_at | TEXT | Дата и время сохранения (ISO 8601) |
+| is_triggered | INTEGER DEFAULT 0 | 1 — алерт уже сработал, повторно не отправляется |
 
-Один пользователь — один алерт. При повторном сохранении запись обновляется.
+Один пользователь — один алерт. При повторном `/alert` запись обновляется, `is_triggered` сбрасывается в 0.
+
+### Таблица `users` (bot.db)
+
+| Поле | Тип | Описание |
+|---|---|---|
+| chat_id | INTEGER PK | Telegram chat_id пользователя |
+| user_name | TEXT | Отображаемое имя (full_name) |
+| joined_at | TEXT | Дата первого /start (ISO 8601) |
+| consent | INTEGER DEFAULT 0 | 1 — пользователь дал согласие на обработку данных |
+| consent_at | TEXT | Дата последнего изменения consent |
+| is_active | INTEGER DEFAULT 1 | 0 — бот заблокирован пользователем |
+
+Запись создаётся при каждом `/start`. При попытке отправить сообщение заблокировавшему пользователю — `is_active` ставится в 0.
 
 ## Принципы
 - Простой и читаемый код — всё должно быть понятно без знания Python
@@ -146,6 +164,85 @@ flowchart TD
     classDef db fill:#e8f4fd,stroke:#2980b9,color:#333
 ```
 
+### Система уведомлений (планировщик + рассылка)
+
+#### Проверка алертов — `check_alerts()`
+
+Запускается автоматически каждые **5 минут** через `AsyncIOScheduler` (APScheduler), а также один раз при старте бота.
+
+```mermaid
+flowchart TD
+    SCHED(["APScheduler\nкаждые 5 минут"])
+
+    SCHED --> GET_RATE["get_usd_jpy_rate()\nyfinance USDJPY=X"]
+    GET_RATE -->|ошибка| LOG_ERR["print: ошибка получения курса\n(пропуск итерации)"]
+    GET_RATE -->|курс получен| GET_ALERTS["get_pending_alerts()\nSELECT из alerts\nгде is_triggered = 0"]
+
+    GET_ALERTS --> FOR{Для каждого алерта}
+
+    FOR -->|direction=выше\nкурс >= threshold| TRIGGERED["mark_alert_triggered()\nis_triggered = 1"]
+    FOR -->|direction=ниже\nкурс <= threshold| TRIGGERED
+    FOR -->|не сработал| SKIP["Пропустить"]
+
+    TRIGGERED --> SEND["bot.send_message(user_id)\n«Алерт сработал! USD/JPY = ...\nТвой порог ... пробит.»"]
+    SEND -->|TelegramError| INACTIVE["mark_inactive(user_id)\nis_active = 0"]
+
+    TRIGGERED:::db
+    SEND:::bot
+    LOG_ERR:::err
+    INACTIVE:::err
+
+    classDef bot fill:#e4f9e8,stroke:#27ae60,color:#333
+    classDef err fill:#f9e4e4,stroke:#c0392b,color:#333
+    classDef db fill:#e8f4fd,stroke:#2980b9,color:#333
+```
+
+#### Управление согласием и рассылка
+
+| Команда | Кто | Что делает |
+|---|---|---|
+| `/start` | любой | `save_user()` + запрос согласия (inline-кнопки) |
+| `/privacy` | любой | Текст политики конфиденциальности |
+| `/unsubscribe` | любой | `set_consent(chat_id, 0)` — отключает уведомления |
+| `/myid` | любой | Отвечает своим `chat_id` (нужен для настройки `ADMIN_ID`) |
+| `/broadcast текст` | только ADMIN_ID | Рассылка всем `consent=1, is_active=1` пользователям |
+
+#### Переменная `ADMIN_ID` в `.env`
+
+```
+ADMIN_ID=123456789   # Telegram ID администратора
+```
+
+Читается при старте: `ADMIN_ID = int(os.getenv("ADMIN_ID"))`. Если не задана — `/broadcast` недоступен всем. Узнать свой ID: команда `/myid` в боте.
+
+#### Логика `/broadcast`
+
+```mermaid
+flowchart TD
+    BC(["Администратор: /broadcast текст"])
+
+    BC --> CHECK_ADMIN{from_user.id\n== ADMIN_ID?}
+    CHECK_ADMIN -->|нет| DENY["«Нет доступа.»"]
+    CHECK_ADMIN -->|да| CHECK_TEXT{Текст\nпустой?}
+    CHECK_TEXT -->|да| HINT["«Укажи текст:\n/broadcast Ваше сообщение»"]
+    CHECK_TEXT -->|нет| LOAD["get_active_consented_users()\nconsent=1, is_active=1"]
+
+    LOAD --> LOOP{Для каждого\nchat_id}
+    LOOP -->|успех| SENT["sent += 1"]
+    LOOP -->|Exception| BLOCK["mark_inactive(chat_id)\nblocked += 1"]
+
+    SENT --> REPORT
+    BLOCK --> REPORT
+    REPORT["«Отправлено: N, заблокировано: M»"]
+
+    DENY:::err
+    BLOCK:::err
+    REPORT:::bot
+
+    classDef bot fill:#e4f9e8,stroke:#27ae60,color:#333
+    classDef err fill:#f9e4e4,stroke:#c0392b,color:#333
+```
+
 ### Планируемый функционал:
 
 ```mermaid
@@ -161,16 +258,6 @@ flowchart TD
     CMD -->|"/rate"| RATE["Запрос текущего курса\nUSD/JPY к источнику данных"]
     RATE --> RATE_OK["USD/JPY: 152.34\n(обновлено HH:MM)"]
     RATE --> RATE_ERR["Не удалось получить курс.\nПопробуй позже"]
-
-    %% /alert
-    CMD -->|"/alert 155.00"| ALC{Порог\nуказан?}
-    ALC -->|нет| ALC_ERR["Укажи порог:\n/alert 155.00"]
-    ALC -->|да| ALC_SAVE["Алерт сохранён:\nUSD/JPY ≥ 155.00"]
-
-    BACKGROUND(["Фоновая задача\n(планировщик)"])
-    BACKGROUND -->|каждые N минут| CHECK{Курс достиг\nпорога?}
-    CHECK -->|да| NOTIFY["Уведомление пользователю:\nUSD/JPY достиг 155.00!"]
-    CHECK -->|нет| WAIT["Ждём следующей проверки"]
 
     %% /volume
     CMD -->|"/volume"| VOL["Загрузка 120 свечей\nUSD/JPY (данные)"]
