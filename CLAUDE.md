@@ -266,5 +266,85 @@ flowchart TD
     VOL_AI --> VOL_OUT["Сообщение: зоны + вывод"]
 ```
 
+## Приём оплаты
+
+### Общее
+
+Telegram Payments — встроенный механизм оплаты внутри Telegram. Работает через платёжного провайдера (ЮKassa, Robokassa и др.). Бот выставляет инвойс, пользователь платит не выходя из мессенджера.
+
+Цены передаются в **копейках** (целое число): 100 рублей = `10000`.
+
+### Переменная `PAYMENT_TOKEN` в `.env`
+
+```
+PAYMENT_TOKEN=381764678:TEST:...   # тестовый токен от BotFather
+```
+
+- **Тестовый токен** — содержит `:TEST:` в середине. Деньги не списываются, карту можно указать любую из тестового набора Telegram.
+- **Боевой токен** — получить через BotFather → Payments → выбрать провайдера (ЮKassa или Robokassa). Требуется статус самозанятого или ИП, договор с провайдером.
+
+Читается при старте: `PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN")`. Если не задан — команда `/pay` отвечает «Оплата временно недоступна».
+
+### Команда `/pay`
+
+Отправляет пользователю инвойс через `bot.send_invoice()`:
+
+| Параметр | Значение |
+|---|---|
+| `title` | Название продукта (например: «Премиум-подписка») |
+| `description` | Краткое описание |
+| `payload` | Внутренний идентификатор (например: `"premium_1month"`) |
+| `provider_token` | `PAYMENT_TOKEN` из `.env` |
+| `currency` | `"RUB"` |
+| `prices` | Список `LabeledPrice` в копейках |
+
+### Обработчики
+
+| Обработчик | Тип | Что делает |
+|---|---|---|
+| `pre_checkout_query` | `PreCheckoutQuery` | Подтверждает корректность заказа — обязательно вызвать `answer_pre_checkout_query(ok=True)` в течение 10 сек, иначе платёж отменяется |
+| `successful_payment` | `Message` (content_type=SUCCESSFUL_PAYMENT) | Фиксирует факт оплаты; `message.successful_payment` содержит детали транзакции |
+
+### Схема флоу `/pay`
+
+```mermaid
+flowchart TD
+    PAY(["Пользователь: /pay"])
+
+    PAY --> CHECK_TOKEN{PAYMENT_TOKEN\nзадан?}
+    CHECK_TOKEN -->|нет| UNAVAIL["«Оплата временно недоступна»"]
+    CHECK_TOKEN -->|да| INVOICE["bot.send_invoice()\nИнвойс пользователю"]
+
+    INVOICE --> USER_ACTION{Пользователь}
+    USER_ACTION -->|закрыл| DONE["Ничего не происходит"]
+    USER_ACTION -->|нажал Оплатить| PRE["pre_checkout_query\n(Telegram → бот)"]
+
+    PRE --> VALIDATE{Заказ\nкорректен?}
+    VALIDATE -->|да| OK["answer_pre_checkout_query(ok=True)"]
+    VALIDATE -->|нет| FAIL["answer_pre_checkout_query(ok=False, ...)"]
+
+    OK --> PAYMENT["Telegram проводит платёж"]
+    PAYMENT --> SUCCESS["successful_payment\nФиксируем оплату в БД"]
+    SUCCESS --> CONFIRM["«Оплата прошла! Спасибо»"]
+
+    FAIL:::err
+    UNAVAIL:::err
+    CONFIRM:::success
+
+    classDef success fill:#e4f9e8,stroke:#27ae60,color:#333
+    classDef err fill:#f9e4e4,stroke:#c0392b,color:#333
+```
+
+### Тестирование
+
+В тестовом режиме (токен содержит `:TEST:`) Telegram показывает форму с тестовыми картами. Реальные деньги не списываются. Переключение на боевой режим — только замена `PAYMENT_TOKEN` в `.env`.
+
+### Путь к боевому токену
+
+1. Оформить статус самозанятого (приложение «Мой налог»).
+2. Зарегистрироваться в ЮKassa или Robokassa и заключить договор.
+3. В BotFather: **Payments** → выбрать провайдера → получить токен.
+4. Заменить тестовый `PAYMENT_TOKEN` на боевой в `.env`.
+
 ## Автор
 Аким — вайбкодер, трейдер, термист

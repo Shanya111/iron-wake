@@ -15,7 +15,9 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    LabeledPrice,
     Message,
+    PreCheckoutQuery,
 )
 from dotenv import load_dotenv
 
@@ -29,6 +31,8 @@ OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 _admin_raw = os.getenv("ADMIN_ID", "")
 ADMIN_ID: int | None = int(_admin_raw) if _admin_raw.strip().isdigit() else None
+
+PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "TEST_TOKEN_PLACEHOLDER")
 
 # Читаем системный промпт один раз при загрузке модуля
 _prompt_path = Path(__file__).parent / "system_prompt.md"
@@ -445,6 +449,31 @@ async def alert_cancel_cb(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
+# ── Telegram Payments ─────────────────────────────────────────────────────────
+
+@dp.message(Command("pay"))
+async def cmd_pay(message: Message):
+    await bot.send_invoice(
+        chat_id=message.chat.id,
+        title="Доступ к алертам",
+        description="Активация уведомлений о курсе USD/JPY на 30 дней",
+        payload="alerts_access_30d",
+        provider_token=PAYMENT_TOKEN,
+        currency="RUB",
+        prices=[LabeledPrice(label="Доступ к алертам", amount=10000)],  # 100 руб = 10000 копеек
+    )
+
+
+@dp.pre_checkout_query()
+async def pre_checkout(query: PreCheckoutQuery):
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def successful_payment(message: Message):
+    await message.answer("Оплата прошла! Алерты активированы.")
+
+
 # ── Свободный текст → OpenRouter (только вне FSM-сценариев) ──────────────────
 
 @dp.message(F.text, StateFilter(None))
@@ -514,6 +543,7 @@ async def main():
         BotCommand(command="privacy",     description="Политика конфиденциальности"),
         BotCommand(command="unsubscribe", description="Отписаться от уведомлений"),
         BotCommand(command="myid",        description="Узнать свой Telegram ID"),
+        BotCommand(command="pay",         description="Оплатить доступ к алертам"),
     ])
     await dp.start_polling(bot)
 
