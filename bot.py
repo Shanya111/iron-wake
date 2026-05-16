@@ -453,15 +453,18 @@ async def alert_cancel_cb(call: CallbackQuery, state: FSMContext):
 
 @dp.message(Command("pay"))
 async def cmd_pay(message: Message):
-    await bot.send_invoice(
-        chat_id=message.chat.id,
-        title="Доступ к алертам",
-        description="Активация уведомлений о курсе USD/JPY на 30 дней",
-        payload="alerts_access_30d",
-        provider_token=PAYMENT_TOKEN,
-        currency="RUB",
-        prices=[LabeledPrice(label="Доступ к алертам", amount=10000)],  # 100 руб = 10000 копеек
-    )
+    try:
+        await bot.send_invoice(
+            chat_id=message.chat.id,
+            title="Доступ к алертам",
+            description="Активация уведомлений о курсе USD/JPY на 30 дней",
+            payload="alerts_access_30d",
+            provider_token=PAYMENT_TOKEN,
+            currency="RUB",
+            prices=[LabeledPrice(label="Доступ к алертам", amount=10000)],  # 100 руб = 10000 копеек
+        )
+    except Exception:
+        await message.answer("Оплата временно недоступна: тестовый токен не настроен. Подключи провайдера через BotFather.")
 
 
 @dp.pre_checkout_query()
