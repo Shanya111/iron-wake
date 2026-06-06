@@ -27,7 +27,9 @@ import database
 load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-OPENROUTER_MODEL = "deepseek/deepseek-v4-flash:free"
+# Модель читается из .env (OPENROUTER_MODEL) — меняется без правки кода.
+# Слаг должен быть РЕАЛЬНОЙ моделью OpenRouter, иначе вернётся 404.
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat-v3-0324:free")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 _admin_raw = os.getenv("ADMIN_ID", "")
