@@ -52,7 +52,10 @@ async def ask_openrouter(user_text: str) -> str:
             {"role": "user", "content": user_text},
         ],
     }
-    async with aiohttp.ClientSession() as session:
+    # trust_env=True — бот уважает прокси-переменные окружения (HTTPS_PROXY).
+    # На сервере (урок 5.12) это направляет запрос к OpenRouter через прокси из 5.09.
+    # На ноутбуке прокси-переменных нет — поведение не меняется.
+    async with aiohttp.ClientSession(trust_env=True) as session:
         async with session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
             resp.raise_for_status()
             data = await resp.json()
