@@ -10,6 +10,7 @@ from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
@@ -61,7 +62,15 @@ async def ask_openrouter(user_text: str) -> str:
             data = await resp.json()
             return data["choices"][0]["message"]["content"]
 
-bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+# BOT_PROXY — адрес прокси для соединения с Telegram. Задаётся в окружении
+# сервиса на сервере (урок 5.12), т.к. api.telegram.org из РФ напрямую недоступен.
+# aiogram не читает прокси из окружения сам (trust_env=False), поэтому передаём явно.
+# Локально переменной BOT_PROXY нет → бот ходит к Telegram напрямую, как раньше.
+_bot_proxy = os.getenv("BOT_PROXY", "").strip()
+if _bot_proxy:
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"), session=AiohttpSession(proxy=_bot_proxy))
+else:
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
 dp = Dispatcher(storage=MemoryStorage())
 
 # Заметки хранятся в памяти: {user_id: [список строк]}
