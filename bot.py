@@ -159,6 +159,10 @@ async def cmd_start(message: Message):
         f"Привет, {user.first_name}! Я iron-wake — бот для мониторинга USD/JPY.\n\nВыбери действие:",
         reply_markup=start_keyboard(),
     )
+    # Спрашиваем согласие только если человек ещё его не давал.
+    # Если в базе уже consent = 1 — не пристаём с кнопкой повторно.
+    if database.get_consent(user.id) == 1:
+        return
     await message.answer(
         "Этот бот сохраняет твой chat_id и настройки алертов для работы уведомлений. "
         "Нажимая «Согласен», ты даёшь согласие на обработку этих данных. "

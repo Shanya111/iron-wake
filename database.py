@@ -58,6 +58,16 @@ def set_consent(chat_id: int, value: int) -> None:
         conn.commit()
 
 
+def get_consent(chat_id: int) -> int | None:
+    """Возвращает согласие одного пользователя: 1 (согласен), 0 (нет),
+    или None — если такого пользователя в базе ещё нет."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT consent FROM users WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+    return row[0] if row is not None else None
+
+
 def get_active_consented_users() -> list[int]:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute("""
