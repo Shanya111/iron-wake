@@ -125,7 +125,10 @@ async def cmd_start(message: Message):
     user = message.from_user
     database.save_user(user.id, user.full_name)
     await message.answer(
-        f"Привет, {user.first_name}! Я iron-wake — бот для мониторинга USD/JPY.\n\nВыбери действие:",
+        f"Привет, {user.first_name}! Я iron-wake — слежу за курсами валют, металлов, "
+        "нефти и крипты и пишу в момент, когда цена коснётся твоего уровня.\n\n"
+        "Поставить алерт — /alert. Свои алерты — /myalerts.\n\n"
+        "Выбери действие:",
         reply_markup=start_keyboard(),
     )
     # Спрашиваем согласие только если человек ещё его не давал.
@@ -181,7 +184,7 @@ async def cmd_about(message: Message):
         "iron-wake — бот для мониторинга валютной пары USD/JPY.\n\n"
         "Следит за объёмами торгов и зонами маржинальности, "
         "уведомляет о значимых движениях рынка.\n\n"
-        "Автор: Аким — вайбкодер, трейдер, термист."
+        "Автор: Аким."
     )
 
 
@@ -243,7 +246,7 @@ async def cb_about(call: CallbackQuery):
         "iron-wake — бот для мониторинга валютной пары USD/JPY.\n\n"
         "Следит за объёмами торгов и зонами маржинальности, "
         "уведомляет о значимых движениях рынка.\n\n"
-        "Автор: Аким — вайбкодер, трейдер, термист."
+        "Автор: Аким."
     )
     await call.answer()
 
