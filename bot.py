@@ -1,4 +1,4 @@
-import asyncio import etogo_modulya_net
+import asyncio 
 import os
 from pathlib import Path
 
