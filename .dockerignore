@@ -1,0 +1,41 @@
+# .dockerignore для build context iron-wake-bot (= /opt/apps/bot)
+# Цель: не передавать демону Docker лишнее и НИКОГДА — секреты/БД.
+# Dockerfile.bot копирует ровно: requirements.txt, bot.py, database.py, system_prompt.md.
+
+# --- Секреты (КРИТИЧНО: .env не должен попасть в контекст сборки) ---
+.env
+.env.*
+
+# --- База данных и её бэкапы ---
+*.db
+*.db.bak-*
+*.bak-*
+
+# --- Виртуальное окружение (сотни файлов, в образе не нужно — pip ставит заново) ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Git ---
+.git/
+.gitignore
+
+# --- Python-кэш ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+
+# --- Памятки/документация (НЕ нужны рантайму) ---
+# Исключаем все .md, затем возвращаем единственный нужный — system_prompt.md.
+*.md
+!system_prompt.md
+памятки/
+
+# --- Прочее ---
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
