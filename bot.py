@@ -181,7 +181,7 @@ async def cmd_help(message: Message):
 @dp.message(Command("about"))
 async def cmd_about(message: Message):
     await message.answer(
-        "iron-wake — бот для мониторинга валютной пары USD/JPY.\n\n"
+        "iron-wake — бот для мониторинга валютных пар.\n\n"
         "Следит за объёмами торгов и зонами маржинальности, "
         "уведомляет о значимых движениях рынка.\n\n"
         "Автор: Аким."
@@ -243,7 +243,7 @@ async def cmd_broadcast(message: Message):
 @dp.callback_query(F.data == "about")
 async def cb_about(call: CallbackQuery):
     await call.message.answer(
-        "iron-wake — бот для мониторинга валютной пары USD/JPY.\n\n"
+        "iron-wake — бот для мониторинга валютных пар.\n\n"
         "Следит за объёмами торгов и зонами маржинальности, "
         "уведомляет о значимых движениях рынка.\n\n"
         "Автор: Аким."
