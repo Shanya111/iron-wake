@@ -21,8 +21,19 @@ from aiogram.types import (
 )
 from dotenv import load_dotenv
 
+import analyzer
+import config
+import data_fetcher
 import database
-from instruments import INSTRUMENTS, fmt, infer_decimals, resolve
+import scheduler as engine
+from instruments import (
+    INSTRUMENTS,
+    ccxt_symbol,
+    crypto_codes,
+    fmt,
+    infer_decimals,
+    resolve,
+)
 
 load_dotenv()
 
@@ -42,8 +53,12 @@ _prompt_path = Path(__file__).parent / "system_prompt.md"
 SYSTEM_PROMPT = _prompt_path.read_text(encoding="utf-8") if _prompt_path.exists() else ""
 
 
-async def ask_openrouter(user_text: str) -> str:
-    """Отправляет запрос в OpenRouter и возвращает ответ модели."""
+async def ask_openrouter(user_text: str, system_prompt: str = SYSTEM_PROMPT) -> str:
+    """Отправляет запрос в OpenRouter и возвращает ответ модели.
+
+    system_prompt по умолчанию — основной промпт бота (свободный текст). Для
+    гибридного разбора в /analyze передаётся отдельный «аналитический» промпт.
+    """
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -51,7 +66,7 @@ async def ask_openrouter(user_text: str) -> str:
     payload = {
         "model": OPENROUTER_MODEL,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_text},
         ],
     }
@@ -169,6 +184,10 @@ HELP_TEXT = (
     "/myid — узнать свой Telegram ID\n"
     "/alert — поставить алерт на уровень (выбор инструмента)\n"
     "/myalerts — мои алерты (посмотреть и удалить)\n"
+    "/analyze — анализ инструмента: тренд D1 + уровни + зоны ликвидности\n"
+    "/subscribe — подписка на торговые сигналы (Spring/Upthrust)\n"
+    "/signals — последние сигналы\n"
+    "/settings — настройки порогов сигналов\n"
     "/cancel — отменить текущий сценарий"
 )
 
@@ -442,6 +461,225 @@ async def cb_delete_alert(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=keyboard)
 
 
+# ── Торговый движок: анализ, подписки, сигналы, настройки ───────────────────────
+
+ANALYST_PROMPT = (
+    "Ты — лаконичный трейдинг-ассистент. Тебе дают ГОТОВЫЕ числа анализа "
+    "(тренд, сильные/слабые уровни, зоны ликвидности по объёму). Объясни простыми "
+    "словами по-русски, что это значит для трейдера: куда смотреть, какие уровни "
+    "приоритетны по тренду, где может быть пружина (Spring). Не выдумывай числа — "
+    "используй только данные. 3–5 коротких предложений, без воды и дисклеймеров."
+)
+
+
+def crypto_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKeyboardMarkup:
+    """Кнопки крипто-инструментов (по 2 в ряд). prefix — начало callback_data.
+    Если передан subscribed — отмечает галочкой уже подписанные (для /subscribe)."""
+    codes = crypto_codes()
+    rows = []
+    for i in range(0, len(codes), 2):
+        row = []
+        for c in codes[i:i + 2]:
+            mark = "✅ " if subscribed and c in subscribed else ""
+            row.append(InlineKeyboardButton(
+                text=f"{mark}{INSTRUMENTS[c]['name']}", callback_data=f"{prefix}{c}"
+            ))
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _format_analysis(info: dict, df, trend: str, levels: list[dict], zones: list[dict]) -> str:
+    """Человеко-читаемый отчёт по числам анализа (без AI)."""
+    last = float(df["close"].iloc[-1])
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
+    trend_ru = {"up": "восходящий ↑", "down": "нисходящий ↓", "sideways": "боковик →"}[trend]
+    strong = [l for l in levels if l["strength"] == "strong" and l["type"] in ("support", "resistance")]
+    weak = [l for l in levels if l["strength"] == "weak"]
+
+    def render(items):
+        if not items:
+            return "  —"
+        return "\n".join(
+            f"  • {'поддержка' if l['type'] == 'support' else 'сопротивление'} {fmt(l['price'], d)}"
+            for l in sorted(items, key=lambda x: x["price"])
+        )
+
+    lines = [
+        f"📊 {info['name']} — анализ",
+        f"Сейчас: {fmt(last, d)}",
+        f"Тренд (D1): {trend_ru}",
+        "",
+        "Сильные уровни (совпали D1↔H1):",
+        render(strong),
+        "",
+        "Слабые уровни (H1):",
+        render(weak[:8]),
+    ]
+    if zones:
+        zlines = "\n".join(
+            f"  • {fmt(z['price'], d)}" for z in sorted(zones, key=lambda x: x["price"])[:6]
+        )
+        lines += ["", "Зоны ликвидности (объём):", zlines]
+    return "\n".join(lines)
+
+
+def _analysis_prompt(info: dict, trend: str, levels: list[dict], zones: list[dict]) -> str:
+    """Компактная сводка чисел для AI-разбора (гибрид)."""
+    strong = [fmt(l["price"], 4) for l in levels if l["strength"] == "strong"]
+    zone_prices = [fmt(z["price"], 4) for z in zones[:6]]
+    return (
+        f"Инструмент: {info['name']}\n"
+        f"Тренд D1: {trend}\n"
+        f"Сильные уровни: {', '.join(strong) or 'нет'}\n"
+        f"Зоны ликвидности: {', '.join(zone_prices) or 'нет'}\n"
+        "Дай короткий разбор."
+    )
+
+
+async def _do_analyze(message: Message, code: str):
+    info = resolve(code)
+    sym = ccxt_symbol(code)
+    waiting = await message.answer(f"Анализирую {info['name']}...")
+    try:
+        d1 = await data_fetcher.get_candles(sym["symbol"], config.D1_TIMEFRAME, config.D1_LIMIT, sym["exchange"])
+        h1 = await data_fetcher.get_candles(sym["symbol"], config.H1_TIMEFRAME, config.H1_LIMIT, sym["exchange"])
+    except Exception:
+        await waiting.delete()
+        await message.answer("Не удалось получить данные сейчас, попробуй позже.")
+        return
+
+    trend = analyzer.get_trend(d1)
+    levels = engine.analyze_and_store(code, d1, h1)  # считает и сохраняет уровни в БД
+    zones = analyzer.find_liquidity_zones(d1)
+    await waiting.delete()
+    await message.answer(_format_analysis(info, d1, trend, levels, zones))
+
+    # Гибрид: AI пишет человеческий разбор поверх чисел. Ошибка LLM не критична.
+    try:
+        comment = await ask_openrouter(
+            _analysis_prompt(info, trend, levels, zones), system_prompt=ANALYST_PROMPT
+        )
+        await message.answer("🤖 " + comment)
+    except Exception:
+        pass
+
+
+@dp.message(Command("analyze"))
+async def cmd_analyze(message: Message):
+    parts = (message.text or "").split()
+    if len(parts) > 1 and parts[1].upper() in crypto_codes():
+        await _do_analyze(message, parts[1].upper())
+        return
+    await message.answer("Выбери инструмент для анализа:", reply_markup=crypto_keyboard("analyze_"))
+
+
+@dp.callback_query(F.data.startswith("analyze_"))
+async def cb_analyze(call: CallbackQuery):
+    code = call.data.removeprefix("analyze_")
+    if code not in crypto_codes():
+        await call.answer()
+        return
+    await call.answer()
+    await _do_analyze(call.message, code)
+
+
+@dp.message(Command("subscribe"))
+async def cmd_subscribe(message: Message):
+    subs = set(database.get_user_subscriptions(message.from_user.id))
+    await message.answer(
+        "Подписка на торговые сигналы (Spring/Upthrust). Нажми инструмент, чтобы "
+        "включить/выключить уведомления:",
+        reply_markup=crypto_keyboard("subtoggle_", subs),
+    )
+
+
+@dp.callback_query(F.data.startswith("subtoggle_"))
+async def cb_subtoggle(call: CallbackQuery):
+    code = call.data.removeprefix("subtoggle_")
+    if code not in crypto_codes():
+        await call.answer()
+        return
+    subs = set(database.get_user_subscriptions(call.from_user.id))
+    if code in subs:
+        database.remove_subscription(call.from_user.id, code)
+        subs.discard(code)
+        await call.answer("Отписка")
+    else:
+        database.add_subscription(call.from_user.id, code)
+        subs.add(code)
+        await call.answer("Подписка оформлена")
+    await call.message.edit_reply_markup(reply_markup=crypto_keyboard("subtoggle_", subs))
+
+
+@dp.message(Command("signals"))
+async def cmd_signals(message: Message):
+    signals = database.get_recent_signals(10)
+    if not signals:
+        await message.answer("Сигналов пока нет. Подписаться на инструменты — /subscribe.")
+        return
+    lines = []
+    for s in signals:
+        info = resolve(s["instrument"])
+        d = info["decimals"] if info["decimals"] is not None else infer_decimals(s["entry_price"])
+        arrow = "🟢" if s["direction"] == "long" else "🔴"
+        pat = "Spring" if s["pattern"] == "spring" else "Upthrust"
+        star = "⭐" if s["priority"] == "high" else ""
+        lines.append(
+            f"{arrow}{star} {info['name']} {pat} — вход {fmt(s['entry_price'], d)}, "
+            f"стоп {fmt(s['stop_loss'], d)}, цель {fmt(s['take_profit'], d)} [{s['status']}]"
+        )
+    await message.answer("Последние сигналы:\n" + "\n".join(lines))
+
+
+def settings_text() -> str:
+    return (
+        "⚙️ Настройки движка сигналов:\n"
+        f"• Аномальный объём: × {config.get('VOL_MULT')}\n"
+        f"• Глубина ложного пробоя: {config.get('BREAK_PCT') * 100:.3g}%\n"
+        f"• Объём зоны ликвидности: × {config.get('LIQUIDITY_MULT')}\n\n"
+        "Меняй пороги кнопками ниже (применяется сразу для всех сигналов):"
+    )
+
+
+def settings_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Объём ×1.3", callback_data="set:VOL_MULT:1.3"),
+            InlineKeyboardButton(text="×1.5", callback_data="set:VOL_MULT:1.5"),
+            InlineKeyboardButton(text="×2.0", callback_data="set:VOL_MULT:2.0"),
+        ],
+        [
+            InlineKeyboardButton(text="Пробой 0.03%", callback_data="set:BREAK_PCT:0.0003"),
+            InlineKeyboardButton(text="0.05%", callback_data="set:BREAK_PCT:0.0005"),
+            InlineKeyboardButton(text="0.1%", callback_data="set:BREAK_PCT:0.001"),
+        ],
+    ])
+
+
+@dp.message(Command("settings"))
+async def cmd_settings(message: Message):
+    # Пороги общие для всех сигналов → меняет только администратор (если задан).
+    if ADMIN_ID is not None and message.from_user.id != ADMIN_ID:
+        await message.answer("Настройки порогов доступны только администратору.")
+        return
+    await message.answer(settings_text(), reply_markup=settings_keyboard())
+
+
+@dp.callback_query(F.data.startswith("set:"))
+async def cb_settings(call: CallbackQuery):
+    if ADMIN_ID is not None and call.from_user.id != ADMIN_ID:
+        await call.answer("Только администратор")
+        return
+    try:
+        _, key, value = call.data.split(":")
+        config.set_value(key, float(value))
+    except (ValueError, KeyError):
+        await call.answer("Не понял настройку")
+        return
+    await call.answer("Готово")
+    await call.message.edit_text(settings_text(), reply_markup=settings_keyboard())
+
+
 # ── Telegram Payments ─────────────────────────────────────────────────────────
 
 @dp.message(Command("pay"))
@@ -558,15 +796,24 @@ async def check_alerts():
 async def main():
     database.init_db()
 
+    # Планировщик простых алертов «касание уровня» (как было).
     scheduler = AsyncIOScheduler()
     scheduler.add_job(check_alerts, "interval", minutes=5)
     scheduler.start()
     await check_alerts()  # однократный прогон при старте для теста
 
+    # Планировщик торгового движка: контекстный анализ (1ч) + мониторинг сигналов (5м).
+    engine.setup(bot)
+    await engine.run_analysis(bot)  # первичный анализ при старте
+
     await bot.set_my_commands([
         BotCommand(command="start",       description="Главное меню"),
         BotCommand(command="alert",       description="Поставить алерт на уровень"),
         BotCommand(command="myalerts",    description="Мои алерты"),
+        BotCommand(command="analyze",     description="Анализ инструмента (тренд + уровни)"),
+        BotCommand(command="subscribe",   description="Подписка на торговые сигналы"),
+        BotCommand(command="signals",     description="Последние сигналы"),
+        BotCommand(command="settings",    description="Настройки порогов сигналов"),
         BotCommand(command="cancel",      description="Отмена"),
         BotCommand(command="help",        description="Помощь"),
         BotCommand(command="privacy",     description="Политика конфиденциальности"),
@@ -574,7 +821,10 @@ async def main():
         BotCommand(command="myid",        description="Узнать свой Telegram ID"),
         BotCommand(command="pay",         description="Оплатить доступ к алертам"),
     ])
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await data_fetcher.close()  # закрываем соединения бирж при остановке
 
 
 if __name__ == "__main__":
