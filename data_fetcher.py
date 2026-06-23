@@ -1,8 +1,11 @@
 """Загрузка биржевых свечей (OHLCV с объёмом) через CCXT + кеш в памяти.
 
 Зачем CCXT, а не yfinance: VSA и паттерн Spring критически зависят от объёма, а у
-Yahoo по форекс-парам объём = 0/пусто. На крипте биржевой объём настоящий — поэтому
-торговые стратегии строим на данных бирж (Binance, Bybit) через CCXT.
+Yahoo по форекс-парам объём = 0/пусто. На бирже объём настоящий — поэтому торговые
+стратегии строим на биржевых данных через CCXT.
+
+Биржа одна — Kraken: у него есть и крипта, и форекс с реальным объёмом, и он не
+блокирует РФ (Binance даёт 451, Bybit 403). Поэтому движку прокси не нужен.
 
 Свечи кешируются на config.CACHE_TTL[timeframe], чтобы мониторинг (каждые 5 минут)
 не делал лишних сетевых запросов. Биржи создаются лениво и переиспользуются.
@@ -16,13 +19,13 @@ import pandas as pd
 
 import config
 
-# Прокси для бирж. Многие биржи (Binance) блокируют запросы из РФ (HTTP 451),
-# поэтому на сервере задаём CCXT_PROXY — прокси в разрешённой стране. Поддерживает
-# http(s):// и socks5:// (socks работает через уже установленный aiohttp-socks).
-# Если переменной нет — ходим напрямую (как на разрешённой локали / в CI).
+# Прокси для бирж. Kraken (наша единственная биржа движка) РФ не блокирует, поэтому
+# обычно прокси НЕ нужен. CCXT_PROXY оставлен на случай, если когда-нибудь вернём
+# биржу с гео-блоком (Binance/Bybit) — тогда задаём прокси в разрешённой стране.
+# Поддерживает http(s):// и socks5://. Нет переменной — ходим напрямую.
 _PROXY = os.getenv("CCXT_PROXY", "").strip()
 
-# Биржи: одна на имя (binance, bybit, ...), создаём при первом обращении.
+# Биржи: одна на имя (kraken, ...), создаём при первом обращении.
 _exchanges: dict[str, "ccxt.Exchange"] = {}
 # Кеш свечей: (биржа, символ, таймфрейм) → (время_загрузки, DataFrame).
 _cache: dict[tuple[str, str, str], tuple[float, pd.DataFrame]] = {}
@@ -44,7 +47,7 @@ def _get_exchange(name: str):
 
 
 async def get_candles(
-    symbol: str, timeframe: str, limit: int, exchange: str = "binance"
+    symbol: str, timeframe: str, limit: int, exchange: str = "kraken"
 ) -> pd.DataFrame:
     """OHLCV-свечи как DataFrame со столбцами open/high/low/close/volume (индекс — время).
 
@@ -69,7 +72,7 @@ async def get_candles(
 
 
 async def get_order_book(
-    symbol: str, limit: int | None = None, exchange: str = "binance"
+    symbol: str, limit: int | None = None, exchange: str = "kraken"
 ) -> dict:
     """Стакан заявок биржи: {'bids': [[цена, объём], ...], 'asks': [...]}.
 

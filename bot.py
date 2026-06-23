@@ -464,11 +464,14 @@ async def cb_delete_alert(call: CallbackQuery):
 # ── Торговый движок: анализ, подписки, сигналы, настройки ───────────────────────
 
 ANALYST_PROMPT = (
-    "Ты — лаконичный трейдинг-ассистент. Тебе дают ГОТОВЫЕ числа анализа "
-    "(тренд, сильные/слабые уровни, зоны ликвидности по объёму). Объясни простыми "
-    "словами по-русски, что это значит для трейдера: куда смотреть, какие уровни "
-    "приоритетны по тренду, где может быть пружина (Spring). Не выдумывай числа — "
-    "используй только данные. 3–5 коротких предложений, без воды и дисклеймеров."
+    "Ты — трейдинг-ассистент. Тебе дают ГОТОВЫЕ числа анализа одного инструмента "
+    "(название, тренд D1, уровни дневки и часовика, зоны ликвидности, стакан). "
+    "Начни ответ с названия инструмента. Объясни простыми словами по-русски: куда "
+    "смотреть, какие уровни приоритетны ПО ТРЕНДУ (в нисходящем — шорты от "
+    "сопротивлений, в восходящем — лонги от поддержек), где вероятна пружина (Spring) "
+    "или ложный пробой, и что говорит стакан. Когда называешь уровень — уточняй, "
+    "дневной он или часовой. Не выдумывай числа — используй только данные. "
+    "4–6 коротких предложений, по делу, без дисклеймеров."
 )
 
 
@@ -489,72 +492,133 @@ def engine_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKe
 
 
 def _format_orderbook(ob: dict, d: int) -> list[str]:
-    """Блок «Стакан (DOM)» для отчёта анализа. ob — сводка analyzer.analyze_order_book."""
-    pressure_ru = {"buyers": "покупатели 🟢", "sellers": "продавцы 🔴", "balance": "баланс →"}
+    """Блок «Стакан заявок» человеческим языком. ob — сводка analyzer.analyze_order_book."""
+    pressure_ru = {
+        "buyers":  "перевес покупателей 🟢 — заявок на покупку больше",
+        "sellers": "перевес продавцов 🔴 — заявок на продажу больше",
+        "balance": "силы примерно равны → — ни одна сторона не давит",
+    }
+    # Широкий спред = стакан тонкий (например, форекс на Kraken по ночам/выходным):
+    # давление и стены по такому стакану недостоверны — честно об этом предупреждаем.
+    thin = ob["spread_pct"] > 0.005
+    if ob["spread_pct"] < 0.001:
+        spread_word = "узкий (рынок ликвидный)"
+    elif not thin:
+        spread_word = "заметный"
+    else:
+        spread_word = "очень широкий (стакан по инструменту тонкий, доверять DOM не стоит)"
     lines = [
         "",
-        "Стакан (DOM):",
-        f"  Давление: {pressure_ru[ob['pressure']]} (дисбаланс {ob['imbalance'] * 100:+.0f}%)",
-        f"  Спред: {fmt(ob['spread'], d)} ({ob['spread_pct'] * 100:.2g}%)",
+        "📖 Стакан заявок (что стоит в очереди прямо сейчас):",
+        f"  • {pressure_ru[ob['pressure']]} ({ob['imbalance'] * 100:+.0f}%)",
+        f"  • Спред (разрыв покупки и продажи): {fmt(ob['spread'], d)} ({ob['spread_pct'] * 100:.2g}%) — {spread_word}",
     ]
+    if thin:
+        return lines  # стены из тонкого стакана не показываем — это шум
     if ob["bid_wall"]:
-        lines.append(f"  Стена покупок: {fmt(ob['bid_wall']['price'], d)} (объём {ob['bid_wall']['amount']:.4g})")
+        lines.append(
+            f"  • 🧱 Крупная заявка на покупку у {fmt(ob['bid_wall']['price'], d)} "
+            f"— может держать цену снизу (объём {ob['bid_wall']['amount']:.4g})"
+        )
     if ob["ask_wall"]:
-        lines.append(f"  Стена продаж: {fmt(ob['ask_wall']['price'], d)} (объём {ob['ask_wall']['amount']:.4g})")
+        lines.append(
+            f"  • 🧱 Крупная заявка на продажу у {fmt(ob['ask_wall']['price'], d)} "
+            f"— может тормозить рост (объём {ob['ask_wall']['amount']:.4g})"
+        )
     return lines
+
+
+def _render_levels(items: list[dict], d: int, last: float, limit: int) -> str:
+    """Уровни строками: эмодзи + слово + цена, сверху вниз (дороже — выше, как на графике).
+    Берём `limit` ближайших к цене (они важнее), близкие сливаем (чтобы «160.14, 160.14,
+    160.13» не засоряли список), ⭐ — сильный уровень."""
+    if not items:
+        return "  —"
+    kept: list[dict] = []
+    for l in sorted(items, key=lambda x: abs(x["price"] - last)):
+        dup = next((k for k in kept if k["type"] == l["type"]
+                    and abs(k["price"] - l["price"]) <= l["price"] * 0.0015), None)
+        if dup is None:
+            kept.append(dict(l))
+            if len(kept) >= limit:
+                break
+        elif l.get("strength") == "strong":
+            dup["strength"] = "strong"  # сильный уровень важнее — поднимаем приоритет
+    rows = []
+    for l in sorted(kept, key=lambda x: x["price"], reverse=True):
+        emoji = "🟥" if l["type"] == "resistance" else "🟩"
+        word = "сопротивление" if l["type"] == "resistance" else "поддержка"
+        star = " ⭐" if l.get("strength") == "strong" else ""
+        rows.append(f"  {emoji} {word} {fmt(l['price'], d)}{star}")
+    return "\n".join(rows)
 
 
 def _format_analysis(info: dict, df, trend: str, levels: list[dict], zones: list[dict],
                      ob: dict | None = None) -> str:
-    """Человеко-читаемый отчёт по числам анализа (без AI)."""
+    """Человеко-читаемый отчёт по числам анализа (без AI). Уровни сгруппированы по
+    таймфреймам (дневка/часовик) с эмодзи — чтобы было видно, что старшее, что ближнее."""
     last = float(df["close"].iloc[-1])
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
-    trend_ru = {"up": "восходящий ↑", "down": "нисходящий ↓", "sideways": "боковик →"}[trend]
-    strong = [l for l in levels if l["strength"] == "strong" and l["type"] in ("support", "resistance")]
-    weak = [l for l in levels if l["strength"] == "weak"]
-
-    def render(items):
-        if not items:
-            return "  —"
-        return "\n".join(
-            f"  • {'поддержка' if l['type'] == 'support' else 'сопротивление'} {fmt(l['price'], d)}"
-            for l in sorted(items, key=lambda x: x["price"])
-        )
+    trend_ru = {
+        "up": "восходящий ↑ (цена растёт)",
+        "down": "нисходящий ↓ (цена падает)",
+        "sideways": "боковик → (без чёткого направления)",
+    }[trend]
+    d1 = [l for l in levels if l.get("timeframe") == "D1" and l["type"] in ("support", "resistance")]
+    h1 = [l for l in levels if l.get("timeframe") == "H1" and l["type"] in ("support", "resistance")]
 
     lines = [
         f"📊 {info['name']} — анализ",
-        f"Сейчас: {fmt(last, d)}",
-        f"Тренд (D1): {trend_ru}",
+        f"Цена сейчас: {fmt(last, d)}",
+        f"Тренд на дневке (D1): {trend_ru}",
         "",
-        "Сильные уровни (совпали D1↔H1):",
-        render(strong),
+        "🔵 Дневка (D1) — крупные уровни (главные ориентиры):",
+        _render_levels(d1, d, last, limit=6),
         "",
-        "Слабые уровни (H1):",
-        render(weak[:8]),
+        "🟡 Часовик (H1) — ближние уровни (для входа):",
+        _render_levels(h1, d, last, limit=8),
     ]
+    if any(l.get("strength") == "strong" for l in h1):
+        lines.append("  ⭐ — сильный: часовой уровень совпал с дневным")
     if zones:
-        zlines = "\n".join(
-            f"  • {fmt(z['price'], d)}" for z in sorted(zones, key=lambda x: x["price"])[:6]
-        )
-        lines += ["", "Зоны ликвидности (объём):", zlines]
+        near = sorted(zones, key=lambda z: abs(z["price"] - last))[:6]
+        zlines = []
+        for z in sorted(near, key=lambda x: x["price"], reverse=True):
+            tag = " (рядом с ценой)" if abs(z["price"] - last) <= last * 0.01 else ""
+            zlines.append(f"  💰 {fmt(z['price'], d)}{tag}")
+        lines += ["", "💰 Зоны ликвидности (где стояли крупные объёмы — магнит для цены):",
+                  "\n".join(zlines)]
     if ob:
         lines += _format_orderbook(ob, d)
     return "\n".join(lines)
 
 
-def _analysis_prompt(info: dict, trend: str, levels: list[dict], zones: list[dict],
-                     ob: dict | None = None) -> str:
-    """Компактная сводка чисел для AI-разбора (гибрид)."""
-    strong = [fmt(l["price"], 4) for l in levels if l["strength"] == "strong"]
-    zone_prices = [fmt(z["price"], 4) for z in zones[:6]]
+def _analysis_prompt(info: dict, last: float, trend: str, levels: list[dict],
+                     zones: list[dict], ob: dict | None = None) -> str:
+    """Компактная сводка чисел для AI-разбора (гибрид). Уровни разнесены по
+    таймфреймам — чтобы AI в ответе уточнял, дневной уровень или часовой."""
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
+    d1 = [fmt(l["price"], d) for l in levels
+          if l.get("timeframe") == "D1" and l["type"] in ("support", "resistance")]
+    h1_strong = [fmt(l["price"], d) for l in levels
+                 if l.get("timeframe") == "H1" and l.get("strength") == "strong"]
+    zone_prices = [fmt(z["price"], d) for z in zones[:6]]
     dom = ""
     if ob:
-        pressure_ru = {"buyers": "покупатели", "sellers": "продавцы", "balance": "баланс"}
-        dom = f"Стакан: {pressure_ru[ob['pressure']]} (дисбаланс {ob['imbalance'] * 100:+.0f}%)\n"
+        pressure_ru = {"buyers": "перевес покупателей", "sellers": "перевес продавцов",
+                       "balance": "баланс сил"}
+        dom = f"Стакан: {pressure_ru[ob['pressure']]} (дисбаланс {ob['imbalance'] * 100:+.0f}%)"
+        if ob.get("bid_wall"):
+            dom += f", крупная покупка у {fmt(ob['bid_wall']['price'], d)}"
+        if ob.get("ask_wall"):
+            dom += f", крупная продажа у {fmt(ob['ask_wall']['price'], d)}"
+        dom += "\n"
     return (
         f"Инструмент: {info['name']}\n"
+        f"Цена сейчас: {fmt(last, d)}\n"
         f"Тренд D1: {trend}\n"
-        f"Сильные уровни: {', '.join(strong) or 'нет'}\n"
+        f"Уровни дневки (D1): {', '.join(d1) or 'нет'}\n"
+        f"Сильные уровни часовика (H1): {', '.join(h1_strong) or 'нет'}\n"
         f"Зоны ликвидности: {', '.join(zone_prices) or 'нет'}\n"
         f"{dom}"
         "Дай короткий разбор."
@@ -590,10 +654,13 @@ async def _do_analyze(message: Message, code: str):
 
     # Гибрид: AI пишет человеческий разбор поверх чисел. Ошибка LLM не критична.
     try:
+        last = float(d1["close"].iloc[-1])
         comment = await ask_openrouter(
-            _analysis_prompt(info, trend, levels, zones, ob), system_prompt=ANALYST_PROMPT
+            _analysis_prompt(info, last, trend, levels, zones, ob), system_prompt=ANALYST_PROMPT
         )
-        await message.answer("🤖 " + comment)
+        # Подписываем, по какому инструменту разбор — сообщения в ленте отрываются
+        # от заголовка, и без имени непонятно, о чём речь.
+        await message.answer(f"🤖 {info['name']} — разбор:\n\n{comment}")
     except Exception:
         pass
 
