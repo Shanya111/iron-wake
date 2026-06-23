@@ -91,10 +91,16 @@ def init_db() -> None:
                 stop_loss   REAL    NOT NULL,
                 take_profit REAL    NOT NULL,
                 priority    TEXT    NOT NULL DEFAULT 'normal',  -- 'high' | 'normal'
-                status      TEXT    NOT NULL DEFAULT 'pending', -- pending|triggered|expired
+                status      TEXT    NOT NULL DEFAULT 'pending', -- pending|hit_tp|hit_sl|expired
                 created_at  TEXT    NOT NULL
             )
         """)
+        # Якорь свечи пробоя — нужен трекингу исхода (2-я волна). Для баз со старой
+        # схемой добавляем колонку миграцией (у старых сигналов будет NULL).
+        try:
+            conn.execute("ALTER TABLE signals ADD COLUMN bar_time TEXT")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
         # Подписки пользователей на сигналы по инструменту.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -288,18 +294,38 @@ def get_levels(instrument: str) -> list[dict]:
 
 def add_signal(instrument: str, pattern: str, direction: str, entry_price: float,
                stop_loss: float, take_profit: float, priority: str = "normal",
-               level_id: int | None = None) -> int:
-    """Сохраняет новый сигнал со статусом 'pending'. Возвращает его id."""
+               level_id: int | None = None, bar_time: str | None = None) -> int:
+    """Сохраняет новый сигнал со статусом 'pending'. Возвращает его id.
+    bar_time — время свечи пробоя (UTC), якорь для трекинга исхода."""
     created_at = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute("""
             INSERT INTO signals (instrument, pattern, level_id, direction,
-                                 entry_price, stop_loss, take_profit, priority, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                                 entry_price, stop_loss, take_profit, priority,
+                                 status, created_at, bar_time)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
         """, (instrument, pattern, level_id, direction, entry_price, stop_loss,
-              take_profit, priority, created_at))
+              take_profit, priority, created_at, bar_time))
         conn.commit()
         return cur.lastrowid
+
+
+def get_open_signals() -> list[dict]:
+    """Открытые (status='pending') сигналы — те, чей исход ещё отслеживаем."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, instrument, direction, entry_price, stop_loss, take_profit, bar_time
+            FROM signals WHERE status = 'pending'
+        """).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_signal_status(signal_id: int, status: str) -> None:
+    """Меняет статус сигнала (pending → hit_tp | hit_sl | expired)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE signals SET status = ? WHERE id = ?", (status, signal_id))
+        conn.commit()
 
 
 def recent_signal_exists(instrument: str, pattern: str, direction: str, since_iso: str) -> bool:

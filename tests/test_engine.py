@@ -139,6 +139,116 @@ def test_upthrust_filtered_by_uptrend():
     assert pattern_detector.detect_upthrust(df, levels, trend="up") is None
 
 
+# ── Трекинг исхода сигналов (evaluate_signal) ────────────────────────────────
+
+def _long_signal(df) -> dict:
+    """Лонг: стоп 99, цель 110, якорь — первая свеча df (следим за тем, что после)."""
+    return {"direction": "long", "stop_loss": 99.0, "take_profit": 110.0,
+            "bar_time": str(df.index[0])}
+
+
+def test_evaluate_long_hit_tp():
+    rows = [(100.5, 101, 100, 100.5, 100) for _ in range(5)]
+    rows[3] = (105, 111, 104, 106, 100)        # high 111 ≥ цель 110
+    df = _df(rows)
+    assert pattern_detector.evaluate_signal(_long_signal(df), df) == "hit_tp"
+
+
+def test_evaluate_long_hit_sl():
+    rows = [(100.5, 101, 100, 100.5, 100) for _ in range(5)]
+    rows[2] = (100, 100.5, 98, 99.5, 100)      # low 98 ≤ стоп 99
+    df = _df(rows)
+    assert pattern_detector.evaluate_signal(_long_signal(df), df) == "hit_sl"
+
+
+def test_evaluate_conservative_stop_first():
+    # Одна свеча накрыла и стоп, и цель → консервативно считаем стопом.
+    rows = [(100.5, 101, 100, 100.5, 100) for _ in range(5)]
+    rows[2] = (100, 111, 98, 100, 100)
+    df = _df(rows)
+    assert pattern_detector.evaluate_signal(_long_signal(df), df) == "hit_sl"
+
+
+def test_evaluate_pending():
+    rows = [(100.5, 101, 100, 100.5, 100) for _ in range(5)]  # ни цели, ни стопа
+    df = _df(rows)
+    assert pattern_detector.evaluate_signal(_long_signal(df), df) == "pending"
+
+
+def test_evaluate_expired():
+    rows = [(100.5, 101, 100, 100.5, 100) for _ in range(50)]  # 49ч ≥ 48ч порога
+    df = _df(rows)
+    assert pattern_detector.evaluate_signal(_long_signal(df), df) == "expired"
+
+
+def test_evaluate_short_hit_tp():
+    rows = [(99.5, 100, 99, 99.5, 100) for _ in range(5)]
+    rows[3] = (95, 96, 89, 90, 100)            # low 89 ≤ цель 90
+    df = _df(rows)
+    sig = {"direction": "short", "stop_loss": 101.0, "take_profit": 90.0,
+           "bar_time": str(df.index[0])}
+    assert pattern_detector.evaluate_signal(sig, df) == "hit_tp"
+
+
+def test_evaluate_no_bar_time_is_pending():
+    # Старый сигнал без якоря не трогаем — исход не определить честно.
+    rows = [(100.5, 101, 100, 100.5, 100) for _ in range(5)]
+    rows[2] = (100, 111, 98, 100, 100)
+    df = _df(rows)
+    sig = {"direction": "long", "stop_loss": 99.0, "take_profit": 110.0, "bar_time": None}
+    assert pattern_detector.evaluate_signal(sig, df) == "pending"
+
+
+# ── Стакан (analyze_order_book) ──────────────────────────────────────────────
+
+def test_orderbook_buyers_pressure():
+    ob = {"bids": [[100.0, 10.0], [99.9, 10.0]], "asks": [[100.1, 1.0], [100.2, 1.0]]}
+    s = analyzer.analyze_order_book(ob)
+    assert s["pressure"] == "buyers"
+    assert s["imbalance"] > 0
+
+
+def test_orderbook_sellers_pressure():
+    ob = {"bids": [[100.0, 1.0], [99.9, 1.0]], "asks": [[100.1, 10.0], [100.2, 10.0]]}
+    s = analyzer.analyze_order_book(ob)
+    assert s["pressure"] == "sellers"
+    assert s["imbalance"] < 0
+
+
+def test_orderbook_balance_and_spread():
+    ob = {"bids": [[100.0, 5.0]], "asks": [[100.2, 5.0]]}
+    s = analyzer.analyze_order_book(ob)
+    assert s["pressure"] == "balance"
+    assert abs(s["spread"] - 0.2) < 1e-9
+
+
+def test_orderbook_walls():
+    # Крупная заявка среди мелких → стена; ровные заявки → стены нет.
+    ob = {
+        "bids": [[100.0, 1.0], [99.9, 1.0], [99.8, 50.0], [99.7, 1.0]],
+        "asks": [[100.1, 2.0], [100.2, 2.0]],
+    }
+    s = analyzer.analyze_order_book(ob, wall_mult=5)
+    assert s["bid_wall"] is not None
+    assert abs(s["bid_wall"]["price"] - 99.8) < 1e-9
+    assert s["ask_wall"] is None
+
+
+def test_orderbook_empty_is_none():
+    assert analyzer.analyze_order_book({"bids": [], "asks": []}) is None
+
+
+def test_orderbook_kraken_three_element_entries():
+    # Kraken отдаёт заявки как [цена, объём, время] (3 элемента) — не должно падать.
+    ob = {
+        "bids": [[1.1430, 10.0, 1700000000], [1.1429, 10.0, 1700000000]],
+        "asks": [[1.1432, 1.0, 1700000000], [1.1433, 1.0, 1700000000]],
+    }
+    s = analyzer.analyze_order_book(ob)
+    assert s is not None
+    assert s["pressure"] == "buyers"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

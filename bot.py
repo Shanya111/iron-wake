@@ -29,7 +29,7 @@ import scheduler as engine
 from instruments import (
     INSTRUMENTS,
     ccxt_symbol,
-    crypto_codes,
+    engine_codes,
     fmt,
     infer_decimals,
     resolve,
@@ -472,10 +472,10 @@ ANALYST_PROMPT = (
 )
 
 
-def crypto_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKeyboardMarkup:
-    """Кнопки крипто-инструментов (по 2 в ряд). prefix — начало callback_data.
-    Если передан subscribed — отмечает галочкой уже подписанные (для /subscribe)."""
-    codes = crypto_codes()
+def engine_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKeyboardMarkup:
+    """Кнопки инструментов движка — крипта + форекс (по 2 в ряд). prefix — начало
+    callback_data. Если передан subscribed — отмечает галочкой подписанные (для /subscribe)."""
+    codes = engine_codes()
     rows = []
     for i in range(0, len(codes), 2):
         row = []
@@ -488,7 +488,24 @@ def crypto_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKe
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _format_analysis(info: dict, df, trend: str, levels: list[dict], zones: list[dict]) -> str:
+def _format_orderbook(ob: dict, d: int) -> list[str]:
+    """Блок «Стакан (DOM)» для отчёта анализа. ob — сводка analyzer.analyze_order_book."""
+    pressure_ru = {"buyers": "покупатели 🟢", "sellers": "продавцы 🔴", "balance": "баланс →"}
+    lines = [
+        "",
+        "Стакан (DOM):",
+        f"  Давление: {pressure_ru[ob['pressure']]} (дисбаланс {ob['imbalance'] * 100:+.0f}%)",
+        f"  Спред: {fmt(ob['spread'], d)} ({ob['spread_pct'] * 100:.2g}%)",
+    ]
+    if ob["bid_wall"]:
+        lines.append(f"  Стена покупок: {fmt(ob['bid_wall']['price'], d)} (объём {ob['bid_wall']['amount']:.4g})")
+    if ob["ask_wall"]:
+        lines.append(f"  Стена продаж: {fmt(ob['ask_wall']['price'], d)} (объём {ob['ask_wall']['amount']:.4g})")
+    return lines
+
+
+def _format_analysis(info: dict, df, trend: str, levels: list[dict], zones: list[dict],
+                     ob: dict | None = None) -> str:
     """Человеко-читаемый отчёт по числам анализа (без AI)."""
     last = float(df["close"].iloc[-1])
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
@@ -520,18 +537,26 @@ def _format_analysis(info: dict, df, trend: str, levels: list[dict], zones: list
             f"  • {fmt(z['price'], d)}" for z in sorted(zones, key=lambda x: x["price"])[:6]
         )
         lines += ["", "Зоны ликвидности (объём):", zlines]
+    if ob:
+        lines += _format_orderbook(ob, d)
     return "\n".join(lines)
 
 
-def _analysis_prompt(info: dict, trend: str, levels: list[dict], zones: list[dict]) -> str:
+def _analysis_prompt(info: dict, trend: str, levels: list[dict], zones: list[dict],
+                     ob: dict | None = None) -> str:
     """Компактная сводка чисел для AI-разбора (гибрид)."""
     strong = [fmt(l["price"], 4) for l in levels if l["strength"] == "strong"]
     zone_prices = [fmt(z["price"], 4) for z in zones[:6]]
+    dom = ""
+    if ob:
+        pressure_ru = {"buyers": "покупатели", "sellers": "продавцы", "balance": "баланс"}
+        dom = f"Стакан: {pressure_ru[ob['pressure']]} (дисбаланс {ob['imbalance'] * 100:+.0f}%)\n"
     return (
         f"Инструмент: {info['name']}\n"
         f"Тренд D1: {trend}\n"
         f"Сильные уровни: {', '.join(strong) or 'нет'}\n"
         f"Зоны ликвидности: {', '.join(zone_prices) or 'нет'}\n"
+        f"{dom}"
         "Дай короткий разбор."
     )
 
@@ -551,13 +576,22 @@ async def _do_analyze(message: Message, code: str):
     trend = analyzer.get_trend(d1)
     levels = engine.analyze_and_store(code, d1, h1)  # считает и сохраняет уровни в БД
     zones = analyzer.find_liquidity_zones(d1)
+
+    # Стакан (DOM) — доп. контекст по крипте. Ошибка стакана не критична для анализа.
+    ob = None
+    try:
+        raw_ob = await data_fetcher.get_order_book(sym["symbol"], exchange=sym["exchange"])
+        ob = analyzer.analyze_order_book(raw_ob)
+    except Exception:
+        ob = None
+
     await waiting.delete()
-    await message.answer(_format_analysis(info, d1, trend, levels, zones))
+    await message.answer(_format_analysis(info, d1, trend, levels, zones, ob))
 
     # Гибрид: AI пишет человеческий разбор поверх чисел. Ошибка LLM не критична.
     try:
         comment = await ask_openrouter(
-            _analysis_prompt(info, trend, levels, zones), system_prompt=ANALYST_PROMPT
+            _analysis_prompt(info, trend, levels, zones, ob), system_prompt=ANALYST_PROMPT
         )
         await message.answer("🤖 " + comment)
     except Exception:
@@ -567,16 +601,16 @@ async def _do_analyze(message: Message, code: str):
 @dp.message(Command("analyze"))
 async def cmd_analyze(message: Message):
     parts = (message.text or "").split()
-    if len(parts) > 1 and parts[1].upper() in crypto_codes():
+    if len(parts) > 1 and parts[1].upper() in engine_codes():
         await _do_analyze(message, parts[1].upper())
         return
-    await message.answer("Выбери инструмент для анализа:", reply_markup=crypto_keyboard("analyze_"))
+    await message.answer("Выбери инструмент для анализа:", reply_markup=engine_keyboard("analyze_"))
 
 
 @dp.callback_query(F.data.startswith("analyze_"))
 async def cb_analyze(call: CallbackQuery):
     code = call.data.removeprefix("analyze_")
-    if code not in crypto_codes():
+    if code not in engine_codes():
         await call.answer()
         return
     await call.answer()
@@ -589,14 +623,14 @@ async def cmd_subscribe(message: Message):
     await message.answer(
         "Подписка на торговые сигналы (Spring/Upthrust). Нажми инструмент, чтобы "
         "включить/выключить уведомления:",
-        reply_markup=crypto_keyboard("subtoggle_", subs),
+        reply_markup=engine_keyboard("subtoggle_", subs),
     )
 
 
 @dp.callback_query(F.data.startswith("subtoggle_"))
 async def cb_subtoggle(call: CallbackQuery):
     code = call.data.removeprefix("subtoggle_")
-    if code not in crypto_codes():
+    if code not in engine_codes():
         await call.answer()
         return
     subs = set(database.get_user_subscriptions(call.from_user.id))
@@ -608,7 +642,7 @@ async def cb_subtoggle(call: CallbackQuery):
         database.add_subscription(call.from_user.id, code)
         subs.add(code)
         await call.answer("Подписка оформлена")
-    await call.message.edit_reply_markup(reply_markup=crypto_keyboard("subtoggle_", subs))
+    await call.message.edit_reply_markup(reply_markup=engine_keyboard("subtoggle_", subs))
 
 
 @dp.message(Command("signals"))
@@ -617,6 +651,12 @@ async def cmd_signals(message: Message):
     if not signals:
         await message.answer("Сигналов пока нет. Подписаться на инструменты — /subscribe.")
         return
+    status_label = {
+        "pending": "⏳ ждём",
+        "hit_tp": "✅ цель",
+        "hit_sl": "🛑 стоп",
+        "expired": "⌛ истёк",
+    }
     lines = []
     for s in signals:
         info = resolve(s["instrument"])
@@ -624,9 +664,10 @@ async def cmd_signals(message: Message):
         arrow = "🟢" if s["direction"] == "long" else "🔴"
         pat = "Spring" if s["pattern"] == "spring" else "Upthrust"
         star = "⭐" if s["priority"] == "high" else ""
+        label = status_label.get(s["status"], s["status"])
         lines.append(
             f"{arrow}{star} {info['name']} {pat} — вход {fmt(s['entry_price'], d)}, "
-            f"стоп {fmt(s['stop_loss'], d)}, цель {fmt(s['take_profit'], d)} [{s['status']}]"
+            f"стоп {fmt(s['stop_loss'], d)}, цель {fmt(s['take_profit'], d)} [{label}]"
         )
     await message.answer("Последние сигналы:\n" + "\n".join(lines))
 

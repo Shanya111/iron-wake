@@ -101,3 +101,46 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str) -> dict
             "bar_time": str(df.index[pos]),
         }
     return None
+
+
+def evaluate_signal(signal: dict, df: pd.DataFrame) -> str:
+    """Исход открытого сигнала по свечам, появившимся ПОСЛЕ свечи пробоя.
+
+    Вход в сделку — это закрытие свечи пробоя (signal['bar_time']), поэтому смотрим
+    только свечи строго после неё. Возвращает:
+      • 'hit_tp'  — цена дошла до цели (плюс);
+      • 'hit_sl'  — цена дошла до стопа (минус);
+      • 'expired' — за SIGNAL_EXPIRE_HOURS не дошла никуда (исход неизвестен);
+      • 'pending' — пока рано, ждём дальше.
+
+    Внутри одной свечи порядок касаний неизвестен, поэтому при двусмысленности
+    (свеча накрыла и стоп, и цель) считаем консервативно — сначала стоп.
+    Если у сигнала нет якоря bar_time (старый сигнал до 2-й волны) — не трогаем
+    его ('pending'): без точки отсчёта исход не определить честно.
+    """
+    bar_time = signal.get("bar_time")
+    if not bar_time:
+        return "pending"
+    after = df[df.index > pd.Timestamp(bar_time)]
+    if after.empty:
+        return "pending"
+
+    stop, tp = signal["stop_loss"], signal["take_profit"]
+    long = signal["direction"] == "long"
+    for _, c in after.iterrows():
+        hi, lo = float(c["high"]), float(c["low"])
+        if long:
+            if lo <= stop:
+                return "hit_sl"
+            if hi >= tp:
+                return "hit_tp"
+        else:
+            if hi >= stop:
+                return "hit_sl"
+            if lo <= tp:
+                return "hit_tp"
+
+    age_hours = (after.index[-1] - pd.Timestamp(bar_time)).total_seconds() / 3600
+    if age_hours >= config.SIGNAL_EXPIRE_HOURS:
+        return "expired"
+    return "pending"

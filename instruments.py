@@ -14,8 +14,12 @@
 # «касание уровня» по-прежнему работают по всем парам через yfinance (ticker).
 INSTRUMENTS = {
     "USDJPY": {"name": "USD/JPY",       "ticker": "USDJPY=X",     "decimals": 2},
-    "EURUSD": {"name": "EUR/USD",       "ticker": "EURUSD=X",     "decimals": 4},
-    "GBPUSD": {"name": "GBP/USD",       "ticker": "GBPUSD=X",     "decimals": 4},
+    "EURUSD": {"name": "EUR/USD",       "ticker": "EURUSD=X",     "decimals": 4,
+               "ccxt": {"symbol": "EUR/USD", "exchange": "kraken"}},
+    "GBPUSD": {"name": "GBP/USD",       "ticker": "GBPUSD=X",     "decimals": 4,
+               "ccxt": {"symbol": "GBP/USD", "exchange": "kraken"}},
+    "AUDUSD": {"name": "AUD/USD",       "ticker": "AUDUSD=X",     "decimals": 4,
+               "ccxt": {"symbol": "AUD/USD", "exchange": "kraken"}},
     "USDCAD": {"name": "USD/CAD",       "ticker": "USDCAD=X",     "decimals": 4},
     "GOLD":   {"name": "Золото",        "ticker": "GC=F",         "decimals": 2},
     "BRENT":  {"name": "Нефть Brent",   "ticker": "BZ=F",         "decimals": 2},
@@ -58,8 +62,10 @@ def resolve(pair: str) -> dict:
     return {"name": pair, "ticker": pair, "decimals": None}
 
 
-def crypto_codes() -> list[str]:
-    """Коды инструментов с биржевым объёмом (CCXT) — для анализа и сигналов."""
+def engine_codes() -> list[str]:
+    """Коды инструментов с биржевым объёмом (CCXT) — для анализа и сигналов.
+    Это крипта (Binance/Bybit) и форекс через Kraken (EUR/USD, GBP/USD, AUD/USD):
+    у всех на бирже есть настоящий объём, в отличие от форекса у Yahoo."""
     return [code for code, info in INSTRUMENTS.items() if "ccxt" in info]
 
 

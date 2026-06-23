@@ -26,6 +26,9 @@ _PROXY = os.getenv("CCXT_PROXY", "").strip()
 _exchanges: dict[str, "ccxt.Exchange"] = {}
 # Кеш свечей: (биржа, символ, таймфрейм) → (время_загрузки, DataFrame).
 _cache: dict[tuple[str, str, str], tuple[float, pd.DataFrame]] = {}
+# Кеш стакана: (биржа, символ) → (время_загрузки, order_book). Стакан меняется
+# быстро, поэтому отдельный короткий TTL (config.ORDERBOOK_TTL).
+_ob_cache: dict[tuple[str, str], tuple[float, dict]] = {}
 
 
 def _get_exchange(name: str):
@@ -63,6 +66,26 @@ async def get_candles(
     df = df.drop(columns=["ts"])
     _cache[key] = (time.time(), df)
     return df
+
+
+async def get_order_book(
+    symbol: str, limit: int | None = None, exchange: str = "binance"
+) -> dict:
+    """Стакан заявок биржи: {'bids': [[цена, объём], ...], 'asks': [...]}.
+
+    Кеш на config.ORDERBOOK_TTL секунд (короткий — стакан живой). Бросает
+    исключение при сетевой ошибке / отсутствии символа — вызывающий код ловит.
+    """
+    if limit is None:
+        limit = config.ORDERBOOK_LIMIT
+    key = (exchange, symbol)
+    cached = _ob_cache.get(key)
+    if cached is not None and time.time() - cached[0] < config.ORDERBOOK_TTL:
+        return cached[1]
+    ex = _get_exchange(exchange)
+    ob = await ex.fetch_order_book(symbol, limit=limit)
+    _ob_cache[key] = (time.time(), ob)
+    return ob
 
 
 async def close() -> None:

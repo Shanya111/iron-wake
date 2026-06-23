@@ -1,12 +1,14 @@
 """Фоновые задачи торгового движка: контекстный анализ и мониторинг паттернов.
 
-Использует тот же AsyncIOScheduler, что и простые алерты (см. bot.py). Две задачи:
+Использует тот же AsyncIOScheduler, что и простые алерты (см. bot.py). Три задачи:
   • run_analysis  (раз в час) — пересчитывает тренд/уровни/зоны и пишет в БД (levels);
   • monitor_signals (каждые 5 мин) — ищет Spring/Upthrust по свежим H1-свечам, пишет
-    в signals и рассылает подписчикам.
+    в signals и рассылает подписчикам;
+  • track_signals (каждые 5 мин) — следит за исходом открытых сигналов (дошёл до
+    цели/стопа/истёк) и сообщает подписчикам результат.
 
-Анализируются только КРИПТО-инструменты (есть биржевой объём) из числа тех, на
-которые есть хотя бы одна подписка — лишние пары не дёргаем.
+Анализируются только инструменты с биржевым объёмом (крипта + форекс через Kraken)
+из числа тех, на которые есть хотя бы одна подписка — лишние пары не дёргаем.
 """
 
 from datetime import datetime, timedelta
@@ -26,14 +28,14 @@ async def _fetch(code: str, timeframe: str, limit: int):
     return await data_fetcher.get_candles(sym["symbol"], timeframe, limit, sym["exchange"])
 
 
-def _subscribed_crypto() -> list[str]:
+def _subscribed_engine() -> list[str]:
     """Инструменты с подпиской, по которым есть биржевой объём (CCXT)."""
     return [c for c in database.get_subscribed_instruments() if ccxt_symbol(c)]
 
 
 async def run_analysis(bot=None) -> None:
     """Контекстный анализ (раз в час): тренд D1 + уровни D1/H1 + зоны ликвидности → БД."""
-    codes = _subscribed_crypto()
+    codes = _subscribed_engine()
     print(f"[run_analysis] инструментов к анализу: {len(codes)}")
     for code in codes:
         try:
@@ -64,7 +66,7 @@ def analyze_and_store(code: str, d1, h1) -> list[dict]:
 
 async def monitor_signals(bot) -> None:
     """Каждые 5 минут: ищем Spring/Upthrust по H1 и шлём подписчикам новые сигналы."""
-    codes = _subscribed_crypto()
+    codes = _subscribed_engine()
     for code in codes:
         try:
             h1 = await _fetch(code, config.H1_TIMEFRAME, config.H1_LIMIT)
@@ -86,10 +88,56 @@ async def monitor_signals(bot) -> None:
             database.add_signal(
                 code, signal["pattern"], signal["direction"],
                 signal["entry_price"], signal["stop_loss"], signal["take_profit"],
-                priority=signal["priority"],
+                priority=signal["priority"], bar_time=signal.get("bar_time"),
             )
             print(f"[monitor_signals] СИГНАЛ {code} {signal['pattern']} {signal['direction']}")
             await _notify(bot, code, signal)
+
+
+async def track_signals(bot) -> None:
+    """Каждые N минут: смотрим, дошли ли открытые сигналы до цели/стопа, и
+    сообщаем подписчикам исход. Свечи берём по разу на инструмент (кеш H1 общий
+    с monitor_signals, так что лишних запросов к бирже нет)."""
+    open_signals = database.get_open_signals()
+    if not open_signals:
+        return
+    candles: dict[str, object] = {}
+    for code in {s["instrument"] for s in open_signals}:
+        try:
+            candles[code] = await _fetch(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+        except Exception as e:
+            print(f"[track_signals] {code}: ошибка данных: {e}")
+    for s in open_signals:
+        df = candles.get(s["instrument"])
+        if df is None:
+            continue
+        outcome = pattern_detector.evaluate_signal(s, df)
+        if outcome == "pending":
+            continue
+        database.update_signal_status(s["id"], outcome)
+        print(f"[track_signals] {s['instrument']} #{s['id']} → {outcome}")
+        if outcome in ("hit_tp", "hit_sl"):
+            await _notify_outcome(bot, s, outcome)
+
+
+async def _notify_outcome(bot, signal: dict, outcome: str) -> None:
+    info = resolve(signal["instrument"])
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
+    arrow = "🟢 ЛОНГ" if signal["direction"] == "long" else "🔴 ШОРТ"
+    if outcome == "hit_tp":
+        head, price = "✅ Цель достигнута", signal["take_profit"]
+    else:
+        head, price = "🛑 Сработал стоп", signal["stop_loss"]
+    text = (
+        f"{head} — {info['name']} ({arrow})\n"
+        f"Вход был {fmt(signal['entry_price'], d)}, цена дошла до {fmt(price, d)}.\n\n"
+        "Это итог подсказки, не финсовет."
+    )
+    for user_id in database.get_subscribers(signal["instrument"]):
+        try:
+            await bot.send_message(user_id, text)
+        except Exception as e:
+            print(f"[track_signals] не отправить {user_id}: {e}")
 
 
 async def _notify(bot, code: str, signal: dict) -> None:
@@ -118,5 +166,6 @@ def setup(bot) -> AsyncIOScheduler:
     sched = AsyncIOScheduler()
     sched.add_job(run_analysis, "interval", minutes=config.ANALYZE_EVERY_MIN, args=[bot])
     sched.add_job(monitor_signals, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
+    sched.add_job(track_signals, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
     sched.start()
     return sched
