@@ -61,9 +61,19 @@ def init_db() -> None:
                 joined_at  TEXT    NOT NULL,
                 consent    INTEGER NOT NULL DEFAULT 0,
                 consent_at TEXT,
-                is_active  INTEGER NOT NULL DEFAULT 1
+                is_active  INTEGER NOT NULL DEFAULT 1,
+                access     TEXT    NOT NULL DEFAULT 'pending'  -- 'pending'|'approved'|'denied'
             )
         """)
+        # Доступ по подтверждению админом. При ПЕРВОМ добавлении колонки (старая база)
+        # все, кто уже зарегистрирован, одобряются автоматически — чтобы правка не
+        # выкинула текущих пользователей. На свежей базе колонка уже в CREATE → ALTER
+        # бросит OperationalError, и grandfather-UPDATE не выполнится (он и не нужен).
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN access TEXT NOT NULL DEFAULT 'pending'")
+            conn.execute("UPDATE users SET access = 'approved'")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
         # ── Торговый движок (VSA + Spring) ───────────────────────────────────
         # Уровни контекстного анализа (стратегия №1). Перезаписываются при каждом
         # анализе инструмента (см. save_levels): старые удаляем, новые пишем.
@@ -158,6 +168,49 @@ def mark_inactive(chat_id: int) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("UPDATE users SET is_active = 0 WHERE chat_id = ?", (chat_id,))
         conn.commit()
+
+
+# ── Доступ по подтверждению админом ──────────────────────────────────────────
+
+def get_access(chat_id: int) -> str | None:
+    """Статус доступа пользователя: 'pending' | 'approved' | 'denied',
+    или None — если пользователя ещё нет в базе."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT access FROM users WHERE chat_id = ?", (chat_id,)
+        ).fetchone()
+    return row[0] if row is not None else None
+
+
+def set_access(chat_id: int, value: str) -> None:
+    """Меняет статус доступа: 'approved' (одобрить) / 'denied' (отклонить) / 'pending'."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE users SET access = ? WHERE chat_id = ?", (value, chat_id))
+        conn.commit()
+
+
+def get_pending_users() -> list[dict]:
+    """Заявки на доступ, ожидающие решения админа (для команды /requests)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT chat_id, user_name FROM users
+            WHERE access = 'pending' ORDER BY joined_at
+        """).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_all_users() -> list[dict]:
+    """Все пользователи со статусами (для админской команды /users).
+    Сортировка: сначала ожидающие, затем одобренные, затем отклонённые."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT chat_id, user_name, access, consent, is_active FROM users
+            ORDER BY CASE access WHEN 'pending' THEN 0 WHEN 'approved' THEN 1 ELSE 2 END,
+                     joined_at
+        """).fetchall()
+    return [dict(row) for row in rows]
 
 
 def get_price_window(ticker: str, decimals: int | None = None, minutes: int = 7) -> dict:

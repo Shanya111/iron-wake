@@ -1,9 +1,10 @@
-import asyncio 
+import asyncio
 import os
+import re
 from pathlib import Path
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F
+from aiogram import Bot, BaseMiddleware, Dispatcher, F
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -91,11 +92,56 @@ else:
     bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
 dp = Dispatcher(storage=MemoryStorage())
 
+
+class AccessMiddleware(BaseMiddleware):
+    """Гейт доступа: пускает в бот только одобренных админом пользователей.
+
+    Неодобренному разрешена единственная команда — /start (отправить заявку).
+    Всё остальное (команды, кнопки, свободный текст) блокируется вежливым
+    сообщением. Админ проходит всегда, минуя проверку.
+    """
+
+    async def __call__(self, handler, event, data):
+        user = data.get("event_from_user")
+        if user is None:
+            return await handler(event, data)
+        if ADMIN_ID is not None and user.id == ADMIN_ID:
+            return await handler(event, data)
+
+        access = database.get_access(user.id)
+        if access == "approved":
+            return await handler(event, data)
+
+        # /start пропускаем — это вход и подача заявки на доступ.
+        if isinstance(event, Message) and (event.text or "").startswith("/start"):
+            return await handler(event, data)
+
+        # Доступа нет — блокируем, хендлер не вызываем.
+        if access == "denied":
+            note = "Администратор отклонил доступ к боту."
+        else:
+            note = ("⏳ Доступ к боту ещё не подтверждён администратором. "
+                    "Отправь /start и дождись подтверждения.")
+        if isinstance(event, Message):
+            await event.answer(note)
+        elif isinstance(event, CallbackQuery):
+            await event.answer(note, show_alert=True)
+        return
+
+
+dp.message.middleware(AccessMiddleware())
+dp.callback_query.middleware(AccessMiddleware())
+
+
 class AlertStates(StatesGroup):
     waiting_pair = State()
     waiting_custom_pair = State()
     waiting_rate = State()
     waiting_confirm = State()
+
+
+class ContactStates(StatesGroup):
+    waiting_message = State()
 
 
 def start_keyboard() -> InlineKeyboardMarkup:
@@ -136,14 +182,55 @@ def consent_keyboard() -> InlineKeyboardMarkup:
     ]])
 
 
+def access_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Кнопки админу для решения по заявке на доступ."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve_{user_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"deny_{user_id}"),
+    ]])
+
+
+async def notify_admin_new_request(user) -> None:
+    """Шлёт админу заявку на доступ с кнопками одобрения/отклонения."""
+    if ADMIN_ID is None:
+        return
+    username = f"@{user.username}" if user.username else "—"
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            f"🆕 Новая заявка на доступ:\n{user.full_name} {username} (id {user.id})",
+            reply_markup=access_keyboard(user.id),
+        )
+    except Exception as e:
+        print(f"notify_admin_new_request: не удалось уведомить админа: {e}")
+
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     user = message.from_user
+    prev = database.get_access(user.id)  # None — пользователь пришёл впервые
     database.save_user(user.id, user.full_name)
+    if ADMIN_ID is not None and user.id == ADMIN_ID:
+        database.set_access(user.id, "approved")  # админ одобрен всегда
+    access = database.get_access(user.id)
+
+    if access != "approved":
+        if access == "denied":
+            await message.answer("К сожалению, администратор отклонил доступ к боту.")
+            return
+        await message.answer(
+            f"👋 Привет, {user.first_name}! Доступ к боту выдаётся по подтверждению "
+            "администратора. Я отправил ему твою заявку — как только одобрит, напишу тебе."
+        )
+        # Уведомляем админа только о новой заявке (чтобы повторный /start не спамил).
+        if prev is None:
+            await notify_admin_new_request(user)
+        return
+
     await message.answer(
         f"Привет, {user.first_name}! Я iron-wake — слежу за курсами валют, металлов, "
         "нефти и крипты и пишу в момент, когда цена коснётся твоего уровня.\n\n"
-        "Поставить алерт — /alert. Свои алерты — /myalerts.\n\n"
+        "Поставить алерт — /alert. Свои алерты — /myalerts. Написать админу — /write.\n\n"
         "Выбери действие:",
         reply_markup=start_keyboard(),
     )
@@ -156,6 +243,175 @@ async def cmd_start(message: Message):
         "Нажимая «Согласен», ты даёшь согласие на обработку этих данных. "
         "Подробности — команда /privacy.",
         reply_markup=consent_keyboard(),
+    )
+
+
+@dp.callback_query(F.data.startswith("approve_"))
+async def cb_approve(call: CallbackQuery):
+    if ADMIN_ID is None or call.from_user.id != ADMIN_ID:
+        await call.answer("Только администратор", show_alert=True)
+        return
+    uid = int(call.data.removeprefix("approve_"))
+    database.set_access(uid, "approved")
+    await call.answer("Одобрен")
+    try:
+        await call.message.edit_text((call.message.text or "") + "\n\n✅ Одобрен")
+    except Exception:
+        pass
+    try:
+        await bot.send_message(uid, "✅ Доступ к боту подтверждён! Нажми /start, чтобы начать.")
+    except Exception as e:
+        print(f"cb_approve: не удалось уведомить {uid}: {e}")
+
+
+@dp.callback_query(F.data.startswith("deny_"))
+async def cb_deny(call: CallbackQuery):
+    if ADMIN_ID is None or call.from_user.id != ADMIN_ID:
+        await call.answer("Только администратор", show_alert=True)
+        return
+    uid = int(call.data.removeprefix("deny_"))
+    database.set_access(uid, "denied")
+    await call.answer("Отклонён")
+    try:
+        await call.message.edit_text((call.message.text or "") + "\n\n❌ Отклонён")
+    except Exception:
+        pass
+    try:
+        await bot.send_message(uid, "К сожалению, администратор отклонил доступ к боту.")
+    except Exception as e:
+        print(f"cb_deny: не удалось уведомить {uid}: {e}")
+
+
+@dp.message(Command("requests"))
+async def cmd_requests(message: Message):
+    """Список ожидающих заявок на доступ — на случай, если уведомление потерялось."""
+    if ADMIN_ID is None or message.from_user.id != ADMIN_ID:
+        await message.answer("Команда доступна только администратору.")
+        return
+    pending = database.get_pending_users()
+    if not pending:
+        await message.answer("Заявок на доступ нет.")
+        return
+    await message.answer(f"Ожидают подтверждения: {len(pending)}")
+    for u in pending:
+        await message.answer(
+            f"🆕 {u['user_name']} (id {u['chat_id']})",
+            reply_markup=access_keyboard(u["chat_id"]),
+        )
+
+
+ACCESS_LABEL = {"approved": "✅ одобрен", "pending": "⏳ ждёт", "denied": "🚫 отклонён"}
+
+
+def users_text_and_kb() -> tuple[str, InlineKeyboardMarkup | None]:
+    """Текст списка всех пользователей со статусами + кнопка переключения доступа
+    на каждого (бан одобренному / выдать доступ остальным). Себя (админа) не трогаем."""
+    users = database.get_all_users()
+    if not users:
+        return "Пользователей нет.", None
+    lines = ["👥 Пользователи бота:"]
+    rows = []
+    for u in users:
+        uid = u["chat_id"]
+        label = ACCESS_LABEL.get(u["access"], u["access"])
+        blocked = " 🔇" if not u["is_active"] else ""
+        if uid == ADMIN_ID:
+            lines.append(f"• {u['user_name']} (id {uid}) — 👑 админ")
+            continue
+        lines.append(f"• {u['user_name']} (id {uid}) — {label}{blocked}")
+        if u["access"] == "approved":
+            rows.append([InlineKeyboardButton(
+                text=f"🚫 Бан {u['user_name']}", callback_data=f"usr:ban:{uid}")])
+        else:
+            rows.append([InlineKeyboardButton(
+                text=f"✅ Доступ {u['user_name']}", callback_data=f"usr:ok:{uid}")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    return "\n".join(lines), kb
+
+
+@dp.message(Command("users"))
+async def cmd_users(message: Message):
+    if ADMIN_ID is None or message.from_user.id != ADMIN_ID:
+        await message.answer("Команда доступна только администратору.")
+        return
+    text, kb = users_text_and_kb()
+    await message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("usr:"))
+async def cb_user_toggle(call: CallbackQuery):
+    if ADMIN_ID is None or call.from_user.id != ADMIN_ID:
+        await call.answer("Только администратор", show_alert=True)
+        return
+    try:
+        _, action, uid_s = call.data.split(":")
+        uid = int(uid_s)
+    except ValueError:
+        await call.answer()
+        return
+    if uid == ADMIN_ID:
+        await call.answer("Себя нельзя", show_alert=True)
+        return
+    if action == "ban":
+        database.set_access(uid, "denied")
+        await call.answer("Доступ снят")
+        try:
+            await bot.send_message(uid, "🚫 Администратор отозвал доступ к боту.")
+        except Exception:
+            pass
+    else:
+        database.set_access(uid, "approved")
+        await call.answer("Доступ выдан")
+        try:
+            await bot.send_message(uid, "✅ Доступ к боту выдан! Нажми /start, чтобы начать.")
+        except Exception:
+            pass
+    text, kb = users_text_and_kb()
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def _set_access_by_command(message: Message, value: str, ok_note: str, user_note: str):
+    """Общая логика /ban и /unban: разбор id из текста, смена доступа, уведомления."""
+    if ADMIN_ID is None or message.from_user.id != ADMIN_ID:
+        await message.answer("Команда доступна только администратору.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Укажи id: например /ban 123456789 (id виден в /users).")
+        return
+    uid = int(parts[1])
+    if uid == ADMIN_ID:
+        await message.answer("Себя трогать нельзя.")
+        return
+    if database.get_access(uid) is None:
+        await message.answer("Такого пользователя нет в базе.")
+        return
+    database.set_access(uid, value)
+    await message.answer(ok_note.format(uid=uid))
+    try:
+        await bot.send_message(uid, user_note)
+    except Exception:
+        pass
+
+
+@dp.message(Command("ban"))
+async def cmd_ban(message: Message):
+    await _set_access_by_command(
+        message, "denied",
+        ok_note="Доступ снят у id {uid}.",
+        user_note="🚫 Администратор отозвал доступ к боту.",
+    )
+
+
+@dp.message(Command("unban"))
+async def cmd_unban(message: Message):
+    await _set_access_by_command(
+        message, "approved",
+        ok_note="Доступ выдан id {uid}.",
+        user_note="✅ Доступ к боту выдан! Нажми /start, чтобы начать.",
     )
 
 
@@ -183,6 +439,7 @@ HELP_TEXT = (
     "/privacy — политика конфиденциальности\n"
     "/unsubscribe — отписаться от уведомлений\n"
     "/myid — узнать свой Telegram ID\n"
+    "/write — написать администратору\n"
     "/alert — поставить алерт на уровень (выбор инструмента)\n"
     "/myalerts — мои алерты (посмотреть и удалить)\n"
     "/analyze — анализ инструмента: тренд D1 + уровни + зоны ликвидности\n"
@@ -312,10 +569,13 @@ async def cmd_alert(message: Message, state: FSMContext):
     await message.answer("Выбери инструмент для алерта:", reply_markup=pairs_keyboard())
 
 
-@dp.message(Command("cancel"), StateFilter(AlertStates))
+@dp.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
+    if await state.get_state() is None:
+        await message.answer("Сейчас нечего отменять.")
+        return
     await state.clear()
-    await message.answer("Настройка алерта отменена.", reply_markup=start_keyboard())
+    await message.answer("Отменено.", reply_markup=start_keyboard())
 
 
 # ── Шаг 1: выбор инструмента ────────────────────────────────────────────────────
@@ -844,6 +1104,61 @@ async def successful_payment(message: Message):
     await message.answer("Оплата прошла! Алерты активированы.")
 
 
+# ── Связь с администратором ─────────────────────────────────────────────────
+
+@dp.message(Command("write"))
+async def cmd_write(message: Message, state: FSMContext):
+    if ADMIN_ID is None:
+        await message.answer("Связь с администратором сейчас недоступна.")
+        return
+    await state.set_state(ContactStates.waiting_message)
+    await message.answer(
+        "✍️ Напиши одним сообщением, что передать администратору. Отмена — /cancel."
+    )
+
+
+@dp.message(ContactStates.waiting_message)
+async def contact_message(message: Message, state: FSMContext):
+    await state.clear()
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Пустое сообщение не отправил. Попробуй ещё раз — /write.")
+        return
+    try:
+        # (id ...) в тексте — якорь: по нему ответ админа reply'ем находит адресата.
+        await bot.send_message(
+            ADMIN_ID,
+            f"✉️ Сообщение от {message.from_user.full_name} (id {message.from_user.id}):\n\n{text}",
+        )
+        await message.answer("Отправил администратору ✅. Ответ придёт сюда же.")
+    except Exception as e:
+        print(f"contact_message: не удалось доставить админу: {e}")
+        await message.answer("Не получилось отправить сейчас, попробуй позже.")
+
+
+# Ответ админа: reply'ем на пересланное сообщение пользователя → летит автору.
+# Регистрируется ПЕРЕД free_text, чтобы перехватить ответы до отправки в LLM.
+@dp.message(StateFilter(None), F.reply_to_message, F.text)
+async def admin_reply(message: Message):
+    src = message.reply_to_message
+    is_user_msg = bool(src and src.text and src.text.startswith("✉️"))
+    if ADMIN_ID is None or message.from_user.id != ADMIN_ID or not is_user_msg:
+        # Не ответ админа на сообщение пользователя — обычный свободный текст.
+        await free_text(message)
+        return
+    m = re.search(r"\(id (\d+)\)", src.text)
+    if not m:
+        await message.answer("Не нашёл, кому ответить.")
+        return
+    target = int(m.group(1))
+    try:
+        await bot.send_message(target, f"💬 Ответ администратора:\n\n{message.text}")
+        await message.answer("Ответ отправлен ✅")
+    except Exception as e:
+        print(f"admin_reply: не удалось доставить {target}: {e}")
+        await message.answer("Не удалось доставить — пользователь, видимо, заблокировал бота.")
+
+
 # ── Свободный текст → OpenRouter (только вне FSM-сценариев) ──────────────────
 
 @dp.message(F.text, StateFilter(None))
@@ -955,6 +1270,7 @@ async def main():
         BotCommand(command="privacy",     description="Политика конфиденциальности"),
         BotCommand(command="unsubscribe", description="Отписаться от уведомлений"),
         BotCommand(command="myid",        description="Узнать свой Telegram ID"),
+        BotCommand(command="write",       description="Написать администратору"),
         BotCommand(command="pay",         description="Оплатить доступ к алертам"),
     ])
     try:
