@@ -121,7 +121,8 @@ def save_user(chat_id: int, user_name: str) -> None:
             INSERT INTO users (chat_id, user_name, joined_at)
             VALUES (?, ?, ?)
             ON CONFLICT(chat_id) DO UPDATE SET
-                user_name = excluded.user_name
+                user_name = excluded.user_name,
+                is_active = 1
         """, (chat_id, user_name, joined_at))
         conn.commit()
 

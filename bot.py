@@ -10,6 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
@@ -244,18 +245,45 @@ async def cmd_broadcast(message: Message):
         await message.answer("Укажи текст: /broadcast Ваше сообщение")
         return
 
-    users = database.get_active_consented_users()
+    # Себе (админу) рассылку не шлём — он автор, ему достаётся только отчёт.
+    # Иначе твой же текст дублируется в твой чат рядом с отчётом.
+    users = [uid for uid in database.get_active_consented_users() if uid != ADMIN_ID]
+    if not users:
+        await message.answer("Нет подписчиков для рассылки.")
+        return
+
     sent = 0
     blocked = 0
+    errors = 0
     for chat_id in users:
         try:
             await bot.send_message(chat_id, text)
             sent += 1
-        except Exception:
+        except TelegramForbiddenError:
+            # Пользователь заблокировал бота / удалил аккаунт — выключаем навсегда.
             database.mark_inactive(chat_id)
             blocked += 1
+        except TelegramRetryAfter as e:
+            # Флуд-лимит Telegram — ждём положенное и пробуем ещё раз. Подписчика
+            # НЕ выключаем: он доступен, просто слишком быстро шлём.
+            await asyncio.sleep(e.retry_after)
+            try:
+                await bot.send_message(chat_id, text)
+                sent += 1
+            except Exception as e2:
+                print(f"broadcast: повтор для {chat_id} не удался: {e2}")
+                errors += 1
+        except Exception as e:
+            # Временный сбой (сеть и т.п.) — НЕ выключаем подписчика, чтобы он не
+            # выпал из всех будущих рассылок из-за одной разовой ошибки.
+            print(f"broadcast: ошибка отправки {chat_id}: {e}")
+            errors += 1
+        await asyncio.sleep(0.05)  # бережём флуд-лимит Telegram между отправками
 
-    await message.answer(f"Отправлено: {sent}, заблокировано: {blocked}")
+    report = f"Отправлено: {sent}, заблокировано: {blocked}"
+    if errors:
+        report += f", ошибок (повторим в след. раз): {errors}"
+    await message.answer(report)
 
 
 # Обработчики inline-кнопок
