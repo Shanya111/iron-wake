@@ -14,6 +14,7 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeChat,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -1257,6 +1258,7 @@ async def main():
     engine.setup(bot)
     await engine.run_analysis(bot)  # первичный анализ при старте
 
+    # Меню обычного пользователя (видят все). Админских команд и /settings тут нет.
     await bot.set_my_commands([
         BotCommand(command="start",       description="Главное меню"),
         BotCommand(command="alert",       description="Поставить алерт на уровень"),
@@ -1264,15 +1266,37 @@ async def main():
         BotCommand(command="analyze",     description="Анализ инструмента (тренд + уровни)"),
         BotCommand(command="subscribe",   description="Подписка на торговые сигналы"),
         BotCommand(command="signals",     description="Последние сигналы"),
-        BotCommand(command="settings",    description="Настройки порогов сигналов"),
+        BotCommand(command="write",       description="Написать администратору"),
         BotCommand(command="cancel",      description="Отмена"),
         BotCommand(command="help",        description="Помощь"),
         BotCommand(command="privacy",     description="Политика конфиденциальности"),
         BotCommand(command="unsubscribe", description="Отписаться от уведомлений"),
         BotCommand(command="myid",        description="Узнать свой Telegram ID"),
-        BotCommand(command="write",       description="Написать администратору"),
         BotCommand(command="pay",         description="Оплатить доступ к алертам"),
     ])
+
+    # Персональное меню админа (только в чате ADMIN_ID): админские команды наверху,
+    # /write тут не нужен — админу некому себе писать.
+    if ADMIN_ID is not None:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="users",     description="Пользователи и доступ"),
+                BotCommand(command="requests",  description="Заявки на доступ"),
+                BotCommand(command="ban",       description="Снять доступ: /ban id"),
+                BotCommand(command="unban",     description="Вернуть доступ: /unban id"),
+                BotCommand(command="broadcast", description="Рассылка всем: /broadcast текст"),
+                BotCommand(command="settings",  description="Настройки порогов сигналов"),
+                BotCommand(command="start",     description="Главное меню"),
+                BotCommand(command="alert",     description="Поставить алерт на уровень"),
+                BotCommand(command="myalerts",  description="Мои алерты"),
+                BotCommand(command="analyze",   description="Анализ инструмента (тренд + уровни)"),
+                BotCommand(command="subscribe", description="Подписка на торговые сигналы"),
+                BotCommand(command="signals",   description="Последние сигналы"),
+                BotCommand(command="help",      description="Помощь"),
+                BotCommand(command="cancel",    description="Отмена"),
+            ],
+            scope=BotCommandScopeChat(chat_id=ADMIN_ID),
+        )
     try:
         await dp.start_polling(bot)
     finally:
