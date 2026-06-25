@@ -604,8 +604,22 @@ def get_hourly_candles(ticker: str, lookback_days: int = 7) -> pd.DataFrame:
     ValueError, если данных нет.
     """
     df = yf.Ticker(ticker).history(period=f"{lookback_days}d", interval="1h")
+    return _normalize_yahoo(df, ticker, "часовых")
+
+
+def get_daily_candles(ticker: str, lookback_days: int = 90) -> pd.DataFrame:
+    """Дневные свечи по тикеру Yahoo в том же формате, что и биржевые свечи движка
+    (open/high/low/close/volume, индекс — UTC). Нужно для движка по золоту/нефти
+    (источник 'yahoo'): контекстный анализ D1 + тренд. Бросает ValueError, если нет данных."""
+    df = yf.Ticker(ticker).history(period=f"{lookback_days}d", interval="1d")
+    return _normalize_yahoo(df, ticker, "дневных")
+
+
+def _normalize_yahoo(df: pd.DataFrame, ticker: str, kind: str) -> pd.DataFrame:
+    """Приводит свечи yfinance к формату движка: столбцы open/high/low/close/volume,
+    индекс — время в UTC. kind — для текста ошибки ('часовых'/'дневных')."""
     if df is None or df.empty:
-        raise ValueError(f"нет часовых свечей по тикеру {ticker}")
+        raise ValueError(f"нет {kind} свечей по тикеру {ticker}")
     df = df.rename(columns={
         "Open": "open", "High": "high", "Low": "low",
         "Close": "close", "Volume": "volume",

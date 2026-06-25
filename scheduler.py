@@ -7,8 +7,9 @@
   • track_signals (каждые 5 мин) — следит за исходом открытых сигналов (дошёл до
     цели/стопа/истёк) и сообщает подписчикам результат.
 
-Анализируются только инструменты с биржевым объёмом (крипта + форекс через Kraken)
-из числа тех, на которые есть хотя бы одна подписка — лишние пары не дёргаем.
+Анализируются инструменты движка (есть источник объёма) из числа подписанных —
+лишние пары не дёргаем. Источник свечей зависит от инструмента (instruments.data_source):
+крипта/форекс — Kraken (CCXT), золото/нефть — Yahoo (см. fetch_candles).
 """
 
 import asyncio
@@ -22,17 +23,37 @@ import data_fetcher
 import database
 import llm
 import pattern_detector
-from instruments import ccxt_symbol, fmt, infer_decimals, resolve
+from instruments import ccxt_symbol, data_source, fmt, infer_decimals, resolve
 
 
-async def _fetch(code: str, timeframe: str, limit: int):
-    sym = ccxt_symbol(code)
-    return await data_fetcher.get_candles(sym["symbol"], timeframe, limit, sym["exchange"])
+def _yahoo_days(timeframe: str, limit: int) -> int:
+    """Сколько календарных дней истории просить у Yahoo, чтобы вышло ~limit свечей
+    (с запасом на выходные). H1: у фьючерсов ~16–18 торговых часов в сутки."""
+    if timeframe == config.H1_TIMEFRAME:
+        return max(7, limit // 12 + 5)   # 120 H1 → ~15 дней
+    return limit * 2 + 10                 # 30 D1 → ~70 дней
+
+
+async def fetch_candles(code: str, timeframe: str, limit: int):
+    """Свечи инструмента движка из его источника (см. instruments.data_source):
+    'ccxt' — биржа Kraken (крипта/форекс), 'yahoo' — свечи Yahoo (золото/нефть).
+    Возвращает DataFrame OHLCV с UTC-индексом — единый формат для аналитики."""
+    src = data_source(code)
+    if src == "ccxt":
+        sym = ccxt_symbol(code)
+        return await data_fetcher.get_candles(sym["symbol"], timeframe, limit, sym["exchange"])
+    if src == "yahoo":
+        ticker = resolve(code)["ticker"]
+        days = _yahoo_days(timeframe, limit)
+        fn = database.get_hourly_candles if timeframe == config.H1_TIMEFRAME else database.get_daily_candles
+        df = await asyncio.to_thread(fn, ticker, days)
+        return df.tail(limit)
+    raise ValueError(f"нет источника свечей для {code}")
 
 
 def _subscribed_engine() -> list[str]:
-    """Инструменты с подпиской, по которым есть биржевой объём (CCXT)."""
-    return [c for c in database.get_subscribed_instruments() if ccxt_symbol(c)]
+    """Инструменты с подпиской, входящие в движок (есть источник объёма: ccxt/yahoo)."""
+    return [c for c in database.get_subscribed_instruments() if data_source(c)]
 
 
 async def run_analysis(bot=None) -> None:
@@ -41,8 +62,8 @@ async def run_analysis(bot=None) -> None:
     print(f"[run_analysis] инструментов к анализу: {len(codes)}")
     for code in codes:
         try:
-            d1 = await _fetch(code, config.D1_TIMEFRAME, config.D1_LIMIT)
-            h1 = await _fetch(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+            d1 = await fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
+            h1 = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
         except Exception as e:
             print(f"[run_analysis] {code}: ошибка данных: {e}")
             continue
@@ -80,8 +101,8 @@ async def monitor_signals(bot) -> None:
         if not subscribers:
             continue
         try:
-            h1 = await _fetch(code, config.H1_TIMEFRAME, config.H1_LIMIT)
-            d1 = await _fetch(code, config.D1_TIMEFRAME, config.D1_LIMIT)
+            h1 = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+            d1 = await fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
         except Exception as e:
             print(f"[monitor_signals] {code}: ошибка данных: {e}")
             continue
@@ -124,7 +145,7 @@ async def track_signals(bot) -> None:
     candles: dict[str, object] = {}
     for code in {s["instrument"] for s in open_signals}:
         try:
-            candles[code] = await _fetch(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+            candles[code] = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
         except Exception as e:
             print(f"[track_signals] {code}: ошибка данных: {e}")
     for s in open_signals:
@@ -155,7 +176,7 @@ async def track_trades(bot) -> None:
     for code in {t["instrument"] for t in trades}:
         try:
             if ccxt_symbol(code):
-                candles[code] = await _fetch(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+                candles[code] = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
             else:
                 ticker = resolve(code)["ticker"]
                 candles[code] = await asyncio.to_thread(database.get_hourly_candles, ticker)
@@ -229,17 +250,18 @@ async def _signal_comment(code: str, signal: dict, trend: str) -> str | None:
     info = resolve(code)
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
     dom = ""
-    try:
-        sym = ccxt_symbol(code)
-        ob = analyzer.analyze_order_book(
-            await data_fetcher.get_order_book(sym["symbol"], exchange=sym["exchange"])
-        )
-        if ob:
-            pr = {"buyers": "перевес покупателей", "sellers": "перевес продавцов",
-                  "balance": "баланс сил"}[ob["pressure"]]
-            dom = f"Стакан: {pr} (дисбаланс {ob['imbalance'] * 100:+.0f}%).\n"
-    except Exception:
-        dom = ""
+    sym = ccxt_symbol(code)
+    if sym:  # стакан есть только у биржевых инструментов (Kraken); у золота/нефти — нет
+        try:
+            ob = analyzer.analyze_order_book(
+                await data_fetcher.get_order_book(sym["symbol"], exchange=sym["exchange"])
+            )
+            if ob:
+                pr = {"buyers": "перевес покупателей", "sellers": "перевес продавцов",
+                      "balance": "баланс сил"}[ob["pressure"]]
+                dom = f"Стакан: {pr} (дисбаланс {ob['imbalance'] * 100:+.0f}%).\n"
+        except Exception:
+            dom = ""
     trend_ru = {"up": "восходящий", "down": "нисходящий", "sideways": "боковик"}[trend]
     strength = "сильный (часовой совпал с дневным)" if signal["priority"] == "high" else "обычный"
     pat = ("Spring — ложный пробой поддержки вниз с возвратом (лонг)"
