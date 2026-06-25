@@ -11,6 +11,7 @@
 из числа тех, на которые есть хотя бы одна подписка — лишние пары не дёргаем.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -19,6 +20,7 @@ import analyzer
 import config
 import data_fetcher
 import database
+import llm
 import pattern_detector
 from instruments import ccxt_symbol, fmt, infer_decimals, resolve
 
@@ -91,7 +93,7 @@ async def monitor_signals(bot) -> None:
                 priority=signal["priority"], bar_time=signal.get("bar_time"),
             )
             print(f"[monitor_signals] СИГНАЛ {code} {signal['pattern']} {signal['direction']}")
-            await _notify(bot, code, signal)
+            await _notify(bot, code, signal, trend)
 
 
 async def track_signals(bot) -> None:
@@ -120,6 +122,64 @@ async def track_signals(bot) -> None:
             await _notify_outcome(bot, s, outcome)
 
 
+async def track_trades(bot) -> None:
+    """Каждые N минут: проверяем сделки журнала — дошли ли до цели/стопа.
+
+    Источник свечей по инструменту: движковые (BTC, EUR/USD…) — Kraken H1 (общий кеш
+    с сигналами), остальные (золото, нефть, своя пара) — часовые свечи Yahoo. Журнал
+    НЕ истекает: 'expired' трактуем как 'ещё открыта' — держим до цели/стопа/ручного
+    закрытия. Внутри свечи при двусмысленности pattern_detector считает стоп раньше.
+    """
+    trades = database.get_open_trades()
+    if not trades:
+        return
+    candles: dict[str, object] = {}
+    for code in {t["instrument"] for t in trades}:
+        try:
+            if ccxt_symbol(code):
+                candles[code] = await _fetch(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+            else:
+                ticker = resolve(code)["ticker"]
+                candles[code] = await asyncio.to_thread(database.get_hourly_candles, ticker)
+        except Exception as e:
+            print(f"[track_trades] {code}: ошибка данных: {e}")
+    for t in trades:
+        df = candles.get(t["instrument"])
+        if df is None:
+            continue
+        # Переходник под pattern_detector.evaluate_signal (он ждёт stop_loss/take_profit).
+        probe = {
+            "direction": t["direction"], "stop_loss": t["stop_loss"],
+            "take_profit": t["take_profit"], "bar_time": t["bar_time"],
+        }
+        outcome = pattern_detector.evaluate_signal(probe, df)
+        if outcome in ("pending", "expired"):
+            continue  # журнал не истекает — оставляем открытой
+        database.update_trade_status(t["id"], outcome)
+        print(f"[track_trades] {t['instrument']} сделка #{t['id']} → {outcome}")
+        await _notify_trade_outcome(bot, t, outcome)
+
+
+async def _notify_trade_outcome(bot, trade: dict, outcome: str) -> None:
+    info = resolve(trade["instrument"])
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(trade["entry_price"])
+    arrow = "🟢 ЛОНГ" if trade["direction"] == "long" else "🔴 ШОРТ"
+    if outcome == "hit_tp":
+        head, price = "✅ Цель достигнута", trade["take_profit"]
+    else:
+        head, price = "🛑 Сработал стоп", trade["stop_loss"]
+    text = (
+        f"📒 Сделка из журнала — {head}\n"
+        f"{info['name']} ({arrow})\n"
+        f"Вход был {fmt(trade['entry_price'], d)}, цена дошла до {fmt(price, d)}.\n\n"
+        "Журнал ведётся для статистики, это не финсовет."
+    )
+    try:
+        await bot.send_message(trade["user_id"], text)
+    except Exception as e:
+        print(f"[track_trades] не отправить {trade['user_id']}: {e}")
+
+
 async def _notify_outcome(bot, signal: dict, outcome: str) -> None:
     info = resolve(signal["instrument"])
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
@@ -140,20 +200,63 @@ async def _notify_outcome(bot, signal: dict, outcome: str) -> None:
             print(f"[track_signals] не отправить {user_id}: {e}")
 
 
-async def _notify(bot, code: str, signal: dict) -> None:
+async def _signal_comment(code: str, signal: dict, trend: str) -> str | None:
+    """1–2 предложения контекста к сигналу от LLM: тренд + сила уровня + стакан.
+    Стакан тянем здесь (раз на сигнал, кеш 30 сек). Любая осечка → None (сигнал
+    уйдёт без комментария)."""
+    info = resolve(code)
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
+    dom = ""
+    try:
+        sym = ccxt_symbol(code)
+        ob = analyzer.analyze_order_book(
+            await data_fetcher.get_order_book(sym["symbol"], exchange=sym["exchange"])
+        )
+        if ob:
+            pr = {"buyers": "перевес покупателей", "sellers": "перевес продавцов",
+                  "balance": "баланс сил"}[ob["pressure"]]
+            dom = f"Стакан: {pr} (дисбаланс {ob['imbalance'] * 100:+.0f}%).\n"
+    except Exception:
+        dom = ""
+    trend_ru = {"up": "восходящий", "down": "нисходящий", "sideways": "боковик"}[trend]
+    strength = "сильный (часовой совпал с дневным)" if signal["priority"] == "high" else "обычный"
+    pat = ("Spring — ложный пробой поддержки вниз с возвратом (лонг)"
+           if signal["pattern"] == "spring"
+           else "Upthrust — ложный пробой сопротивления вверх с возвратом (шорт)")
+    summary = (
+        f"Инструмент: {info['name']}\n"
+        f"Паттерн: {pat}\n"
+        f"Тренд D1: {trend_ru}\n"
+        f"Сила пробитого уровня: {strength}\n"
+        f"Вход {fmt(signal['entry_price'], d)}, стоп {fmt(signal['stop_loss'], d)}, "
+        f"цель {fmt(signal['take_profit'], d)}.\n"
+        f"{dom}"
+    )
+    return await llm.comment_on_signal(summary)
+
+
+async def _notify(bot, code: str, signal: dict, trend: str) -> None:
     info = resolve(code)
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
     arrow = "🟢 ЛОНГ" if signal["direction"] == "long" else "🔴 ШОРТ"
     name = "Spring (пружина)" if signal["pattern"] == "spring" else "Upthrust (зеркало)"
     star = "⭐ " if signal["priority"] == "high" else ""
+    risk = abs(signal["entry_price"] - signal["stop_loss"])
+    reward = abs(signal["take_profit"] - signal["entry_price"])
+    rr = reward / risk if risk else 0
     text = (
         f"{star}{arrow} — {info['name']}\n"
         f"Паттерн: {name}\n"
         f"Вход: {fmt(signal['entry_price'], d)}\n"
         f"Стоп: {fmt(signal['stop_loss'], d)}\n"
-        f"Цель: {fmt(signal['take_profit'], d)}\n\n"
+        f"Цель: {fmt(signal['take_profit'], d)}\n"
+        f"Профит/риск: 1:{rr:.1f}\n\n"
         "Это подсказка, не приказ. Решение и риск — на тебе."
     )
+    # AI-комментарий считаем один раз на сигнал (а не на каждого подписчика).
+    comment = await _signal_comment(code, signal, trend)
+    if comment:
+        text += f"\n\n🤖 {comment}"
     for user_id in database.get_subscribers(code):
         try:
             await bot.send_message(user_id, text)
@@ -167,5 +270,6 @@ def setup(bot) -> AsyncIOScheduler:
     sched.add_job(run_analysis, "interval", minutes=config.ANALYZE_EVERY_MIN, args=[bot])
     sched.add_job(monitor_signals, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
     sched.add_job(track_signals, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
+    sched.add_job(track_trades, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
     sched.start()
     return sched

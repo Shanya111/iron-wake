@@ -77,18 +77,32 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str) -> dict
             continue
 
         priority = "high" if lvl.get("strength") == "strong" else "normal"
+        # Минимальный R:R (прибыль/риск). Цель — ближайший противоположный уровень,
+        # но сигнал берём, только если он даёт хотя бы MIN_RR; ближе — сделка
+        # невыгодна, пропускаем. Нет уровня впереди → ставим цель ровно на MIN_RR×риск.
+        min_rr = config.get("MIN_RR")
         if side == "long":
             entry = c
             stop = l * (1 - config.STOP_SPREAD)
-            tp = _nearest(levels, "resistance", entry, above=True)
-            if tp is None:
-                tp = entry + (entry - stop) * 2    # запасной тейк 2R
+            risk = entry - stop
+            target = _nearest(levels, "resistance", entry, above=True)
+            if target is None:
+                tp = entry + risk * min_rr
+            elif (target - entry) >= risk * min_rr:
+                tp = target
+            else:
+                continue
         else:
             entry = c
             stop = h * (1 + config.STOP_SPREAD)
-            tp = _nearest(levels, "support", entry, above=False)
-            if tp is None:
-                tp = entry - (stop - entry) * 2
+            risk = stop - entry
+            target = _nearest(levels, "support", entry, above=False)
+            if target is None:
+                tp = entry - risk * min_rr
+            elif (entry - target) >= risk * min_rr:
+                tp = target
+            else:
+                continue
 
         return {
             "pattern": "spring" if side == "long" else "upthrust",

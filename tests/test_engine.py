@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd  # noqa: E402
 
 import analyzer  # noqa: E402
+import config  # noqa: E402
 import pattern_detector  # noqa: E402
 
 
@@ -109,6 +110,28 @@ def test_spring_needs_abnormal_volume():
     df.iloc[23, df.columns.get_loc("volume")] = 100.0   # объём как у соседей — не Spring
     levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
     assert pattern_detector.detect_spring(df, levels, trend="up") is None
+
+
+def test_spring_filtered_by_bad_rr():
+    # Цель (ближайшее сопротивление 101.5) слишком близко: при стопе ниже 99 риск ~1.6,
+    # а до цели всего ~1.0 → R:R < 1:2 → сигнал не берём.
+    df = _spring_df()
+    levels = [
+        {"price": 100.0, "type": "support", "strength": "strong"},
+        {"price": 101.5, "type": "resistance", "strength": "weak"},
+    ]
+    assert pattern_detector.detect_spring(df, levels, trend="up") is None
+
+
+def test_spring_fallback_target_min_rr():
+    # Сопротивления впереди нет → цель ставится ровно на MIN_RR × риск.
+    df = _spring_df()
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
+    sig = pattern_detector.detect_spring(df, levels, trend="up")
+    assert sig is not None
+    risk = sig["entry_price"] - sig["stop_loss"]
+    expected_tp = sig["entry_price"] + risk * config.get("MIN_RR")
+    assert abs(sig["take_profit"] - expected_tp) < 1e-9
 
 
 def _upthrust_df() -> pd.DataFrame:

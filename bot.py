@@ -1,9 +1,8 @@
 import asyncio
 import os
 import re
-from pathlib import Path
+from datetime import datetime, timezone
 
-import aiohttp
 from aiogram import Bot, BaseMiddleware, Dispatcher, F
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram.filters import Command, CommandStart, StateFilter
@@ -29,6 +28,7 @@ import config
 import data_fetcher
 import database
 import scheduler as engine
+from llm import ANALYST_PROMPT, ask_openrouter, classify_intent
 from instruments import (
     INSTRUMENTS,
     ccxt_symbol,
@@ -40,47 +40,10 @@ from instruments import (
 
 load_dotenv()
 
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
-# Модель читается из .env (OPENROUTER_MODEL) — меняется без правки кода.
-# Слаг должен быть РЕАЛЬНОЙ моделью OpenRouter, иначе вернётся 404.
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-chat-v3-0324:free")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-
 _admin_raw = os.getenv("ADMIN_ID", "")
 ADMIN_ID: int | None = int(_admin_raw) if _admin_raw.strip().isdigit() else None
 
 PAYMENT_TOKEN = os.getenv("PAYMENT_TOKEN", "TEST_TOKEN_PLACEHOLDER")
-
-# Читаем системный промпт один раз при загрузке модуля
-_prompt_path = Path(__file__).parent / "system_prompt.md"
-SYSTEM_PROMPT = _prompt_path.read_text(encoding="utf-8") if _prompt_path.exists() else ""
-
-
-async def ask_openrouter(user_text: str, system_prompt: str = SYSTEM_PROMPT) -> str:
-    """Отправляет запрос в OpenRouter и возвращает ответ модели.
-
-    system_prompt по умолчанию — основной промпт бота (свободный текст). Для
-    гибридного разбора в /analyze передаётся отдельный «аналитический» промпт.
-    """
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": OPENROUTER_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_text},
-        ],
-    }
-    # trust_env=True — бот уважает прокси-переменные окружения (HTTPS_PROXY).
-    # На сервере (урок 5.12) это направляет запрос к OpenRouter через прокси из 5.09.
-    # На ноутбуке прокси-переменных нет — поведение не меняется.
-    async with aiohttp.ClientSession(trust_env=True) as session:
-        async with session.post(OPENROUTER_URL, json=payload, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
-            return data["choices"][0]["message"]["content"]
 
 # BOT_PROXY — адрес прокси для соединения с Telegram. Задаётся в окружении
 # сервиса на сервере (урок 5.12), т.к. api.telegram.org из РФ напрямую недоступен.
@@ -143,6 +106,11 @@ class AlertStates(StatesGroup):
 
 class ContactStates(StatesGroup):
     waiting_message = State()
+
+
+class NLConfirm(StatesGroup):
+    """Подтверждение действия, распознанного из свободного текста (алерт/сделка)."""
+    waiting = State()
 
 
 def start_keyboard() -> InlineKeyboardMarkup:
@@ -446,8 +414,15 @@ HELP_TEXT = (
     "/analyze — анализ инструмента: тренд D1 + уровни + зоны ликвидности\n"
     "/subscribe — подписка на торговые сигналы (Spring/Upthrust)\n"
     "/signals — последние сигналы\n"
+    "/trades — журнал сделок (статус цель/стоп, закрытие)\n"
     "/settings — настройки порогов сигналов\n"
-    "/cancel — отменить текущий сценарий"
+    "/cancel — отменить текущий сценарий\n\n"
+    "Можно просто писать словами — я пойму:\n"
+    "• «алерт золото 2400» — поставлю алерт\n"
+    "• «что по биткоину» — сделаю анализ\n"
+    "• «подпиши на эфир» / «мои сигналы» — подписка и список\n"
+    "• «взял золото по 2390, стоп 2380, цель 2410» — запишу сделку в журнал\n"
+    "Остальное (вопросы, разбор пересланного анализа) — отвечу как ассистент."
 )
 
 
@@ -750,19 +725,55 @@ async def cb_delete_alert(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=keyboard)
 
 
+# ── Журнал сделок ────────────────────────────────────────────────────────────
+
+TRADE_STATUS_LABEL = {
+    "open": "⏳ открыта", "hit_tp": "✅ цель", "hit_sl": "🛑 стоп", "closed": "☑️ закрыта",
+}
+
+
+def render_trades(user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Текст журнала сделок + кнопки «закрыть» на каждую открытую (или None)."""
+    trades = database.get_user_trades(user_id)
+    if not trades:
+        return ("Журнал сделок пуст. Запиши сделку свободным текстом, например: "
+                "«взял золото по 2390, стоп 2380, цель 2410».", None)
+    lines = ["📒 Журнал сделок:"]
+    rows = []
+    for t in trades:
+        info = resolve(t["instrument"])
+        d = info["decimals"] if info["decimals"] is not None else infer_decimals(t["entry_price"])
+        arrow = "🟢" if t["direction"] == "long" else "🔴"
+        label = TRADE_STATUS_LABEL.get(t["status"], t["status"])
+        lines.append(
+            f"{arrow} {info['name']} — вход {fmt(t['entry_price'], d)}, "
+            f"стоп {fmt(t['stop_loss'], d)}, цель {fmt(t['take_profit'], d)} [{label}]"
+        )
+        if t["status"] == "open":
+            rows.append([InlineKeyboardButton(
+                text=f"☑️ Закрыть {info['name']} {fmt(t['entry_price'], d)}",
+                callback_data=f"closetrade_{t['id']}",
+            )])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    return "\n".join(lines), kb
+
+
+@dp.message(Command("trades"))
+async def cmd_trades(message: Message):
+    text, keyboard = render_trades(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("closetrade_"))
+async def cb_close_trade(call: CallbackQuery):
+    trade_id = int(call.data.removeprefix("closetrade_"))
+    closed = database.close_trade(trade_id, call.from_user.id)
+    await call.answer("Закрыта" if closed else "Уже закрыта")
+    text, keyboard = render_trades(call.from_user.id)
+    await call.message.edit_text(text, reply_markup=keyboard)
+
+
 # ── Торговый движок: анализ, подписки, сигналы, настройки ───────────────────────
-
-ANALYST_PROMPT = (
-    "Ты — трейдинг-ассистент. Тебе дают ГОТОВЫЕ числа анализа одного инструмента "
-    "(название, тренд D1, уровни дневки и часовика, зоны ликвидности, стакан). "
-    "Начни ответ с названия инструмента. Объясни простыми словами по-русски: куда "
-    "смотреть, какие уровни приоритетны ПО ТРЕНДУ (в нисходящем — шорты от "
-    "сопротивлений, в восходящем — лонги от поддержек), где вероятна пружина (Spring) "
-    "или ложный пробой, и что говорит стакан. Когда называешь уровень — уточняй, "
-    "дневной он или часовой. Не выдумывай числа — используй только данные. "
-    "4–6 коротких предложений, по делу, без дисклеймеров."
-)
-
 
 def engine_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKeyboardMarkup:
     """Кнопки инструментов движка — крипта + форекс (по 2 в ряд). prefix — начало
@@ -1021,9 +1032,12 @@ async def cmd_signals(message: Message):
         pat = "Spring" if s["pattern"] == "spring" else "Upthrust"
         star = "⭐" if s["priority"] == "high" else ""
         label = status_label.get(s["status"], s["status"])
+        risk = abs(s["entry_price"] - s["stop_loss"])
+        rr = abs(s["take_profit"] - s["entry_price"]) / risk if risk else 0
         lines.append(
             f"{arrow}{star} {info['name']} {pat} — вход {fmt(s['entry_price'], d)}, "
-            f"стоп {fmt(s['stop_loss'], d)}, цель {fmt(s['take_profit'], d)} [{label}]"
+            f"стоп {fmt(s['stop_loss'], d)}, цель {fmt(s['take_profit'], d)} "
+            f"(1:{rr:.1f}) [{label}]"
         )
     await message.answer("Последние сигналы:\n" + "\n".join(lines))
 
@@ -1033,7 +1047,8 @@ def settings_text() -> str:
         "⚙️ Настройки движка сигналов:\n"
         f"• Аномальный объём: × {config.get('VOL_MULT')}\n"
         f"• Глубина ложного пробоя: {config.get('BREAK_PCT') * 100:.3g}%\n"
-        f"• Объём зоны ликвидности: × {config.get('LIQUIDITY_MULT')}\n\n"
+        f"• Объём зоны ликвидности: × {config.get('LIQUIDITY_MULT')}\n"
+        f"• Мин. прибыль/риск (R:R): 1:{config.get('MIN_RR'):g}\n\n"
         "Меняй пороги кнопками ниже (применяется сразу для всех сигналов):"
     )
 
@@ -1049,6 +1064,11 @@ def settings_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="Пробой 0.03%", callback_data="set:BREAK_PCT:0.0003"),
             InlineKeyboardButton(text="0.05%", callback_data="set:BREAK_PCT:0.0005"),
             InlineKeyboardButton(text="0.1%", callback_data="set:BREAK_PCT:0.001"),
+        ],
+        [
+            InlineKeyboardButton(text="R:R 1:2", callback_data="set:MIN_RR:2.0"),
+            InlineKeyboardButton(text="1:2.5", callback_data="set:MIN_RR:2.5"),
+            InlineKeyboardButton(text="1:3", callback_data="set:MIN_RR:3.0"),
         ],
     ])
 
@@ -1140,12 +1160,12 @@ async def contact_message(message: Message, state: FSMContext):
 # Ответ админа: reply'ем на пересланное сообщение пользователя → летит автору.
 # Регистрируется ПЕРЕД free_text, чтобы перехватить ответы до отправки в LLM.
 @dp.message(StateFilter(None), F.reply_to_message, F.text)
-async def admin_reply(message: Message):
+async def admin_reply(message: Message, state: FSMContext):
     src = message.reply_to_message
     is_user_msg = bool(src and src.text and src.text.startswith("✉️"))
     if ADMIN_ID is None or message.from_user.id != ADMIN_ID or not is_user_msg:
         # Не ответ админа на сообщение пользователя — обычный свободный текст.
-        await free_text(message)
+        await free_text(message, state)
         return
     m = re.search(r"\(id (\d+)\)", src.text)
     if not m:
@@ -1160,10 +1180,18 @@ async def admin_reply(message: Message):
         await message.answer("Не удалось доставить — пользователь, видимо, заблокировал бота.")
 
 
-# ── Свободный текст → OpenRouter (только вне FSM-сценариев) ──────────────────
+# ── Свободный текст → NL-роутер команд / журнал / чат (вне FSM-сценариев) ────
 
-@dp.message(F.text, StateFilter(None))
-async def free_text(message: Message):
+def nl_confirm_kb() -> InlineKeyboardMarkup:
+    """Кнопки подтверждения действия, распознанного из текста."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да", callback_data="nlok"),
+        InlineKeyboardButton(text="❌ Нет", callback_data="nlno"),
+    ]])
+
+
+async def _nl_chat(message: Message) -> None:
+    """Обычный свободный чат через LLM (как было) — fallback роутера."""
     thinking = await message.answer("Думаю...")
     try:
         reply = await ask_openrouter(message.text)
@@ -1172,6 +1200,174 @@ async def free_text(message: Message):
     except Exception:
         await thinking.delete()
         await message.answer("Не получилось ответить, попробуй через минуту")
+
+
+async def _nl_set_alert(message: Message, state: FSMContext, intent: dict) -> None:
+    """Намерение «поставить алерт» из текста: проверяем уровень/инструмент и просим
+    подтвердить кнопкой (на случай, если LLM не так понял число)."""
+    raw = str(intent.get("instrument") or "").strip().upper()
+    try:
+        level = float(str(intent.get("level")).replace(",", "."))
+        if level <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        await message.answer("Понял, что нужен алерт, но не разобрал уровень. "
+                             "Напиши, например: «алерт золото 2400».")
+        return
+    if not raw:
+        await message.answer("На какой инструмент ставим алерт? "
+                             "Например: «алерт биткоин 70000».")
+        return
+    info = resolve(raw)
+    try:
+        window = await asyncio.to_thread(database.get_price_window, info["ticker"], info["decimals"])
+    except Exception:
+        await message.answer(f"Не нашёл инструмент «{raw}». Уточни тикер или поставь "
+                             "алерт через /alert.")
+        return
+    decimals = window["decimals"]
+    await state.set_state(NLConfirm.waiting)
+    await state.update_data(kind="alert", pair=raw, level=level, decimals=decimals)
+    await message.answer(
+        f"Поставить алерт: {info['name']} {fmt(level, decimals)}? "
+        f"(сейчас {fmt(window['last'], decimals)})",
+        reply_markup=nl_confirm_kb(),
+    )
+
+
+async def _nl_log_trade(message: Message, state: FSMContext, intent: dict) -> None:
+    """Намерение «записать сделку» из текста. Нужны вход, стоп и цель — иначе исход
+    не отследить. Направление определяем по числам (надёжнее, чем по словам)."""
+    raw = str(intent.get("instrument") or "").strip().upper()
+    if not raw:
+        await message.answer("По какому инструменту сделка? Например: "
+                             "«взял золото по 2390, стоп 2380, цель 2410».")
+        return
+    nums: dict[str, float | None] = {}
+    for k in ("entry", "stop", "target"):
+        try:
+            nums[k] = float(str(intent.get(k)).replace(",", "."))
+        except (TypeError, ValueError):
+            nums[k] = None
+    if not all(nums.values()):
+        await message.answer("Чтобы вести сделку и следить за исходом, нужны вход, стоп "
+                             "и цель. Например: «взял золото по 2390, стоп 2380, цель 2410».")
+        return
+    entry, stop, target = nums["entry"], nums["stop"], nums["target"]
+    if stop < entry < target:
+        direction = "long"
+    elif stop > entry > target:
+        direction = "short"
+    elif intent.get("direction") in ("long", "short"):
+        direction = intent["direction"]
+    else:
+        await message.answer("Не понял направление: стоп должен быть по одну сторону от "
+                             "входа, а цель — по другую. Проверь числа.")
+        return
+    info = resolve(raw)
+    in_registry = raw in INSTRUMENTS
+    try:
+        window = await asyncio.to_thread(database.get_price_window, info["ticker"], info["decimals"])
+        decimals = window["decimals"]
+    except Exception:
+        if not in_registry:
+            await message.answer(f"Не нашёл инструмент «{raw}». Уточни тикер.")
+            return
+        decimals = info["decimals"] if info["decimals"] is not None else infer_decimals(entry)
+    await state.set_state(NLConfirm.waiting)
+    await state.update_data(kind="trade", pair=raw, direction=direction,
+                            entry=entry, stop=stop, target=target, decimals=decimals)
+    arrow = "🟢 лонг" if direction == "long" else "🔴 шорт"
+    await message.answer(
+        f"Записать сделку в журнал: {info['name']} {arrow}\n"
+        f"вход {fmt(entry, decimals)}, стоп {fmt(stop, decimals)}, цель {fmt(target, decimals)}?",
+        reply_markup=nl_confirm_kb(),
+    )
+
+
+async def _nl_subscribe(message: Message, intent: dict, action: str) -> None:
+    code = str(intent.get("instrument") or "").strip().upper()
+    if code not in engine_codes():
+        await message.answer("Подписка на сигналы — по крипте и форексу. "
+                             "Открой /subscribe и выбери инструмент.")
+        return
+    info = resolve(code)
+    if action == "subscribe":
+        database.add_subscription(message.from_user.id, code)
+        await message.answer(f"Подписал на сигналы по {info['name']}. Управление — /subscribe.")
+    else:
+        database.remove_subscription(message.from_user.id, code)
+        await message.answer(f"Отписал от сигналов по {info['name']}.")
+
+
+async def _nl_analyze(message: Message, intent: dict) -> None:
+    code = str(intent.get("instrument") or "").strip().upper()
+    if code not in engine_codes():
+        await message.answer("Анализ — по крипте и форексу (BTC, ETH, SOL, TON, EUR/USD, "
+                             "GBP/USD, AUD/USD, USD/CAD, USD/JPY). Выбрать — /analyze.")
+        return
+    await _do_analyze(message, code)
+
+
+@dp.message(F.text, StateFilter(None))
+async def free_text(message: Message, state: FSMContext):
+    """Свободный текст: сначала распознаём команду (NL-роутер), иначе — обычный чат.
+    Любая осечка роутера безопасно сводится к чату (см. llm.classify_intent)."""
+    intent = await classify_intent(message.text or "")
+    action = intent.get("action")
+    if action == "set_alert":
+        await _nl_set_alert(message, state, intent)
+    elif action == "log_trade":
+        await _nl_log_trade(message, state, intent)
+    elif action == "analyze":
+        await _nl_analyze(message, intent)
+    elif action == "signals":
+        await cmd_signals(message)
+    elif action == "my_alerts":
+        await cmd_myalerts(message)
+    elif action == "my_trades":
+        await cmd_trades(message)
+    elif action in ("subscribe", "unsubscribe"):
+        await _nl_subscribe(message, intent, action)
+    else:
+        await _nl_chat(message)
+
+
+@dp.callback_query(F.data == "nlok", StateFilter(NLConfirm.waiting))
+async def cb_nl_ok(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    info = resolve(data["pair"])
+    d = data["decimals"]
+    if data.get("kind") == "alert":
+        database.add_alert(call.from_user.id, data["pair"], data["level"])
+        await call.message.edit_text(
+            f"Алерт сохранён: {info['name']} {fmt(data['level'], d)}. "
+            "Уведомлю при касании. Список — /myalerts."
+        )
+    elif data.get("kind") == "trade":
+        bar_time = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        database.add_trade(call.from_user.id, data["pair"], data["direction"],
+                           data["entry"], data["stop"], data["target"], bar_time)
+        arrow = "🟢 лонг" if data["direction"] == "long" else "🔴 шорт"
+        await call.message.edit_text(
+            f"Записал в журнал: {info['name']} {arrow}, вход {fmt(data['entry'], d)}, "
+            f"стоп {fmt(data['stop'], d)}, цель {fmt(data['target'], d)}.\n"
+            "Напишу, когда цена дойдёт до цели или стопа. Журнал — /trades."
+        )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "nlno", StateFilter(NLConfirm.waiting))
+async def cb_nl_no(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text("Отменил.")
+    await call.answer()
+
+
+@dp.message(StateFilter(NLConfirm.waiting))
+async def nl_confirm_text(message: Message):
+    await message.answer("Нажми «Да» или «Нет».", reply_markup=nl_confirm_kb())
 
 
 async def check_alerts():
@@ -1266,6 +1462,7 @@ async def main():
         BotCommand(command="analyze",     description="Анализ инструмента (тренд + уровни)"),
         BotCommand(command="subscribe",   description="Подписка на торговые сигналы"),
         BotCommand(command="signals",     description="Последние сигналы"),
+        BotCommand(command="trades",      description="Журнал сделок"),
         BotCommand(command="write",       description="Написать администратору"),
         BotCommand(command="cancel",      description="Отмена"),
         BotCommand(command="help",        description="Помощь"),
@@ -1292,6 +1489,7 @@ async def main():
                 BotCommand(command="analyze",   description="Анализ инструмента (тренд + уровни)"),
                 BotCommand(command="subscribe", description="Подписка на торговые сигналы"),
                 BotCommand(command="signals",   description="Последние сигналы"),
+                BotCommand(command="trades",    description="Журнал сделок"),
                 BotCommand(command="help",      description="Помощь"),
                 BotCommand(command="cancel",    description="Отмена"),
             ],

@@ -121,6 +121,26 @@ def init_db() -> None:
                 UNIQUE(user_id, instrument)
             )
         """)
+        # Журнал сделок пользователя (записывается свободным текстом через LLM).
+        # instrument — код движка или сырой тикер Yahoo (как alerts.pair). bar_time —
+        # момент записи (UTC), якорь для трекинга исхода по свечам. Журнал НЕ истекает
+        # сам: сделка висит 'open', пока не дойдёт до цели/стопа или её не закроют вручную.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id     INTEGER NOT NULL,
+                instrument  TEXT    NOT NULL,
+                direction   TEXT    NOT NULL,                  -- 'long' | 'short'
+                entry_price REAL    NOT NULL,
+                stop_loss   REAL    NOT NULL,
+                take_profit REAL    NOT NULL,
+                status      TEXT    NOT NULL DEFAULT 'open',   -- open|hit_tp|hit_sl|closed
+                bar_time    TEXT,
+                note        TEXT,
+                opened_at   TEXT    NOT NULL,
+                closed_at   TEXT
+            )
+        """)
         conn.commit()
 
 
@@ -449,3 +469,92 @@ def get_subscribed_instruments() -> list[str]:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute("SELECT DISTINCT instrument FROM subscriptions").fetchall()
     return [row[0] for row in rows]
+
+
+# ── Журнал сделок ────────────────────────────────────────────────────────────
+
+def add_trade(user_id: int, instrument: str, direction: str, entry_price: float,
+              stop_loss: float, take_profit: float, bar_time: str,
+              note: str | None = None) -> int:
+    """Записывает сделку в журнал (status='open'). Возвращает её id.
+    bar_time — момент записи (UTC ISO), якорь для трекинга исхода по свечам."""
+    opened_at = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("""
+            INSERT INTO trades (user_id, instrument, direction, entry_price, stop_loss,
+                                take_profit, status, bar_time, note, opened_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'open', ?, ?, ?)
+        """, (user_id, instrument, direction, entry_price, stop_loss, take_profit,
+              bar_time, note, opened_at))
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_open_trades() -> list[dict]:
+    """Открытые сделки журнала (status='open') — те, чей исход ещё отслеживаем."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, user_id, instrument, direction, entry_price, stop_loss,
+                   take_profit, bar_time
+            FROM trades WHERE status = 'open'
+        """).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_user_trades(user_id: int, limit: int = 20) -> list[dict]:
+    """Сделки одного пользователя: сначала открытые, затем закрытые (свежие выше)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, instrument, direction, entry_price, stop_loss, take_profit, status
+            FROM trades WHERE user_id = ?
+            ORDER BY CASE status WHEN 'open' THEN 0 ELSE 1 END, id DESC
+            LIMIT ?
+        """, (user_id, limit)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_trade_status(trade_id: int, status: str) -> None:
+    """Меняет статус сделки (open → hit_tp | hit_sl | closed) и ставит дату закрытия."""
+    closed_at = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE trades SET status = ?, closed_at = ? WHERE id = ?",
+            (status, closed_at, trade_id),
+        )
+        conn.commit()
+
+
+def close_trade(trade_id: int, user_id: int) -> bool:
+    """Ручное закрытие сделки пользователем. Возвращает True, если что-то закрылось."""
+    closed_at = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("""
+            UPDATE trades SET status = 'closed', closed_at = ?
+            WHERE id = ? AND user_id = ? AND status = 'open'
+        """, (closed_at, trade_id, user_id))
+        conn.commit()
+        return cur.rowcount > 0
+
+
+def get_hourly_candles(ticker: str, lookback_days: int = 7) -> pd.DataFrame:
+    """Часовые свечи по тикеру Yahoo в том же формате, что и биржевые свечи движка:
+    столбцы open/high/low/close/volume и индекс — время в UTC.
+
+    Нужно для трекинга сделок журнала по инструментам без биржевого объёма (золото,
+    нефть, своя пара): у них нет CCXT, но Yahoo отдаёт часовые свечи. Бросает
+    ValueError, если данных нет.
+    """
+    df = yf.Ticker(ticker).history(period=f"{lookback_days}d", interval="1h")
+    if df is None or df.empty:
+        raise ValueError(f"нет часовых свечей по тикеру {ticker}")
+    df = df.rename(columns={
+        "Open": "open", "High": "high", "Low": "low",
+        "Close": "close", "Volume": "volume",
+    })
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    else:
+        df.index = df.index.tz_convert("UTC")
+    return df[["open", "high", "low", "close", "volume"]]
