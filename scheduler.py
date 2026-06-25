@@ -67,9 +67,18 @@ def analyze_and_store(code: str, d1, h1) -> list[dict]:
 
 
 async def monitor_signals(bot) -> None:
-    """Каждые 5 минут: ищем Spring/Upthrust по H1 и шлём подписчикам новые сигналы."""
+    """Каждые 5 минут: ищем Spring/Upthrust по H1 и шлём новые сигналы.
+
+    Сигналы теперь персональные: по каждому инструменту прогоняем детект отдельно
+    для каждого подписчика — с его личными порогами (config.effective поверх его
+    user_settings). Дедуп и трекинг исхода тоже идут по конкретному пользователю.
+    Свечи/уровни/тренд считаются один раз на инструмент (детект — чистый CPU по кешу).
+    """
     codes = _subscribed_engine()
     for code in codes:
+        subscribers = database.get_subscribers(code)
+        if not subscribers:
+            continue
         try:
             h1 = await _fetch(code, config.H1_TIMEFRAME, config.H1_LIMIT)
             d1 = await _fetch(code, config.D1_TIMEFRAME, config.D1_LIMIT)
@@ -78,22 +87,31 @@ async def monitor_signals(bot) -> None:
             continue
         trend = analyzer.get_trend(d1)
         levels = database.get_levels(code)
-        for detector in (pattern_detector.detect_spring, pattern_detector.detect_upthrust):
-            signal = detector(h1, levels, trend)
-            if signal is None:
-                continue
-            # Дедуп: тот же паттерн на той же закрытой свече держится до часа —
-            # не шлём одинаковый сигнал чаще, чем раз в SIGNAL_DEDUP_MIN минут.
-            since = (datetime.now() - timedelta(minutes=config.SIGNAL_DEDUP_MIN)).isoformat(timespec="seconds")
-            if database.recent_signal_exists(code, signal["pattern"], signal["direction"], since):
-                continue
-            database.add_signal(
-                code, signal["pattern"], signal["direction"],
-                signal["entry_price"], signal["stop_loss"], signal["take_profit"],
-                priority=signal["priority"], bar_time=signal.get("bar_time"),
-            )
-            print(f"[monitor_signals] СИГНАЛ {code} {signal['pattern']} {signal['direction']}")
-            await _notify(bot, code, signal, trend)
+        # Комментарий LLM считаем один раз на одинаковый сигнал в цикле (а не на каждого
+        # подписчика): ключ — паттерн+направление+цель (цель зависит от личного R:R).
+        comment_cache: dict[tuple, str | None] = {}
+        for user_id in subscribers:
+            settings = config.effective(database.get_user_settings(user_id))
+            for detector in (pattern_detector.detect_spring, pattern_detector.detect_upthrust):
+                signal = detector(h1, levels, trend, settings)
+                if signal is None:
+                    continue
+                # Дедуп персональный: тот же паттерн тому же пользователю не чаще,
+                # чем раз в SIGNAL_DEDUP_MIN минут.
+                since = (datetime.now() - timedelta(minutes=config.SIGNAL_DEDUP_MIN)).isoformat(timespec="seconds")
+                if database.recent_signal_exists(code, signal["pattern"], signal["direction"], since, user_id):
+                    continue
+                database.add_signal(
+                    code, signal["pattern"], signal["direction"],
+                    signal["entry_price"], signal["stop_loss"], signal["take_profit"],
+                    priority=signal["priority"], bar_time=signal.get("bar_time"),
+                    user_id=user_id,
+                )
+                print(f"[monitor_signals] СИГНАЛ {code} {signal['pattern']} {signal['direction']} → {user_id}")
+                key = (signal["pattern"], signal["direction"], round(signal["take_profit"], 10))
+                if key not in comment_cache:
+                    comment_cache[key] = await _signal_comment(code, signal, trend)
+                await _notify(bot, code, signal, user_id, comment_cache[key])
 
 
 async def track_signals(bot) -> None:
@@ -193,7 +211,11 @@ async def _notify_outcome(bot, signal: dict, outcome: str) -> None:
         f"Вход был {fmt(signal['entry_price'], d)}, цена дошла до {fmt(price, d)}.\n\n"
         "Это итог подсказки, не финсовет."
     )
-    for user_id in database.get_subscribers(signal["instrument"]):
+    # Сигнал персональный → исход шлём его владельцу. Старые «общие» сигналы (до
+    # перехода, user_id отсутствует/NULL) — всем текущим подписчикам, как раньше.
+    owner = signal.get("user_id")
+    recipients = [owner] if owner else database.get_subscribers(signal["instrument"])
+    for user_id in recipients:
         try:
             await bot.send_message(user_id, text)
         except Exception as e:
@@ -235,7 +257,9 @@ async def _signal_comment(code: str, signal: dict, trend: str) -> str | None:
     return await llm.comment_on_signal(summary)
 
 
-async def _notify(bot, code: str, signal: dict, trend: str) -> None:
+async def _notify(bot, code: str, signal: dict, user_id: int, comment: str | None) -> None:
+    """Шлёт персональный сигнал одному подписчику. comment — готовый AI-комментарий
+    (считается один раз на одинаковый сигнал в monitor_signals, см. comment_cache)."""
     info = resolve(code)
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
     arrow = "🟢 ЛОНГ" if signal["direction"] == "long" else "🔴 ШОРТ"
@@ -253,15 +277,12 @@ async def _notify(bot, code: str, signal: dict, trend: str) -> None:
         f"Профит/риск: 1:{rr:.1f}\n\n"
         "Это подсказка, не приказ. Решение и риск — на тебе."
     )
-    # AI-комментарий считаем один раз на сигнал (а не на каждого подписчика).
-    comment = await _signal_comment(code, signal, trend)
     if comment:
         text += f"\n\n🤖 {comment}"
-    for user_id in database.get_subscribers(code):
-        try:
-            await bot.send_message(user_id, text)
-        except Exception as e:
-            print(f"[monitor_signals] не отправить {user_id}: {e}")
+    try:
+        await bot.send_message(user_id, text)
+    except Exception as e:
+        print(f"[monitor_signals] не отправить {user_id}: {e}")
 
 
 def setup(bot) -> AsyncIOScheduler:

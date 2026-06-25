@@ -415,7 +415,7 @@ HELP_TEXT = (
     "/subscribe — подписка на торговые сигналы (Spring/Upthrust)\n"
     "/signals — последние сигналы\n"
     "/trades — журнал сделок (статус цель/стоп, закрытие)\n"
-    "/settings — настройки порогов сигналов\n"
+    "/settings — пороги движка сигналов под себя (объём, пробой, R:R)\n"
     "/cancel — отменить текущий сценарий\n\n"
     "Можно просто писать словами — я пойму:\n"
     "• «алерт золото 2400» — поставлю алерт\n"
@@ -925,7 +925,7 @@ def _analysis_prompt(info: dict, last: float, trend: str, levels: list[dict],
     )
 
 
-async def _do_analyze(message: Message, code: str):
+async def _do_analyze(message: Message, code: str, user_id: int):
     info = resolve(code)
     sym = ccxt_symbol(code)
     waiting = await message.answer(f"Анализирую {info['name']}...")
@@ -939,7 +939,10 @@ async def _do_analyze(message: Message, code: str):
 
     trend = analyzer.get_trend(d1)
     levels = engine.analyze_and_store(code, d1, h1)  # считает и сохраняет уровни в БД
-    zones = analyzer.find_liquidity_zones(d1)
+    # Зоны ликвидности — под личный порог пользователя (LIQUIDITY_MULT): кто-то хочет
+    # видеть только самые жирные всплески объёма, кто-то — больше зон. На сигналы не влияет.
+    liq_mult = config.effective(database.get_user_settings(user_id))["LIQUIDITY_MULT"]
+    zones = analyzer.find_liquidity_zones(d1, liq_mult)
 
     # Стакан (DOM) — доп. контекст по крипте. Ошибка стакана не критична для анализа.
     ob = None
@@ -969,7 +972,7 @@ async def _do_analyze(message: Message, code: str):
 async def cmd_analyze(message: Message):
     parts = (message.text or "").split()
     if len(parts) > 1 and parts[1].upper() in engine_codes():
-        await _do_analyze(message, parts[1].upper())
+        await _do_analyze(message, parts[1].upper(), message.from_user.id)
         return
     await message.answer("Выбери инструмент для анализа:", reply_markup=engine_keyboard("analyze_"))
 
@@ -981,7 +984,8 @@ async def cb_analyze(call: CallbackQuery):
         await call.answer()
         return
     await call.answer()
-    await _do_analyze(call.message, code)
+    # call.message.from_user — это бот, поэтому id пользователя берём из call.from_user.
+    await _do_analyze(call.message, code, call.from_user.id)
 
 
 @dp.message(Command("subscribe"))
@@ -1014,7 +1018,8 @@ async def cb_subtoggle(call: CallbackQuery):
 
 @dp.message(Command("signals"))
 async def cmd_signals(message: Message):
-    signals = database.get_recent_signals(10)
+    # Сигналы персональные → показываем свои (плюс старые «общие», если были).
+    signals = database.get_recent_signals(message.from_user.id, 10)
     if not signals:
         await message.answer("Сигналов пока нет. Подписаться на инструменты — /subscribe.")
         return
@@ -1042,19 +1047,37 @@ async def cmd_signals(message: Message):
     await message.answer("Последние сигналы:\n" + "\n".join(lines))
 
 
-def settings_text() -> str:
+def settings_text(user_id: int, is_admin: bool) -> str:
+    # Пороги персональные: подписчик крутит их под себя, поверх общих значений.
+    # Админ правит ОБЩИЙ дефолт (для всех, кто не настроил своё) — у него личных нет.
+    overrides = {} if is_admin else database.get_user_settings(user_id)
+    eff = config.effective(overrides)
+
+    def mark(key: str) -> str:
+        return " (личное)" if key in overrides else ""
+
+    if is_admin:
+        footer = (
+            "Это общие пороги по умолчанию — для всех, кто не настроил своё.\n"
+            "Меняй кнопками ниже (применится сразу ко всем «по умолчанию»):"
+        )
+    else:
+        footer = (
+            "Это твои личные пороги — крути сигналы (и зоны в /analyze) под себя кнопками.\n"
+            "«Сбросить» вернёт общие значения. Метка «(личное)» = твоё переопределение."
+        )
     return (
         "⚙️ Настройки движка сигналов:\n"
-        f"• Аномальный объём: × {config.get('VOL_MULT')}\n"
-        f"• Глубина ложного пробоя: {config.get('BREAK_PCT') * 100:.3g}%\n"
-        f"• Объём зоны ликвидности: × {config.get('LIQUIDITY_MULT')}\n"
-        f"• Мин. прибыль/риск (R:R): 1:{config.get('MIN_RR'):g}\n\n"
-        "Меняй пороги кнопками ниже (применяется сразу для всех сигналов):"
+        f"• Аномальный объём: × {eff['VOL_MULT']:g}{mark('VOL_MULT')}\n"
+        f"• Глубина ложного пробоя: {eff['BREAK_PCT'] * 100:.3g}%{mark('BREAK_PCT')}\n"
+        f"• Объём зоны ликвидности (для /analyze): × {eff['LIQUIDITY_MULT']:g}{mark('LIQUIDITY_MULT')}\n"
+        f"• Мин. прибыль/риск (R:R): 1:{eff['MIN_RR']:g}{mark('MIN_RR')}\n\n"
+        + footer
     )
 
 
-def settings_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def settings_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
+    rows = [
         [
             InlineKeyboardButton(text="Объём ×1.3", callback_data="set:VOL_MULT:1.3"),
             InlineKeyboardButton(text="×1.5", callback_data="set:VOL_MULT:1.5"),
@@ -1070,31 +1093,59 @@ def settings_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="1:2.5", callback_data="set:MIN_RR:2.5"),
             InlineKeyboardButton(text="1:3", callback_data="set:MIN_RR:3.0"),
         ],
-    ])
+        [
+            InlineKeyboardButton(text="Ликвидн. ×1.3", callback_data="set:LIQUIDITY_MULT:1.3"),
+            InlineKeyboardButton(text="×1.5", callback_data="set:LIQUIDITY_MULT:1.5"),
+            InlineKeyboardButton(text="×2.0", callback_data="set:LIQUIDITY_MULT:2.0"),
+        ],
+    ]
+    # Подписчику — сброс личных порогов к общим. Админу нечего сбрасывать (он и есть общие).
+    if not is_admin:
+        rows.append([InlineKeyboardButton(text="↩️ Сбросить к общим", callback_data="set:reset")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @dp.message(Command("settings"))
 async def cmd_settings(message: Message):
-    # Пороги общие для всех сигналов → меняет только администратор (если задан).
-    if ADMIN_ID is not None and message.from_user.id != ADMIN_ID:
-        await message.answer("Настройки порогов доступны только администратору.")
-        return
-    await message.answer(settings_text(), reply_markup=settings_keyboard())
+    # Доступно всем. Админ правит общий дефолт, подписчик — свои личные пороги.
+    is_admin = ADMIN_ID is None or message.from_user.id == ADMIN_ID
+    await message.answer(
+        settings_text(message.from_user.id, is_admin),
+        reply_markup=settings_keyboard(is_admin),
+    )
 
 
 @dp.callback_query(F.data.startswith("set:"))
 async def cb_settings(call: CallbackQuery):
-    if ADMIN_ID is not None and call.from_user.id != ADMIN_ID:
-        await call.answer("Только администратор")
+    is_admin = ADMIN_ID is None or call.from_user.id == ADMIN_ID
+    parts = call.data.split(":")
+
+    # Сброс личных порогов подписчика к общим.
+    if len(parts) == 2 and parts[1] == "reset":
+        database.reset_user_settings(call.from_user.id)
+        await call.answer("Сброшено к общим")
+        await call.message.edit_text(
+            settings_text(call.from_user.id, is_admin), reply_markup=settings_keyboard(is_admin)
+        )
         return
+
     try:
-        _, key, value = call.data.split(":")
-        config.set_value(key, float(value))
+        _, key, value = parts
+        value = float(value)
+        if key not in config.TUNABLE:
+            raise KeyError(key)
     except (ValueError, KeyError):
         await call.answer("Не понял настройку")
         return
+
+    if is_admin:
+        config.set_value(key, value)                       # общий дефолт для всех
+    else:
+        database.set_user_setting(call.from_user.id, key, value)  # личный порог
     await call.answer("Готово")
-    await call.message.edit_text(settings_text(), reply_markup=settings_keyboard())
+    await call.message.edit_text(
+        settings_text(call.from_user.id, is_admin), reply_markup=settings_keyboard(is_admin)
+    )
 
 
 # ── Telegram Payments ─────────────────────────────────────────────────────────
@@ -1306,7 +1357,7 @@ async def _nl_analyze(message: Message, intent: dict) -> None:
         await message.answer("Анализ — по крипте и форексу (BTC, ETH, SOL, TON, EUR/USD, "
                              "GBP/USD, AUD/USD, USD/CAD, USD/JPY). Выбрать — /analyze.")
         return
-    await _do_analyze(message, code)
+    await _do_analyze(message, code, message.from_user.id)
 
 
 @dp.message(F.text, StateFilter(None))
@@ -1454,7 +1505,8 @@ async def main():
     engine.setup(bot)
     await engine.run_analysis(bot)  # первичный анализ при старте
 
-    # Меню обычного пользователя (видят все). Админских команд и /settings тут нет.
+    # Меню обычного пользователя (видят все). Админских команд тут нет; /settings —
+    # только просмотр порогов (менять может админ, ему кнопки в его меню).
     await bot.set_my_commands([
         BotCommand(command="start",       description="Главное меню"),
         BotCommand(command="alert",       description="Поставить алерт на уровень"),
@@ -1463,6 +1515,7 @@ async def main():
         BotCommand(command="subscribe",   description="Подписка на торговые сигналы"),
         BotCommand(command="signals",     description="Последние сигналы"),
         BotCommand(command="trades",      description="Журнал сделок"),
+        BotCommand(command="settings",    description="Настройки сигналов под себя"),
         BotCommand(command="write",       description="Написать администратору"),
         BotCommand(command="cancel",      description="Отмена"),
         BotCommand(command="help",        description="Помощь"),

@@ -111,6 +111,13 @@ def init_db() -> None:
             conn.execute("ALTER TABLE signals ADD COLUMN bar_time TEXT")
         except sqlite3.OperationalError:
             pass  # колонка уже есть
+        # Владелец сигнала. Сигналы теперь персональные: каждый подписчик получает их
+        # по своим порогам (см. user_settings). Старые сигналы — NULL (общие, до правки):
+        # на исходе таких уведомляем всех текущих подписчиков (обратная совместимость).
+        try:
+            conn.execute("ALTER TABLE signals ADD COLUMN user_id INTEGER")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть
         # Подписки пользователей на сигналы по инструменту.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -139,6 +146,17 @@ def init_db() -> None:
                 note        TEXT,
                 opened_at   TEXT    NOT NULL,
                 closed_at   TEXT
+            )
+        """)
+        # Персональные пороги движка: подписчик переопределяет общие значения под себя.
+        # key — из config.TUNABLE (VOL_MULT / BREAK_PCT / MIN_RR …), value — число.
+        # Чего тут нет — берётся из общих настроек (settings.json / дефолтов).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER NOT NULL,
+                key     TEXT    NOT NULL,
+                value   REAL    NOT NULL,
+                UNIQUE(user_id, key)
             )
         """)
         conn.commit()
@@ -368,18 +386,20 @@ def get_levels(instrument: str) -> list[dict]:
 
 def add_signal(instrument: str, pattern: str, direction: str, entry_price: float,
                stop_loss: float, take_profit: float, priority: str = "normal",
-               level_id: int | None = None, bar_time: str | None = None) -> int:
+               level_id: int | None = None, bar_time: str | None = None,
+               user_id: int | None = None) -> int:
     """Сохраняет новый сигнал со статусом 'pending'. Возвращает его id.
-    bar_time — время свечи пробоя (UTC), якорь для трекинга исхода."""
+    bar_time — время свечи пробоя (UTC), якорь для трекинга исхода.
+    user_id — владелец (сигнал персональный, по его порогам)."""
     created_at = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute("""
             INSERT INTO signals (instrument, pattern, level_id, direction,
                                  entry_price, stop_loss, take_profit, priority,
-                                 status, created_at, bar_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                                 status, created_at, bar_time, user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
         """, (instrument, pattern, level_id, direction, entry_price, stop_loss,
-              take_profit, priority, created_at, bar_time))
+              take_profit, priority, created_at, bar_time, user_id))
         conn.commit()
         return cur.lastrowid
 
@@ -389,7 +409,8 @@ def get_open_signals() -> list[dict]:
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
-            SELECT id, instrument, direction, entry_price, stop_loss, take_profit, bar_time
+            SELECT id, instrument, direction, entry_price, stop_loss, take_profit,
+                   bar_time, user_id
             FROM signals WHERE status = 'pending'
         """).fetchall()
     return [dict(row) for row in rows]
@@ -402,26 +423,32 @@ def update_signal_status(signal_id: int, status: str) -> None:
         conn.commit()
 
 
-def recent_signal_exists(instrument: str, pattern: str, direction: str, since_iso: str) -> bool:
-    """Есть ли уже такой сигнал не старше since_iso — защита от дублей в мониторинге."""
+def recent_signal_exists(instrument: str, pattern: str, direction: str, since_iso: str,
+                         user_id: int | None = None) -> bool:
+    """Есть ли уже такой сигнал не старше since_iso — защита от дублей в мониторинге.
+    Дедуп персональный: проверяем по конкретному пользователю (user_id)."""
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute("""
             SELECT 1 FROM signals
             WHERE instrument = ? AND pattern = ? AND direction = ? AND created_at >= ?
+              AND user_id IS ?
             LIMIT 1
-        """, (instrument, pattern, direction, since_iso)).fetchone()
+        """, (instrument, pattern, direction, since_iso, user_id)).fetchone()
     return row is not None
 
 
-def get_recent_signals(limit: int = 10) -> list[dict]:
-    """Последние сигналы (для команды /signals)."""
+def get_recent_signals(user_id: int, limit: int = 10) -> list[dict]:
+    """Последние сигналы пользователя (для команды /signals). Берём его персональные
+    сигналы плюс старые «общие» (user_id IS NULL, до перехода на персональные)."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             SELECT instrument, pattern, direction, entry_price, stop_loss, take_profit,
                    priority, status, created_at
-            FROM signals ORDER BY id DESC LIMIT ?
-        """, (limit,)).fetchall()
+            FROM signals
+            WHERE user_id = ? OR user_id IS NULL
+            ORDER BY id DESC LIMIT ?
+        """, (user_id, limit)).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -469,6 +496,36 @@ def get_subscribed_instruments() -> list[str]:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute("SELECT DISTINCT instrument FROM subscriptions").fetchall()
     return [row[0] for row in rows]
+
+
+# ── Персональные пороги движка ──────────────────────────────────────────────
+
+def get_user_settings(user_id: int) -> dict:
+    """Личные переопределения порогов пользователя (key → value). Чего нет —
+    берётся из общих настроек (см. config.effective)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT key, value FROM user_settings WHERE user_id = ?", (user_id,)
+        ).fetchall()
+    return {row[0]: row[1] for row in rows}
+
+
+def set_user_setting(user_id: int, key: str, value: float) -> None:
+    """Задать (или обновить) личный порог пользователя."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO user_settings (user_id, key, value)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, key) DO UPDATE SET value = excluded.value
+        """, (user_id, key, value))
+        conn.commit()
+
+
+def reset_user_settings(user_id: int) -> None:
+    """Сбросить все личные пороги пользователя — вернуться к общим значениям."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM user_settings WHERE user_id = ?", (user_id,))
+        conn.commit()
 
 
 # ── Журнал сделок ────────────────────────────────────────────────────────────

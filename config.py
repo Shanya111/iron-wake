@@ -90,3 +90,21 @@ def set_value(key: str, value) -> None:
 def all_settings() -> dict:
     """Все текущие настраиваемые пороги (для отображения в /settings)."""
     return dict(_runtime)
+
+
+# Ключи, которые подписчик может переопределить персонально (через /settings).
+# Это пороги, влияющие на отбор его сигналов; остальные константы — только в коде.
+TUNABLE = tuple(_DEFAULTS)
+
+
+def effective(overrides: dict | None = None) -> dict:
+    """Действующие пороги с учётом персональных переопределений пользователя.
+
+    База — общие значения (settings.json / дефолты, задаёт админ). Поверх неё
+    кладём личные `overrides` пользователя (из БД). Ключи вне TUNABLE игнорируем.
+    Если overrides пуст — вернётся ровно общий набор (как у всех «по умолчанию»).
+    """
+    base = {k: get(k) for k in _DEFAULTS}
+    if overrides:
+        base.update({k: v for k, v in overrides.items() if k in _DEFAULTS})
+    return base

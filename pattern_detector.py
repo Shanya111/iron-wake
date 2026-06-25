@@ -13,14 +13,18 @@ import pandas as pd
 import config
 
 
-def detect_spring(df: pd.DataFrame, levels: list[dict], trend: str) -> dict | None:
-    """Бычий Spring. Фильтр тренда: при нисходящем тренде ('down') не сигналим."""
-    return _detect(df, levels, trend, side="long")
+def detect_spring(df: pd.DataFrame, levels: list[dict], trend: str,
+                  settings: dict | None = None) -> dict | None:
+    """Бычий Spring. Фильтр тренда: при нисходящем тренде ('down') не сигналим.
+    settings — персональные пороги подписчика (None → общие из config)."""
+    return _detect(df, levels, trend, side="long", settings=settings)
 
 
-def detect_upthrust(df: pd.DataFrame, levels: list[dict], trend: str) -> dict | None:
-    """Медвежий Upthrust — зеркало Spring. При восходящем тренде ('up') не сигналим."""
-    return _detect(df, levels, trend, side="short")
+def detect_upthrust(df: pd.DataFrame, levels: list[dict], trend: str,
+                    settings: dict | None = None) -> dict | None:
+    """Медвежий Upthrust — зеркало Spring. При восходящем тренде ('up') не сигналим.
+    settings — персональные пороги подписчика (None → общие из config)."""
+    return _detect(df, levels, trend, side="short", settings=settings)
 
 
 def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
@@ -42,7 +46,14 @@ def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool)
     return min(prices) if above else max(prices)
 
 
-def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str) -> dict | None:
+def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
+            settings: dict | None = None) -> dict | None:
+    # Действующие пороги: личные значения подписчика поверх общих (None → общие).
+    s = settings or {}
+    vol_mult = s.get("VOL_MULT", config.get("VOL_MULT"))
+    break_pct = s.get("BREAK_PCT", config.get("BREAK_PCT"))
+    min_rr = s.get("MIN_RR", config.get("MIN_RR"))
+
     if len(df) < config.VOL_LOOKBACK + 3:
         return None
     # Фильтр направления по глобальному тренду.
@@ -58,10 +69,9 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str) -> dict
 
     # Условие №3: аномальный объём на свече пробоя.
     avg_vol = _avg_volume(df, pos)
-    if avg_vol <= 0 or vol < avg_vol * config.get("VOL_MULT"):
+    if avg_vol <= 0 or vol < avg_vol * vol_mult:
         return None
 
-    break_pct = config.get("BREAK_PCT")
     level_type = "support" if side == "long" else "resistance"
     relevant = [lvl for lvl in levels if lvl["type"] == level_type]
 
@@ -80,7 +90,6 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str) -> dict
         # Минимальный R:R (прибыль/риск). Цель — ближайший противоположный уровень,
         # но сигнал берём, только если он даёт хотя бы MIN_RR; ближе — сделка
         # невыгодна, пропускаем. Нет уровня впереди → ставим цель ровно на MIN_RR×риск.
-        min_rr = config.get("MIN_RR")
         if side == "long":
             entry = c
             stop = l * (1 - config.STOP_SPREAD)
