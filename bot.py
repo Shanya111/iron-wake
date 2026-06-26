@@ -445,7 +445,7 @@ async def cmd_about(message: Message):
 async def cmd_privacy(message: Message):
     await message.answer(
         "Политика конфиденциальности: бот iron-wake собирает chat_id и настройки алертов "
-        "исключительно для отправки уведомлений о курсе USD/JPY. "
+        "исключительно для отправки уведомлений о курсах отслеживаемых инструментов. "
         "Данные не передаются третьим лицам. "
         "Для отключения — /unsubscribe."
     )
@@ -680,7 +680,7 @@ async def alert_cancel_cb(call: CallbackQuery, state: FSMContext):
 # ── Список и удаление алертов ───────────────────────────────────────────────────
 
 def _alert_label(a: dict) -> str:
-    """«USD/JPY 160.00» / «Bitcoin 70000.00» / «EURGBP=X 0.8520» — имя пары и уровень.
+    """«EUR/USD 1.0850» / «Bitcoin 70000.00» / «EURGBP=X 0.8520» — имя пары и уровень.
     Точность: фиксированная для реестра, для своей пары — по величине уровня
     (цену тут не запрашиваем, чтобы не дёргать Yahoo на каждый /myalerts)."""
     info = resolve(a["pair"])
@@ -1159,7 +1159,7 @@ async def cmd_pay(message: Message):
         await bot.send_invoice(
             chat_id=message.chat.id,
             title="Доступ к алертам",
-            description="Активация уведомлений о курсе USD/JPY на 30 дней",
+            description="Активация уведомлений о курсах инструментов на 30 дней",
             payload="alerts_access_30d",
             provider_token=PAYMENT_TOKEN,
             currency="RUB",
@@ -1358,7 +1358,7 @@ async def _nl_analyze(message: Message, intent: dict) -> None:
     code = str(intent.get("instrument") or "").strip().upper()
     if code not in engine_codes():
         await message.answer("Анализ — по крипте, форексу, золоту и нефти (BTC, ETH, SOL, TON, "
-                             "EUR/USD, GBP/USD, AUD/USD, USD/CAD, USD/JPY, Золото, Нефть). "
+                             "EUR/USD, GBP/USD, AUD/USD, USD/CAD, Золото, Нефть). "
                              "Выбрать — /analyze.")
         return
     await _do_analyze(message, code, message.from_user.id)
