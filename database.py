@@ -452,6 +452,27 @@ def get_recent_signals(user_id: int, limit: int = 10) -> list[dict]:
     return [dict(row) for row in rows]
 
 
+def get_signals_since(user_id: int, since: str | None = None) -> list[dict]:
+    """Все сигналы пользователя (плюс старые «общие» user_id IS NULL) для сводной
+    статистики /stats — без LIMIT, считаем по всей истории. since — ISO-дата
+    (берём created_at >= since); None → вся история без фильтра по дате.
+    created_at хранится строкой ISO 8601 фиксированного формата, поэтому
+    лексикографическое сравнение = хронологическое."""
+    query = """
+        SELECT instrument, direction, entry_price, stop_loss, take_profit, status
+        FROM signals
+        WHERE (user_id = ? OR user_id IS NULL)
+    """
+    params: list = [user_id]
+    if since is not None:
+        query += " AND created_at >= ?"
+        params.append(since)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
 # ── Подписки на сигналы ─────────────────────────────────────────────────────
 
 def add_subscription(user_id: int, instrument: str) -> None:

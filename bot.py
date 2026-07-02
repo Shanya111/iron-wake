@@ -1,7 +1,7 @@
 import asyncio
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from aiogram import Bot, BaseMiddleware, Dispatcher, F
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -414,6 +414,7 @@ HELP_TEXT = (
     "/analyze — анализ инструмента: тренд D1 + уровни + зоны ликвидности\n"
     "/subscribe — подписка на торговые сигналы (Spring/Upthrust)\n"
     "/signals — последние сигналы\n"
+    "/stats — статистика сигналов (винрейт, итог в R) за 30 дней / всё время\n"
     "/trades — журнал сделок (статус цель/стоп, закрытие)\n"
     "/settings — пороги движка сигналов под себя (объём, пробой, R:R)\n"
     "/cancel — отменить текущий сценарий\n\n"
@@ -421,6 +422,7 @@ HELP_TEXT = (
     "• «алерт золото 2400» — поставлю алерт\n"
     "• «что по биткоину» — сделаю анализ\n"
     "• «подпиши на эфир» / «мои сигналы» — подписка и список\n"
+    "• «статистика за месяц» — сводка по сигналам (винрейт, итог в R)\n"
     "• «взял золото по 2390, стоп 2380, цель 2410» — запишу сделку в журнал\n"
     "Остальное (вопросы, разбор пересланного анализа) — отвечу как ассистент."
 )
@@ -1050,6 +1052,132 @@ async def cmd_signals(message: Message):
     await message.answer("Последние сигналы:\n" + "\n".join(lines))
 
 
+# ── Сводная статистика по сигналам (/stats) ────────────────────────────────────
+
+def compute_signal_stats(rows: list[dict]) -> dict:
+    """Считает агрегаты по списку сигналов. Денег не храним → меряем в R
+    (риск на сделку = 1R): цель дала +R:R, стоп = −1R. pending/expired в
+    винрейт и профит-фактор не входят (исход не определён). Разбивка по
+    инструментам — только по закрытым (цель/стоп)."""
+    tp = sl = pending = expired = 0
+    gross_profit = 0.0            # сумма плюсов в R (по факт. R:R достигших цели)
+    gross_loss = 0.0             # сумма минусов в R (каждый стоп = 1R)
+    by_instrument: dict[str, dict] = {}
+
+    for s in rows:
+        status = s["status"]
+        if status == "pending":
+            pending += 1
+            continue
+        if status == "expired":
+            expired += 1
+            continue
+        # закрытые: hit_tp / hit_sl
+        risk = abs(s["entry_price"] - s["stop_loss"])
+        rr = abs(s["take_profit"] - s["entry_price"]) / risk if risk else 0.0
+        inst = by_instrument.setdefault(
+            s["instrument"], {"tp": 0, "sl": 0, "net": 0.0}
+        )
+        if status == "hit_tp":
+            tp += 1
+            gross_profit += rr
+            inst["tp"] += 1
+            inst["net"] += rr
+        elif status == "hit_sl":
+            sl += 1
+            gross_loss += 1.0
+            inst["sl"] += 1
+            inst["net"] -= 1.0
+
+    decided = tp + sl
+    return {
+        "total": len(rows),
+        "tp": tp, "sl": sl, "pending": pending, "expired": expired,
+        "decided": decided,
+        "winrate": (tp / decided) if decided else None,
+        "net_r": gross_profit - gross_loss,
+        "gross_profit": gross_profit,
+        "gross_loss": gross_loss,
+        # профит-фактор: плюсы ÷ минусы; нет стопов при наличии плюсов → бесконечность
+        "profit_factor": (gross_profit / gross_loss) if gross_loss else
+                         (float("inf") if gross_profit > 0 else None),
+        "by_instrument": by_instrument,
+    }
+
+
+def render_stats(user_id: int, period: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Текст + кнопка-переключатель периода для /stats. period: '30' | 'all'."""
+    since = None
+    if period == "30":
+        since = (datetime.now() - timedelta(days=30)).isoformat(timespec="seconds")
+    rows = database.get_signals_since(user_id, since)
+    st = compute_signal_stats(rows)
+
+    head = "за 30 дней" if period == "30" else "за всё время"
+    # Кнопка ведёт на противоположный период.
+    if period == "30":
+        btn = InlineKeyboardButton(text="📅 За всё время", callback_data="stats:all")
+    else:
+        btn = InlineKeyboardButton(text="📅 За 30 дней", callback_data="stats:30")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[[btn]])
+
+    if st["total"] == 0:
+        return (
+            f"📊 Статистика сигналов — {head}\n\n"
+            "За период сигналов не было. Подписаться на инструменты — /subscribe.",
+            keyboard,
+        )
+
+    lines = [
+        f"📊 Статистика сигналов — {head}\n",
+        f"Всего: {st['total']}",
+        f"✅ Цель: {st['tp']}   🛑 Стоп: {st['sl']}   "
+        f"⏳ Ждём: {st['pending']}   ⌛ Истекло: {st['expired']}",
+        "",
+    ]
+
+    if st["decided"]:
+        lines.append(f"Винрейт: {st['winrate'] * 100:.0f}% "
+                     f"({st['tp']} из {st['decided']} закрытых)")
+        lines.append(f"Итог: {st['net_r']:+.1f}R")
+        pf = st["profit_factor"]
+        if pf is None:
+            pf_str = "—"
+        elif pf == float("inf"):
+            pf_str = "∞ (без стопов)"
+        else:
+            pf_str = f"{pf:.2f}"
+        lines.append(f"Профит-фактор: {pf_str}")
+    else:
+        lines.append("Закрытых сигналов пока нет — винрейт посчитаю, когда "
+                     "сработают цель/стоп.")
+
+    # Разбивка по инструментам (по закрытым), сильнейшие сверху.
+    if st["by_instrument"]:
+        lines.append("\nПо инструментам:")
+        for code, d in sorted(st["by_instrument"].items(),
+                              key=lambda kv: kv[1]["net"], reverse=True):
+            info = resolve(code)
+            lines.append(f"  • {info['name']}: {d['net']:+.1f}R "
+                         f"({d['tp']}✅/{d['sl']}🛑)")
+
+    return "\n".join(lines), keyboard
+
+
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    text, keyboard = render_stats(message.from_user.id, "30")
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("stats:"))
+async def cb_stats(call: CallbackQuery):
+    period = call.data.removeprefix("stats:")   # '30' | 'all'
+    text, keyboard = render_stats(call.from_user.id, period)
+    await call.message.edit_text(text, reply_markup=keyboard)
+    await call.answer()
+
+
 def settings_text(user_id: int, is_admin: bool) -> str:
     # Пороги персональные: подписчик крутит их под себя, поверх общих значений.
     # Админ правит ОБЩИЙ дефолт (для всех, кто не настроил своё) — у него личных нет.
@@ -1378,6 +1506,8 @@ async def free_text(message: Message, state: FSMContext):
         await _nl_analyze(message, intent)
     elif action == "signals":
         await cmd_signals(message)
+    elif action == "stats":
+        await cmd_stats(message)
     elif action == "my_alerts":
         await cmd_myalerts(message)
     elif action == "my_trades":
@@ -1518,6 +1648,7 @@ async def main():
         BotCommand(command="analyze",     description="Анализ инструмента (тренд + уровни)"),
         BotCommand(command="subscribe",   description="Подписка на торговые сигналы"),
         BotCommand(command="signals",     description="Последние сигналы"),
+        BotCommand(command="stats",       description="Статистика сигналов (винрейт, R)"),
         BotCommand(command="trades",      description="Журнал сделок"),
         BotCommand(command="settings",    description="Настройки сигналов под себя"),
         BotCommand(command="write",       description="Написать администратору"),
@@ -1546,6 +1677,7 @@ async def main():
                 BotCommand(command="analyze",   description="Анализ инструмента (тренд + уровни)"),
                 BotCommand(command="subscribe", description="Подписка на торговые сигналы"),
                 BotCommand(command="signals",   description="Последние сигналы"),
+                BotCommand(command="stats",     description="Статистика сигналов (винрейт, R)"),
                 BotCommand(command="trades",    description="Журнал сделок"),
                 BotCommand(command="help",      description="Помощь"),
                 BotCommand(command="cancel",    description="Отмена"),
