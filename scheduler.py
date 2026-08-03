@@ -13,7 +13,7 @@
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -23,6 +23,7 @@ import data_fetcher
 import database
 import llm
 import pattern_detector
+import trading_week
 from instruments import ccxt_symbol, data_source, fmt, infer_decimals, resolve
 
 
@@ -57,7 +58,7 @@ def _subscribed_engine() -> list[str]:
 
 
 async def run_analysis(bot=None) -> None:
-    """Контекстный анализ (раз в час): тренд D1 + уровни D1/H1 + зоны ликвидности → БД."""
+    """Контекстный анализ (раз в час): тренд H1/D1 + уровни D1/H1 + зоны ликвидности → БД."""
     codes = _subscribed_engine()
     print(f"[run_analysis] инструментов к анализу: {len(codes)}")
     for code in codes:
@@ -82,7 +83,10 @@ def analyze_and_store(code: str, d1, h1) -> list[dict]:
         for z in zones
     ]
     database.save_levels(code, prioritized + liquidity_levels)
-    print(f"[analysis] {code}: тренд={analyzer.get_trend(d1)}, "
+    # Печатаем оба тренда: H1 — рабочий (по нему отбираются сигналы и строится
+    # /analyze), D1 — фон. Когда сигналов нет, по логу сразу видно, тренд ли виноват.
+    print(f"[analysis] {code}: тренд H1={analyzer.get_trend(h1)} "
+          f"(D1={analyzer.get_trend(d1)}), "
           f"уровней={len(prioritized)}, зон ликвидности={len(zones)}")
     return prioritized
 
@@ -95,6 +99,13 @@ async def monitor_signals(bot) -> None:
     user_settings). Дедуп и трекинг исхода тоже идут по конкретному пользователю.
     Свечи/уровни/тренд считаются один раз на инструмент (детект — чистый CPU по кешу).
     """
+    # Недельное окно проверяем дважды: здесь — по текущему времени, в детекторе —
+    # по времени свечи. Без этой проверки сигнал по свече четверга 23:00 ушёл бы
+    # подписчику в пятницу 00:05, и вход по факту оказался бы пятничным.
+    allowed, why = trading_week.is_entry_allowed(datetime.now(timezone.utc))
+    if not allowed:
+        print(f"[monitor_signals] вне недельного окна ({why}) — новых входов не даём")
+        return
     codes = _subscribed_engine()
     for code in codes:
         subscribers = database.get_subscribers(code)
@@ -102,11 +113,15 @@ async def monitor_signals(bot) -> None:
             continue
         try:
             h1 = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
-            d1 = await fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
         except Exception as e:
             print(f"[monitor_signals] {code}: ошибка данных: {e}")
             continue
-        trend = analyzer.get_trend(d1)
+        # Фильтр направления — по ЧАСОВОМУ тренду: сделка живёт внутри недели
+        # (вход пн–чт, выход к пятнице), и на таком горизонте ориентир задаёт H1,
+        # а не дневка. Тот же тренд показывает /analyze — что видно в отчёте, то
+        # и отбирает сигналы. Дневные свечи здесь больше не нужны (уровни D1
+        # приходят из БД, их считает run_analysis) — лишний запрос убран.
+        trend = analyzer.get_trend(h1)
         levels = database.get_levels(code)
         # Комментарий LLM считаем один раз на одинаковый сигнал в цикле (а не на каждого
         # подписчика): ключ — паттерн+направление+цель (цель зависит от личного R:R).
@@ -152,13 +167,17 @@ async def track_signals(bot) -> None:
         df = candles.get(s["instrument"])
         if df is None:
             continue
-        outcome = pattern_detector.evaluate_signal(s, df)
+        # week_close=True — через выходные сделку не тянем: не дошла до цели/стопа
+        # к пятничному закрытию, гасим по рынку (см. trading_week и config).
+        res = pattern_detector.evaluate_signal_detailed(
+            s, df, week_close=config.FORCE_CLOSE_AT_WEEK_END)
+        outcome = res["status"]
         if outcome == "pending":
             continue
-        database.update_signal_status(s["id"], outcome)
+        database.update_signal_status(s["id"], outcome, res["exit_price"])
         print(f"[track_signals] {s['instrument']} #{s['id']} → {outcome}")
-        if outcome in ("hit_tp", "hit_sl"):
-            await _notify_outcome(bot, s, outcome)
+        if outcome in ("hit_tp", "hit_sl", "closed_week"):
+            await _notify_outcome(bot, s, outcome, res["exit_price"])
 
 
 async def track_trades(bot) -> None:
@@ -219,10 +238,25 @@ async def _notify_trade_outcome(bot, trade: dict, outcome: str) -> None:
         print(f"[track_trades] не отправить {trade['user_id']}: {e}")
 
 
-async def _notify_outcome(bot, signal: dict, outcome: str) -> None:
+async def _notify_outcome(bot, signal: dict, outcome: str,
+                          exit_price: float | None = None) -> None:
     info = resolve(signal["instrument"])
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
     arrow = "🟢 ЛОНГ" if signal["direction"] == "long" else "🔴 ШОРТ"
+    if outcome == "closed_week":
+        # Неделя закрылась, сделка не отработала — на выходные не переносим.
+        r = trading_week.realized_r(signal["direction"], signal["entry_price"],
+                                    signal["stop_loss"], exit_price)
+        text = (
+            f"🔚 Закрыл по неделе — {info['name']} ({arrow})\n"
+            f"Вход был {fmt(signal['entry_price'], d)}, "
+            f"на закрытии недели {fmt(exit_price, d)} ({r:+.2f}R).\n"
+            "Цель и стоп не сработали, а через выходные позицию не держим — "
+            "в понедельник рынок открывается гэпом.\n\n"
+            "Это итог подсказки, не финсовет."
+        )
+        await _send_outcome(bot, signal, text)
+        return
     if outcome == "hit_tp":
         head, price = "✅ Цель достигнута", signal["take_profit"]
     else:
@@ -232,8 +266,12 @@ async def _notify_outcome(bot, signal: dict, outcome: str) -> None:
         f"Вход был {fmt(signal['entry_price'], d)}, цена дошла до {fmt(price, d)}.\n\n"
         "Это итог подсказки, не финсовет."
     )
-    # Сигнал персональный → исход шлём его владельцу. Старые «общие» сигналы (до
-    # перехода, user_id отсутствует/NULL) — всем текущим подписчикам, как раньше.
+    await _send_outcome(bot, signal, text)
+
+
+async def _send_outcome(bot, signal: dict, text: str) -> None:
+    """Шлёт итог по сигналу. Сигнал персональный → владельцу. Старые «общие»
+    сигналы (до перехода, user_id отсутствует/NULL) — всем текущим подписчикам."""
     owner = signal.get("user_id")
     recipients = [owner] if owner else database.get_subscribers(signal["instrument"])
     for user_id in recipients:
@@ -270,7 +308,7 @@ async def _signal_comment(code: str, signal: dict, trend: str) -> str | None:
     summary = (
         f"Инструмент: {info['name']}\n"
         f"Паттерн: {pat}\n"
-        f"Тренд D1: {trend_ru}\n"
+        f"Тренд H1 (рабочий): {trend_ru}\n"
         f"Сила пробитого уровня: {strength}\n"
         f"Вход {fmt(signal['entry_price'], d)}, стоп {fmt(signal['stop_loss'], d)}, "
         f"цель {fmt(signal['take_profit'], d)}.\n"

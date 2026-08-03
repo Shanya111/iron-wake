@@ -37,6 +37,9 @@ htmlcov/
 # Рантайм-настройки порогов (создаётся командой /settings)
 settings.json
 
+# Кеш скачанной истории для бэктеста (backtest.py, сбрасывается --no-cache)
+.backtest_cache/
+
 # Логи
 *.log
 logs/

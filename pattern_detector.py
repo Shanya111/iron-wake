@@ -11,6 +11,7 @@ Upthrust — зеркало по сопротивлению (пробой вве
 import pandas as pd
 
 import config
+import trading_week
 
 
 def detect_spring(df: pd.DataFrame, levels: list[dict], trend: str,
@@ -34,6 +35,28 @@ def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
     return float(window.mean()) if len(window) else 0.0
 
 
+def _atr(df: pd.DataFrame, pos: int, period: int) -> float:
+    """ATR (средний истинный диапазон) на свече `pos` — мера волатильности.
+
+    Истинный диапазон свечи — наибольшее из: её размах, расстояние от её максимума
+    до вчерашнего закрытия и от минимума до него же (последние два ловят гэпы).
+    ATR — среднее такого диапазона за `period` свечей.
+
+    Нужен стопу: запас за экстремум свечи пробоя задаётся в долях ATR, а не в
+    процентах от цены. По бэктесту типичный свип у биткоина 0.32% от цены, а у
+    золота 0.10% — одним процентом им обоим не угодить, в долях ATR они втрое ближе.
+    """
+    start = max(0, pos - period + 1)
+    window = df.iloc[start:pos + 1]
+    prev_close = df["close"].shift(1).iloc[start:pos + 1]
+    tr = pd.concat([
+        window["high"] - window["low"],
+        (window["high"] - prev_close).abs(),
+        (window["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return float(tr.mean())
+
+
 def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool):
     """Ближайший уровень нужного типа выше (above=True) или ниже ref_price."""
     prices = [
@@ -53,6 +76,14 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     vol_mult = s.get("VOL_MULT", config.get("VOL_MULT"))
     break_pct = s.get("BREAK_PCT", config.get("BREAK_PCT"))
     min_rr = s.get("MIN_RR", config.get("MIN_RR"))
+    # Запас стопа за экстремум свечи пробоя — см. config.STOP_MODE. По умолчанию
+    # он в долях ATR (подстраивается под волатильность), запасной вариант — процент
+    # от цены. Настройки могут переопределить: STOP_ABS — готовый запас числом,
+    # STOP_SPREAD — явный процент. Оба нужны бэктесту, чтобы гонять варианты стопа
+    # через боевой детектор; явное переопределение всегда главнее режима из config.
+    stop_spread = s.get("STOP_SPREAD", config.STOP_SPREAD)
+    stop_abs = s.get("STOP_ABS")
+    use_atr = stop_abs is None and "STOP_SPREAD" not in s and config.STOP_MODE == "atr"
 
     if len(df) < config.VOL_LOOKBACK + 3:
         return None
@@ -63,6 +94,14 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
         return None
 
     pos = len(df) - 2  # последняя закрытая свеча
+    # Недельное окно: в пятницу и на выходных входов не даём вообще, и не даём,
+    # если до закрытия недели осталось меньше MIN_HOURS_BEFORE_CLOSE — сделка не
+    # успеет отработать, а через выходные мы ничего не переносим (trading_week).
+    # WEEK_FILTER=False отключает проверку — нужно бэктесту, чтобы сравнить с «как было».
+    if s.get("WEEK_FILTER", True):
+        allowed, _ = trading_week.is_entry_allowed(df.index[pos])
+        if not allowed:
+            return None
     candle = df.iloc[pos]
     h, l, c = float(candle["high"]), float(candle["low"]), float(candle["close"])
     vol = float(candle["volume"])
@@ -71,6 +110,14 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     avg_vol = _avg_volume(df, pos)
     if avg_vol <= 0 or vol < avg_vol * vol_mult:
         return None
+
+    # Запас стопа в долях ATR. Считаем только здесь, когда свеча уже прошла все
+    # фильтры — на каждом баре подряд это была бы лишняя работа. Если ATR посчитать
+    # не на чем (плоские свечи, короткая история), молча падаем на процент.
+    if use_atr:
+        atr = _atr(df, pos, config.STOP_ATR_PERIOD)
+        if atr > 0:
+            stop_abs = atr * config.STOP_ATR_MULT
 
     level_type = "support" if side == "long" else "resistance"
     relevant = [lvl for lvl in levels if lvl["type"] == level_type]
@@ -92,7 +139,7 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
         # невыгодна, пропускаем. Нет уровня впереди → ставим цель ровно на MIN_RR×риск.
         if side == "long":
             entry = c
-            stop = l * (1 - config.STOP_SPREAD)
+            stop = l - (stop_abs if stop_abs is not None else l * stop_spread)
             risk = entry - stop
             target = _nearest(levels, "resistance", entry, above=True)
             if target is None:
@@ -103,7 +150,7 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
                 continue
         else:
             entry = c
-            stop = h * (1 + config.STOP_SPREAD)
+            stop = h + (stop_abs if stop_abs is not None else h * stop_spread)
             risk = stop - entry
             target = _nearest(levels, "support", entry, above=False)
             if target is None:
@@ -126,44 +173,73 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     return None
 
 
-def evaluate_signal(signal: dict, df: pd.DataFrame) -> str:
+def evaluate_signal(signal: dict, df: pd.DataFrame, week_close: bool = False) -> str:
+    """Исход открытого сигнала одной строкой (см. evaluate_signal_detailed)."""
+    return evaluate_signal_detailed(signal, df, week_close)["status"]
+
+
+def evaluate_signal_detailed(signal: dict, df: pd.DataFrame,
+                             week_close: bool = False) -> dict:
     """Исход открытого сигнала по свечам, появившимся ПОСЛЕ свечи пробоя.
 
     Вход в сделку — это закрытие свечи пробоя (signal['bar_time']), поэтому смотрим
-    только свечи строго после неё. Возвращает:
-      • 'hit_tp'  — цена дошла до цели (плюс);
-      • 'hit_sl'  — цена дошла до стопа (минус);
-      • 'expired' — за SIGNAL_EXPIRE_HOURS не дошла никуда (исход неизвестен);
-      • 'pending' — пока рано, ждём дальше.
+    только свечи строго после неё. Возвращает {status, exit_price, exit_time}, где
+    status:
+      • 'hit_tp'      — цена дошла до цели (плюс);
+      • 'hit_sl'      — цена дошла до стопа (минус);
+      • 'closed_week' — не дошла никуда до закрытия недели и погашена по рынку
+                        (только при week_close=True; цена выхода — в exit_price);
+      • 'expired'     — за SIGNAL_EXPIRE_HOURS не дошла никуда (исход неизвестен);
+      • 'pending'     — пока рано, ждём дальше.
+
+    week_close=True включает недельное окно: за пятничное закрытие сделку не
+    тянем, гасим по последней свече перед ним (см. trading_week). Журнал сделок
+    вызывает с week_close=False — там сделки закрывает сам пользователь.
 
     Внутри одной свечи порядок касаний неизвестен, поэтому при двусмысленности
     (свеча накрыла и стоп, и цель) считаем консервативно — сначала стоп.
     Если у сигнала нет якоря bar_time (старый сигнал до 2-й волны) — не трогаем
     его ('pending'): без точки отсчёта исход не определить честно.
     """
+    def result(status, price=None, ts=None):
+        return {"status": status, "exit_price": price, "exit_time": ts}
+
     bar_time = signal.get("bar_time")
     if not bar_time:
-        return "pending"
+        return result("pending")
     after = df[df.index > pd.Timestamp(bar_time)]
     if after.empty:
-        return "pending"
+        return result("pending")
+
+    deadline = trading_week.week_close_after(bar_time) if week_close else None
+    if deadline is not None:
+        after = after[after.index <= deadline]  # за закрытие недели не заглядываем
+        if after.empty:
+            return result("pending")
 
     stop, tp = signal["stop_loss"], signal["take_profit"]
     long = signal["direction"] == "long"
-    for _, c in after.iterrows():
+    for ts, c in after.iterrows():
         hi, lo = float(c["high"]), float(c["low"])
         if long:
             if lo <= stop:
-                return "hit_sl"
+                return result("hit_sl", stop, ts)
             if hi >= tp:
-                return "hit_tp"
+                return result("hit_tp", tp, ts)
         else:
             if hi >= stop:
-                return "hit_sl"
+                return result("hit_sl", stop, ts)
             if lo <= tp:
-                return "hit_tp"
+                return result("hit_tp", tp, ts)
 
+    # С недельным окном горизонт сигнала задаёт закрытие недели: `after` обрезан
+    # дедлайном, а от понедельника до пятничного закрытия максимум 117ч — меньше
+    # SIGNAL_EXPIRE_HOURS (120ч). То есть сигнал понедельника доживает до пятницы
+    # и гасится по рынку, а не истекает на середине недели. 'expired' остаётся
+    # для вызовов без окна (журнал сделок) и на случай дыр в данных.
     age_hours = (after.index[-1] - pd.Timestamp(bar_time)).total_seconds() / 3600
     if age_hours >= config.SIGNAL_EXPIRE_HOURS:
-        return "expired"
-    return "pending"
+        return result("expired")
+    if deadline is not None and df.index.max() >= deadline:
+        return result("closed_week", float(after["close"].iloc[-1]), after.index[-1])
+    return result("pending")

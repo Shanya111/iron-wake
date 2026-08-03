@@ -18,7 +18,13 @@ import pattern_detector  # noqa: E402
 
 
 def _df(rows: list[tuple]) -> pd.DataFrame:
-    """rows: список (open, high, low, close, volume). Индекс — почасовой UTC."""
+    """rows: список (open, high, low, close, volume). Индекс — почасовой UTC.
+
+    Дата начала выбрана не случайно: 2024-01-01 — понедельник, поэтому свечи
+    попадают в недельное окно торговли (входы только пн–чт, см. trading_week).
+    Сдвинешь дату на пятницу/выходные — детектор перестанет выдавать сигналы и
+    тесты паттернов упадут. Проверка окна — в tests/test_trading_week.py.
+    """
     idx = pd.date_range("2024-01-01", periods=len(rows), freq="h", tz="UTC")
     return pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=idx)
 
@@ -199,9 +205,19 @@ def test_evaluate_pending():
 
 
 def test_evaluate_expired():
-    rows = [(100.5, 101, 100, 100.5, 100) for _ in range(50)]  # 49ч ≥ 48ч порога
+    # Без недельного окна (журнал сделок) горизонт задаёт SIGNAL_EXPIRE_HOURS.
+    rows = [(100.5, 101, 100, 100.5, 100)
+            for _ in range(config.SIGNAL_EXPIRE_HOURS + 2)]
     df = _df(rows)
     assert pattern_detector.evaluate_signal(_long_signal(df), df) == "expired"
+
+
+def test_evaluate_not_expired_within_week():
+    # Сделка внутри недели (меньше горизонта) ещё не истекла — ждём дальше.
+    rows = [(100.5, 101, 100, 100.5, 100)
+            for _ in range(config.SIGNAL_EXPIRE_HOURS - 10)]
+    df = _df(rows)
+    assert pattern_detector.evaluate_signal(_long_signal(df), df) == "pending"
 
 
 def test_evaluate_short_hit_tp():

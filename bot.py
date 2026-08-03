@@ -28,6 +28,7 @@ import config
 import data_fetcher
 import database
 import scheduler as engine
+import trading_week
 from llm import ANALYST_PROMPT, ask_openrouter, classify_intent
 from instruments import (
     INSTRUMENTS,
@@ -855,50 +856,67 @@ def _render_levels(items: list[dict], d: int, last: float, limit: int) -> str:
     return "\n".join(rows)
 
 
-def _format_analysis(info: dict, df, trend: str, levels: list[dict], zones: list[dict],
-                     ob: dict | None = None) -> str:
-    """Человеко-читаемый отчёт по числам анализа (без AI). Уровни сгруппированы по
-    таймфреймам (дневка/часовик) с эмодзи — чтобы было видно, что старшее, что ближнее."""
+_TREND_RU = {
+    "up": "восходящий ↑ (цена растёт)",
+    "down": "нисходящий ↓ (цена падает)",
+    "sideways": "боковик → (без чёткого направления)",
+}
+_TREND_SHORT = {"up": "вверх ↑", "down": "вниз ↓", "sideways": "боковик →"}
+
+
+def _format_analysis(info: dict, df, trend: str, trend_d1: str, levels: list[dict],
+                     zones: list[dict], ob: dict | None = None) -> str:
+    """Человеко-читаемый отчёт по числам анализа (без AI).
+
+    Главный таймфрейм — часовик (H1): по нему тренд, зоны ликвидности и рабочие
+    уровни (торговля внутри дня). Дневка (D1) остаётся фоном: крупные ориентиры
+    и та самая сверка, из-за которой часовой уровень получает ⭐.
+    """
     last = float(df["close"].iloc[-1])
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
-    trend_ru = {
-        "up": "восходящий ↑ (цена растёт)",
-        "down": "нисходящий ↓ (цена падает)",
-        "sideways": "боковик → (без чёткого направления)",
-    }[trend]
     d1 = [l for l in levels if l.get("timeframe") == "D1" and l["type"] in ("support", "resistance")]
     h1 = [l for l in levels if l.get("timeframe") == "H1" and l["type"] in ("support", "resistance")]
 
     lines = [
         f"📊 {info['name']} — анализ",
         f"Цена сейчас: {fmt(last, d)}",
-        f"Тренд на дневке (D1): {trend_ru}",
+        f"Тренд на часовике (H1): {_TREND_RU[trend]}",
+        f"Фон дневки (D1): {_TREND_SHORT[trend_d1]}",
+    ]
+    # Часовик против дневки — обычная коррекция внутри старшего движения: тянуть
+    # такую сделку далеко не стоит, поэтому предупреждаем отдельной строкой.
+    if trend != "sideways" and trend_d1 != "sideways" and trend != trend_d1:
+        lines.append("  ⚠️ часовик идёт против дневки — похоже на коррекцию, цели короче")
+    lines += [
         "",
-        "🔵 Дневка (D1) — крупные уровни (главные ориентиры):",
-        _render_levels(d1, d, last, limit=6),
-        "",
-        "🟡 Часовик (H1) — ближние уровни (для входа):",
+        "🟡 Часовик (H1) — рабочие уровни (отсюда вход):",
         _render_levels(h1, d, last, limit=8),
     ]
     if any(l.get("strength") == "strong" for l in h1):
         lines.append("  ⭐ — сильный: часовой уровень совпал с дневным")
+    lines += [
+        "",
+        "🔵 Дневка (D1) — крупные ориентиры (фон):",
+        _render_levels(d1, d, last, limit=6),
+    ]
     if zones:
         near = sorted(zones, key=lambda z: abs(z["price"] - last))[:6]
         zlines = []
         for z in sorted(near, key=lambda x: x["price"], reverse=True):
             tag = " (рядом с ценой)" if abs(z["price"] - last) <= last * 0.01 else ""
             zlines.append(f"  💰 {fmt(z['price'], d)}{tag}")
-        lines += ["", "💰 Зоны ликвидности (где стояли крупные объёмы — магнит для цены):",
+        lines += ["", "💰 Зоны ликвидности часовика (крупные объёмы — магнит для цены):",
                   "\n".join(zlines)]
     if ob:
         lines += _format_orderbook(ob, d)
     return "\n".join(lines)
 
 
-def _analysis_prompt(info: dict, last: float, trend: str, levels: list[dict],
-                     zones: list[dict], ob: dict | None = None) -> str:
+def _analysis_prompt(info: dict, last: float, trend: str, trend_d1: str,
+                     levels: list[dict], zones: list[dict], ob: dict | None = None) -> str:
     """Компактная сводка чисел для AI-разбора (гибрид). Уровни разнесены по
-    таймфреймам — чтобы AI в ответе уточнял, дневной уровень или часовой."""
+    таймфреймам — чтобы AI в ответе уточнял, дневной уровень или часовой.
+    Рабочий тренд — часовой; дневной идёт отдельной строкой как фон."""
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
     d1 = [fmt(l["price"], d) for l in levels
           if l.get("timeframe") == "D1" and l["type"] in ("support", "resistance")]
@@ -918,10 +936,11 @@ def _analysis_prompt(info: dict, last: float, trend: str, levels: list[dict],
     return (
         f"Инструмент: {info['name']}\n"
         f"Цена сейчас: {fmt(last, d)}\n"
-        f"Тренд D1: {trend}\n"
+        f"Тренд H1 (рабочий): {trend}\n"
+        f"Тренд D1 (фон): {trend_d1}\n"
         f"Уровни дневки (D1): {', '.join(d1) or 'нет'}\n"
         f"Сильные уровни часовика (H1): {', '.join(h1_strong) or 'нет'}\n"
-        f"Зоны ликвидности: {', '.join(zone_prices) or 'нет'}\n"
+        f"Зоны ликвидности H1: {', '.join(zone_prices) or 'нет'}\n"
         f"{dom}"
         "Дай короткий разбор."
     )
@@ -939,12 +958,15 @@ async def _do_analyze(message: Message, code: str, user_id: int):
         await message.answer("Не удалось получить данные сейчас, попробуй позже.")
         return
 
-    trend = analyzer.get_trend(d1)
+    # Рабочий таймфрейм отчёта — часовик (торговля внутри дня): тренд и зоны считаем
+    # по H1. Дневной тренд остаётся фоном — понять, помогает старший таймфрейм или мешает.
+    trend = analyzer.get_trend(h1)
+    trend_d1 = analyzer.get_trend(d1)
     levels = engine.analyze_and_store(code, d1, h1)  # считает и сохраняет уровни в БД
     # Зоны ликвидности — под личный порог пользователя (LIQUIDITY_MULT): кто-то хочет
     # видеть только самые жирные всплески объёма, кто-то — больше зон. На сигналы не влияет.
     liq_mult = config.effective(database.get_user_settings(user_id))["LIQUIDITY_MULT"]
-    zones = analyzer.find_liquidity_zones(d1, liq_mult)
+    zones = analyzer.find_liquidity_zones(h1, liq_mult)
 
     # Стакан (DOM) есть только у биржевых инструментов (Kraken). У золота/нефти (Yahoo)
     # стакана нет → пропускаем; анализ это переживает (ob=None обрабатывается ниже).
@@ -958,13 +980,15 @@ async def _do_analyze(message: Message, code: str, user_id: int):
             ob = None
 
     await waiting.delete()
-    await message.answer(_format_analysis(info, d1, trend, levels, zones, ob))
+    # Цену берём из H1 — последняя часовая свеча свежее дневной.
+    await message.answer(_format_analysis(info, h1, trend, trend_d1, levels, zones, ob))
 
     # Гибрид: AI пишет человеческий разбор поверх чисел. Ошибка LLM не критична.
     try:
-        last = float(d1["close"].iloc[-1])
+        last = float(h1["close"].iloc[-1])
         comment = await ask_openrouter(
-            _analysis_prompt(info, last, trend, levels, zones, ob), system_prompt=ANALYST_PROMPT
+            _analysis_prompt(info, last, trend, trend_d1, levels, zones, ob),
+            system_prompt=ANALYST_PROMPT,
         )
         # Подписываем, по какому инструменту разбор — сообщения в ленте отрываются
         # от заголовка, и без имени непонятно, о чём речь.
@@ -1033,6 +1057,7 @@ async def cmd_signals(message: Message):
         "hit_tp": "✅ цель",
         "hit_sl": "🛑 стоп",
         "expired": "⌛ истёк",
+        "closed_week": "🔚 закрыт по неделе",
     }
     lines = []
     for s in signals:
@@ -1044,6 +1069,12 @@ async def cmd_signals(message: Message):
         label = status_label.get(s["status"], s["status"])
         risk = abs(s["entry_price"] - s["stop_loss"])
         rr = abs(s["take_profit"] - s["entry_price"]) / risk if risk else 0
+        # У закрытого по неделе выхода нет ни цели, ни стопа — показываем фактический
+        # результат в R, иначе строка выглядит как незакрытая сделка.
+        if s["status"] == "closed_week" and s.get("exit_price") is not None:
+            r = trading_week.realized_r(s["direction"], s["entry_price"],
+                                        s["stop_loss"], s["exit_price"])
+            label = f"{label} {fmt(s['exit_price'], d)} ({r:+.2f}R)"
         lines.append(
             f"{arrow}{star} {info['name']} {pat} — вход {fmt(s['entry_price'], d)}, "
             f"стоп {fmt(s['stop_loss'], d)}, цель {fmt(s['take_profit'], d)} "
@@ -1058,8 +1089,13 @@ def compute_signal_stats(rows: list[dict]) -> dict:
     """Считает агрегаты по списку сигналов. Денег не храним → меряем в R
     (риск на сделку = 1R): цель дала +R:R, стоп = −1R. pending/expired в
     винрейт и профит-фактор не входят (исход не определён). Разбивка по
-    инструментам — только по закрытым (цель/стоп)."""
-    tp = sl = pending = expired = 0
+    инструментам — только по закрытым.
+
+    Закрытые по неделе (`closed_week`, погашены по рынку перед выходными) считаются
+    по фактической цене выхода: их R может быть любым от −1 до +R:R. В винрейт они
+    входят по знаку — плюсовой выход считаем удачей, минусовой нет; в профит-фактор
+    попадают той же величиной, что и в итог."""
+    tp = sl = pending = expired = week = 0
     gross_profit = 0.0            # сумма плюсов в R (по факт. R:R достигших цели)
     gross_loss = 0.0             # сумма минусов в R (каждый стоп = 1R)
     by_instrument: dict[str, dict] = {}
@@ -1072,7 +1108,7 @@ def compute_signal_stats(rows: list[dict]) -> dict:
         if status == "expired":
             expired += 1
             continue
-        # закрытые: hit_tp / hit_sl
+        # закрытые: hit_tp / hit_sl / closed_week
         risk = abs(s["entry_price"] - s["stop_loss"])
         rr = abs(s["take_profit"] - s["entry_price"]) / risk if risk else 0.0
         inst = by_instrument.setdefault(
@@ -1088,11 +1124,26 @@ def compute_signal_stats(rows: list[dict]) -> dict:
             gross_loss += 1.0
             inst["sl"] += 1
             inst["net"] -= 1.0
+        elif status == "closed_week":
+            week += 1
+            if s.get("exit_price") is None:
+                continue  # цены выхода нет — посчитать результат нечем
+            r = trading_week.realized_r(s["direction"], s["entry_price"],
+                                        s["stop_loss"], s["exit_price"])
+            inst["net"] += r
+            if r >= 0:
+                tp += 1
+                gross_profit += r
+                inst["tp"] += 1
+            else:
+                sl += 1
+                gross_loss += -r
+                inst["sl"] += 1
 
     decided = tp + sl
     return {
         "total": len(rows),
-        "tp": tp, "sl": sl, "pending": pending, "expired": expired,
+        "tp": tp, "sl": sl, "pending": pending, "expired": expired, "week": week,
         "decided": decided,
         "winrate": (tp / decided) if decided else None,
         "net_r": gross_profit - gross_loss,
@@ -1132,7 +1183,9 @@ def render_stats(user_id: int, period: str) -> tuple[str, InlineKeyboardMarkup]:
         f"📊 Статистика сигналов — {head}\n",
         f"Всего: {st['total']}",
         f"✅ Цель: {st['tp']}   🛑 Стоп: {st['sl']}   "
-        f"⏳ Ждём: {st['pending']}   ⌛ Истекло: {st['expired']}",
+        f"⏳ Ждём: {st['pending']}   ⌛ Истекло: {st['expired']}"
+        + (f"\n🔚 Закрыто по неделе: {st['week']} (учтены по цене выхода)"
+           if st.get("week") else ""),
         "",
     ]
 
