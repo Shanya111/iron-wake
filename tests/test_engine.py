@@ -309,8 +309,11 @@ def test_sensitivity_presets_stay_in_measured_range():
         assert 60 <= values["VOL_PCTL"] <= 80
 
 
-def test_sensitivity_unknown_combo_falls_back_to_mid():
-    assert config.sensitivity_of({"VOL_PCTL": 42, "BREAK_PCT": 0.0005}) == "mid"
+def test_sensitivity_unknown_combo_returns_none():
+    """Ручные пороги не совпадают ни с одним пресетом → None, а не «ближайший».
+    Иначе меню поставило бы галочку на положении, в котором пользователя нет."""
+    assert config.sensitivity_of({"VOL_PCTL": 70, "BREAK_PCT": 0.0004}) is None
+    assert config.sensitivity_of({"VOL_PCTL": 42, "BREAK_PCT": 0.0005}) is None
 
 
 def test_chase_filter_toggles_off_with_zero():

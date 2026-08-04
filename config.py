@@ -225,12 +225,18 @@ SENSITIVITY = {
 }
 
 
-def sensitivity_of(eff: dict) -> str:
-    """Какому пресету соответствуют действующие пороги ('mid', если ничему)."""
+def sensitivity_of(eff: dict) -> str | None:
+    """Какому пресету соответствуют действующие пороги. None — ничему.
+
+    None важен: если вернуть 'mid' наугад, меню поставит галочку на положении,
+    в котором пользователь на самом деле не находится (так бывает у тех, кто
+    настраивал пороги вручную до появления пресетов). Меню врать не должно —
+    оно показывает «своё» и не отмечает ни одну кнопку.
+    """
     for name, (_, values) in SENSITIVITY.items():
         if all(eff.get(k) == v for k, v in values.items()):
             return name
-    return "mid"
+    return None
 
 
 def _load() -> dict:

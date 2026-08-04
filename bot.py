@@ -1242,7 +1242,10 @@ def settings_text(user_id: int, is_admin: bool) -> str:
     overrides = {} if is_admin else database.get_user_settings(user_id)
     eff = config.effective(overrides)
     sens = config.sensitivity_of(eff)
-    sens_name = config.SENSITIVITY[sens][0]
+    # None — действующие пороги не совпадают ни с одним пресетом (настраивали
+    # вручную до появления кнопок). Пишем честно, а не выбираем ближайшее.
+    sens_name = (config.SENSITIVITY[sens][0] if sens
+                 else "своё значение — нажми кнопку, чтобы перейти на измеренное")
     personal = " (личное)" if overrides else ""
     chase = "включено" if eff["MAX_RISK_ATR"] else "выключено"
 
