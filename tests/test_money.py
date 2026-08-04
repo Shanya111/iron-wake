@@ -54,6 +54,28 @@ def test_cost_zero_when_no_fee():
     assert money.cost_in_r(_trade("hit_tp"), 0.0) == 0.0
 
 
+def test_cost_differs_by_venue():
+    """Ставка своя у каждой площадки: крипта на Bybit дороже фьючерсов через БКС.
+    Инструмент берётся из сделки, источник — из реестра instruments."""
+    costs = {"ccxt": 0.0015, "yahoo": 0.0005}
+    btc = _trade("hit_tp", instrument="BTC")     # крипта → ccxt
+    gold = _trade("hit_tp", instrument="GOLD")   # золото → yahoo
+    assert abs(money.cost_in_r(btc, costs) - 0.15) < 1e-9    # 0.15% / 1%
+    assert abs(money.cost_in_r(gold, costs) - 0.05) < 1e-9   # 0.05% / 1%
+    assert money.cost_in_r(btc, costs) > money.cost_in_r(gold, costs)
+
+
+def test_cost_scalar_still_works():
+    """Одна ставка на всех — так бэктест считает колонку НЕТТО R."""
+    assert abs(money.cost_in_r(_trade("hit_tp", instrument="BTC"), 0.001) - 0.1) < 1e-9
+
+
+def test_unknown_instrument_costs_nothing():
+    """Своя пара без источника (сырой тикер) — ставки для неё нет, не падаем."""
+    assert money.cost_in_r(_trade("hit_tp", instrument="EURGBP=X"),
+                           {"ccxt": 0.0015, "yahoo": 0.0005}) == 0.0
+
+
 # ── Симуляция счёта ─────────────────────────────────────────────────────────
 
 def test_simulate_compounds():
@@ -67,7 +89,7 @@ def test_simulate_compounds():
 def test_simulate_costs_reduce_result():
     trades = [_trade("hit_tp", hours=0)]
     free = money.simulate(trades, 1000, 0.01)
-    paid = money.simulate(trades, 1000, 0.01, cost_frac=0.001)
+    paid = money.simulate(trades, 1000, 0.01, costs=0.001)
     # Риск 1% от цены → издержки 0.1% стоят 0.1R: было +2R, стало +1.9R.
     assert abs(paid["final"] - 1000 * (1 + 0.01 * 1.9)) < 1e-9
     assert paid["final"] < free["final"]

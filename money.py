@@ -20,15 +20,30 @@ from datetime import datetime
 import pandas as pd
 
 import trading_week
+from instruments import data_source
 
-# Сценарии издержек «туда-обратно», в долях от цены. Считаем несколько, потому что
-# правильного ответа нет: он зависит от инструмента, объёма и типа заявки.
+# Сценарии издержек «туда-обратно», в долях от цены. Ставка РАЗНАЯ у разных
+# площадок, поэтому задаётся по источнику данных инструмента (instruments.data_source):
+#   "ccxt"  — крипта (BTC/ETH/SOL/TON), торгуется на Bybit;
+#   "yahoo" — золото и нефть, торгуются фьючерсами через БКС.
+# Комиссия фьючерсов на МосБирже копеечная относительно объёма контракта, поэтому
+# у золота с нефтью ставка в разы ниже, чем у крипты, — и это заметно меняет итог.
+#
+# В каждой ставке сидит и комиссия, и спред с проскальзыванием: вход по рыночной
+# цене закрытия свечи — это заявка «по рынку», и она всегда берёт худшую сторону.
 COST_SCENARIOS = (
-    (0.0, "без издержек (как считает бэктест)"),
-    (0.001, "0.1% — оптимистично: лимитные заявки, крупный объём"),
-    (0.0032, "0.32% — Kraken, обе стороны лимитом (мейкер 0.16%)"),
-    (0.0052, "0.52% — Kraken, розничный тариф тейкера (0.26% × 2)"),
+    ({"ccxt": 0.0, "yahoo": 0.0},
+     "идеал: издержек нет (так считает сам бэктест)"),
+    ({"ccxt": 0.0006, "yahoo": 0.0003},
+     "лимитом: Bybit мейкер 0.02%×2, БКС фьючерсы + узкий спред"),
+    ({"ccxt": 0.0015, "yahoo": 0.0005},
+     "по рынку: Bybit тейкер 0.055%×2 + проскальзывание, БКС фьючерсы"),
+    ({"ccxt": 0.003, "yahoo": 0.001},
+     "осторожно: вдвое дороже — тонкая ликвидность, ночь, новости"),
 )
+
+# Сценарий «как в бою» для коротких сводок — второй из списка (реальный, не идеал).
+LIVE_COSTS = COST_SCENARIOS[2][0]
 
 # Сценарии счёта по умолчанию: (стартовый капитал, риск на сделку в долях).
 DEFAULT_ACCOUNTS = ((1000, 0.01), (1000, 0.02), (5000, 0.01))
@@ -51,13 +66,23 @@ def trade_r(signal: dict) -> float:
     return 0.0
 
 
-def cost_in_r(signal: dict, cost_frac: float) -> float:
+def cost_of(signal: dict, costs) -> float:
+    """Ставка издержек для этой сделки. costs — число (одна ставка на всех) или
+    словарь по источнику данных инструмента: {'ccxt': …, 'yahoo': …}."""
+    if not isinstance(costs, dict):
+        return costs or 0.0
+    return costs.get(data_source(signal.get("instrument", "")) or "", 0.0)
+
+
+def cost_in_r(signal: dict, costs) -> float:
     """Во сколько R обходятся издержки на этой сделке.
 
     Издержки заданы долей от ЦЕНЫ, а R — это риск сделки, тоже доля от цены.
     Значит цена сделки в R = издержки ÷ риск. Чем теснее стоп, тем дороже обходится
     каждая сделка: при риске 0.5% комиссия 0.1% стоит 0.2R, а при риске 0.2% — уже 0.5R.
+    Это и есть причина, по которой у движка с тесным стопом издержки решают всё.
     """
+    cost_frac = cost_of(signal, costs)
     if not cost_frac:
         return 0.0
     risk_frac = signal["risk"] / signal["entry_price"] if signal["entry_price"] else 0.0
@@ -73,7 +98,7 @@ def chronological(per_instrument: dict[str, list[dict]]) -> list[dict]:
 
 
 def simulate(trades: list[dict], capital: float, risk_frac: float,
-             cost_frac: float = 0.0) -> dict:
+             costs=0.0) -> dict:
     """Прогон сделок по счёту: сложный процент, риск risk_frac от текущего капитала.
 
     Модель намеренно простая и оптимистичная в одном месте: сделки считаются
@@ -89,7 +114,7 @@ def simulate(trades: list[dict], capital: float, risk_frac: float,
     wins = 0
     curve = [capital]
     for s in trades:
-        r = trade_r(s) - cost_in_r(s, cost_frac)
+        r = trade_r(s) - cost_in_r(s, costs)
         equity *= (1 + risk_frac * r)
         curve.append(equity)
         if r > 0:
@@ -137,24 +162,22 @@ def compare(per_instrument: dict[str, dict[str, list[dict]]], names: list[str],
     print("\n" + "═" * 96)
     print(f"  ВЫБОР ВАРИАНТА ПО ДЕНЬГАМ — счёт {capital:,.0f}$, риск {risk_frac:.0%} на сделку")
     print("═" * 96)
-    header = "".join(f"{f'{c * 100:g}%':>12}" for c, _ in COST_SCENARIOS)
+    header = "".join(f"{label.split(':')[0]:>13}" for _, label in COST_SCENARIOS)
     print(f"  {column:<20}{'сделок':>8}{'в мес.':>8}" + header + f"{'просадка':>10}")
-    print("  " + "─" * 94)
+    print("  " + "─" * 98)
     for name in names:
         trades = chronological({c: r.get(name, []) for c, r in per_instrument.items()})
         if not trades:
             print(f"  {name:<20}{'—':>8}  (сделок нет)")
             continue
-        cells = []
-        for cost_frac, _ in COST_SCENARIOS:
-            res = simulate(trades, capital, risk_frac, cost_frac)
-            cells.append(f"{res['final']:>11,.0f}$")
-        base = simulate(trades, capital, risk_frac, COST_SCENARIOS[1][0])
+        cells = [f"{simulate(trades, capital, risk_frac, costs)['final']:>12,.0f}$"
+                 for costs, _ in COST_SCENARIOS]
+        base = simulate(trades, capital, risk_frac, LIVE_COSTS)
         print(f"  {name:<20}{base['n']:>8}{base['per_month']:>8.1f}"
               + "".join(cells) + f"{base['max_dd']:>9.0%}")
-    print("\n    Колонки — издержки «туда-обратно» в % от цены. Просадка показана для "
-          f"{COST_SCENARIOS[1][0] * 100:g}%.\n"
-          "    Вариант, живой только в колонке 0% — это не стратегия, а иллюзия.")
+    print("\n    Колонки — сценарии издержек (расшифровка в money.COST_SCENARIOS).")
+    print("    Просадка показана для сценария «по рынку».")
+    print("    Вариант, живой только в колонке «идеал» — это не стратегия, а иллюзия.")
 
 
 def _fmt(res: dict) -> str:
@@ -181,13 +204,22 @@ def report(per_instrument: dict[str, list[dict]],
           f"→ в среднем {base['per_month']:.1f} сделок в месяц.")
     print("  Сделки идут в хронологическом порядке, все инструменты вперемешку.")
 
-    for cost_frac, label in COST_SCENARIOS:
+    # Из чего складывается счёт по инструментам — видно, кто его тянет и кто топит.
+    by_code: dict[str, int] = {}
+    for s in trades:
+        by_code[s["instrument"]] = by_code.get(s["instrument"], 0) + 1
+    print("  Сделок по инструментам: "
+          + ", ".join(f"{c} {n}" for c, n in sorted(by_code.items(), key=lambda x: -x[1])))
+
+    for costs, label in COST_SCENARIOS:
+        rates = ", ".join(f"{k} {v * 100:g}%" for k, v in costs.items())
         print(f"\n  ИЗДЕРЖКИ: {label}")
+        print(f"            (туда-обратно: {rates}; ccxt = крипта, yahoo = золото/нефть)")
         print(f"  {'счёт / риск':<20}{'итог':>13}{'прибыль':>9}"
               f"{'макс. просадка':>20}{'серия −':>8}{'винрейт':>9}")
         print("  " + "─" * 80)
         for capital, risk in accounts:
-            res = simulate(trades, capital, risk, cost_frac)
+            res = simulate(trades, capital, risk, costs)
             flag = "  ← счёт уполовинен" if res["ruined"] else ""
             print(f"  {capital:,}$ риск {risk:.0%}".ljust(22) + _fmt(res) + flag)
 
@@ -199,9 +231,9 @@ def report(per_instrument: dict[str, list[dict]],
             print("  ТО ЖЕ ПО СВЕЖЕЙ ПОЛОВИНЕ ИСТОРИИ (её отбор порогов не видел —")
             print("  это ближе всего к тому, чего ждать дальше)")
             print("─" * 96)
-            for cost_frac, label in COST_SCENARIOS[:3]:
-                res = simulate(second, 1000, 0.01, cost_frac)
-                print(f"  1,000$ риск 1%, {label[:34]:<34}" + _fmt(res))
+            for costs, label in COST_SCENARIOS:
+                res = simulate(second, 1000, 0.01, costs)
+                print(f"  1,000$ риск 1%, {label.split(':')[0]:<12}" + _fmt(res))
 
     print("\n  ⚠️  Это история, а не прогноз. У движка НЕТ доказанного преимущества:")
     print("      на проверочной половине результат задевает ноль (разброс сопоставим")
