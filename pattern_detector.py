@@ -35,6 +35,35 @@ def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
     return float(window.mean()) if len(window) else 0.0
 
 
+def _volume_ok(df: pd.DataFrame, pos: int, s: dict, vol_mult: float) -> bool:
+    """Аномален ли объём свечи `pos`? Два способа, см. config.VOL_MODE.
+
+    «mult» — объём ≥ среднего за VOL_LOOKBACK свечей × vol_mult (как было всегда).
+    «pctl» — объём выше VOL_PCTL-го процентиля за последние VOL_WINDOW свечей, то
+    есть свеча входит в самые объёмные среди соседних. Порог получается свой у
+    каждого инструмента и подстраивается сам: у золота с Yahoo объём неполный, и
+    требование «в 1.5 раза выше среднего» там режет нормальные сетапы, а «выше
+    80% соседей» — нет, потому что сравнивается с такими же неполными данными.
+
+    Окно в обоих случаях кончается ПЕРЕД свечой pos — саму свечу в свою же норму
+    не включаем, иначе она задирала бы порог, который сама должна перепрыгнуть.
+    """
+    vol = float(df["volume"].iloc[pos])
+    if s.get("VOL_MODE", config.VOL_MODE) == "pctl":
+        window_n = int(s.get("VOL_WINDOW", config.VOL_WINDOW))
+        pctl = float(s.get("VOL_PCTL", config.get("VOL_PCTL")))
+        window = df["volume"].iloc[max(0, pos - window_n):pos]
+        # На совсем коротком окне процентиль — шум, а не мера. Ниже VOL_LOOKBACK
+        # свечей не считаем вовсе (детектор и так требует такую историю).
+        if len(window) < config.VOL_LOOKBACK:
+            return False
+        threshold = float(window.quantile(pctl / 100))
+        return threshold > 0 and vol > threshold
+
+    avg_vol = _avg_volume(df, pos)
+    return avg_vol > 0 and vol >= avg_vol * vol_mult
+
+
 def _atr(df: pd.DataFrame, pos: int, period: int) -> float:
     """ATR (средний истинный диапазон) на свече `pos` — мера волатильности.
 
@@ -73,7 +102,7 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             settings: dict | None = None) -> dict | None:
     # Действующие пороги: личные значения подписчика поверх общих (None → общие).
     s = settings or {}
-    vol_mult = s.get("VOL_MULT", config.get("VOL_MULT"))
+    vol_mult = s.get("VOL_MULT", config.VOL_MULT)
     break_pct = s.get("BREAK_PCT", config.get("BREAK_PCT"))
     min_rr = s.get("MIN_RR", config.get("MIN_RR"))
     # Запас стопа за экстремум свечи пробоя — см. config.STOP_MODE. По умолчанию
@@ -104,11 +133,9 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             return None
     candle = df.iloc[pos]
     h, l, c = float(candle["high"]), float(candle["low"]), float(candle["close"])
-    vol = float(candle["volume"])
 
-    # Условие №3: аномальный объём на свече пробоя.
-    avg_vol = _avg_volume(df, pos)
-    if avg_vol <= 0 or vol < avg_vol * vol_mult:
+    # Условие №3: аномальный объём на свече пробоя (множитель или процентиль).
+    if not _volume_ok(df, pos, s, vol_mult):
         return None
 
     # ATR считаем только здесь, когда свеча уже прошла фильтр объёма — на каждом

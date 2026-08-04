@@ -963,10 +963,9 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     trend = analyzer.get_trend(h1)
     trend_d1 = analyzer.get_trend(d1)
     levels = engine.analyze_and_store(code, d1, h1)  # считает и сохраняет уровни в БД
-    # Зоны ликвидности — под личный порог пользователя (LIQUIDITY_MULT): кто-то хочет
-    # видеть только самые жирные всплески объёма, кто-то — больше зон. На сигналы не влияет.
-    liq_mult = config.effective(database.get_user_settings(user_id))["LIQUIDITY_MULT"]
-    zones = analyzer.find_liquidity_zones(h1, liq_mult)
+    # Зоны ликвидности — порог общий (config.LIQUIDITY_MULT), настройкой он больше
+    # не является: зоны видны только здесь, в отчёте, и на отбор сигналов не влияют.
+    zones = analyzer.find_liquidity_zones(h1)
 
     # Стакан (DOM) есть только у биржевых инструментов (Kraken). У золота/нефти (Yahoo)
     # стакана нет → пропускаем; анализ это переживает (ob=None обрабатывается ниже).
@@ -1247,14 +1246,13 @@ def settings_text(user_id: int, is_admin: bool) -> str:
         )
     else:
         footer = (
-            "Это твои личные пороги — крути сигналы (и зоны в /analyze) под себя кнопками.\n"
+            "Это твои личные пороги — крути отбор сигналов под себя кнопками.\n"
             "«Сбросить» вернёт общие значения. Метка «(личное)» = твоё переопределение."
         )
     return (
         "⚙️ Настройки движка сигналов:\n"
-        f"• Аномальный объём: × {eff['VOL_MULT']:g}{mark('VOL_MULT')}\n"
+        f"• Аномальный объём: выше {eff['VOL_PCTL']:g}% соседних свечей{mark('VOL_PCTL')}\n"
         f"• Глубина ложного пробоя: {eff['BREAK_PCT'] * 100:.3g}%{mark('BREAK_PCT')}\n"
-        f"• Объём зоны ликвидности (для /analyze): × {eff['LIQUIDITY_MULT']:g}{mark('LIQUIDITY_MULT')}\n"
         f"• Мин. прибыль/риск (R:R): 1:{eff['MIN_RR']:g}{mark('MIN_RR')}\n\n"
         + footer
     )
@@ -1263,9 +1261,9 @@ def settings_text(user_id: int, is_admin: bool) -> str:
 def settings_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(text="Объём ×1.3", callback_data="set:VOL_MULT:1.3"),
-            InlineKeyboardButton(text="×1.5", callback_data="set:VOL_MULT:1.5"),
-            InlineKeyboardButton(text="×2.0", callback_data="set:VOL_MULT:2.0"),
+            InlineKeyboardButton(text="Объём P60", callback_data="set:VOL_PCTL:60"),
+            InlineKeyboardButton(text="P70", callback_data="set:VOL_PCTL:70"),
+            InlineKeyboardButton(text="P80", callback_data="set:VOL_PCTL:80"),
         ],
         [
             InlineKeyboardButton(text="Пробой 0.03%", callback_data="set:BREAK_PCT:0.0003"),
@@ -1276,11 +1274,6 @@ def settings_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="R:R 1:2", callback_data="set:MIN_RR:2.0"),
             InlineKeyboardButton(text="1:2.5", callback_data="set:MIN_RR:2.5"),
             InlineKeyboardButton(text="1:3", callback_data="set:MIN_RR:3.0"),
-        ],
-        [
-            InlineKeyboardButton(text="Ликвидн. ×1.3", callback_data="set:LIQUIDITY_MULT:1.3"),
-            InlineKeyboardButton(text="×1.5", callback_data="set:LIQUIDITY_MULT:1.5"),
-            InlineKeyboardButton(text="×2.0", callback_data="set:LIQUIDITY_MULT:2.0"),
         ],
     ]
     # Подписчику — сброс личных порогов к общим. Админу нечего сбрасывать (он и есть общие).

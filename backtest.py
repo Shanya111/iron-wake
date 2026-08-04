@@ -84,6 +84,22 @@ STOP_VARIANTS = [
     ("ATR×3.0",       "atr", 3.0),
 ]
 
+# Варианты порога аномального объёма (--sweep vol). Точка отсчёта — текущий
+# множитель «объём ≥ среднего × VOL_MULT»; остальное — процентиль: «объём выше
+# P-го процентиля за последние N свечей». Смысл замены в том, что множитель —
+# один и тот же для всех инструментов, а объём у золота/нефти приходит с Yahoo
+# неполным. Процентиль сравнивает свечу с её же соседями и подстраивается сам.
+#
+# В перебор ОБЯЗАТЕЛЬНО входят и множители послабее текущего (VOL_MULTS). Без них
+# сравнение нечестное: процентиль P70 пропускает заметно больше сделок, чем ×1.5, а
+# у этого движка ослабление фильтра само по себе улучшает итог. Тогда победа
+# процентиля означала бы «мы просто ослабили порог», а не «процентиль — мера лучше».
+# Контроль отвечает на нужный вопрос: выигрывает ли процентиль у множителя ПРИ
+# СОПОСТАВИМОМ числе сделок.
+VOL_PCTLS = (50, 60, 70, 80, 90, 95)
+VOL_WINDOWS = (20, 50, 100)
+VOL_MULTS = (1.0, 1.1, 1.2, 1.3)
+
 ATR_PERIOD = 14
 
 # Кеш скачанной истории. Лежит рядом с кодом, в .gitignore. Нужен, чтобы разные
@@ -252,17 +268,89 @@ def _levels_at(d1_view: pd.DataFrame, h1_window: pd.DataFrame) -> list[dict]:
     return analyzer.prioritize_levels(global_levels, local_levels)
 
 
-def _variant_settings(base: dict, kind: str, value: float, atr: float) -> dict | None:
-    """Пороги детектора для конкретного варианта стопа. None — если ATR ещё не
-    посчитан (начало истории) и вариант посчитать не на чем."""
-    s = dict(base)
-    if kind == "pct":
-        s["STOP_SPREAD"] = value
-    else:
+# ── Варианты перебора ───────────────────────────────────────────────────────
+# Вариант — это набор порогов детектора, который прогоняется по всей истории
+# целиком и сравнивается с остальными. Меняем в нём ровно один рычаг, остальное
+# держим боевым: иначе непонятно, что именно дало разницу.
+#
+# Каждый вариант — dict:
+#   name  — как он называется в отчёте;
+#   patch — функция (ATR на баре) → переопределения порогов, или None, если на
+#           этом баре вариант не посчитать (ATR ещё не набрался в начале истории);
+#   vol   — условие объёма варианта, нужно предфильтру (см. _vol_mask).
+
+def _stop_patch(kind: str, value: float):
+    """Переопределения для варианта запаса стопа: процент от цены или доля ATR."""
+    def patch(atr: float) -> dict | None:
+        if kind == "pct":
+            return {"STOP_SPREAD": value}
         if not atr or pd.isna(atr):
             return None
-        s["STOP_ABS"] = atr * value
-    return s
+        return {"STOP_ABS": atr * value}
+    return patch
+
+
+def _base_vol_spec(base: dict) -> tuple:
+    """Условие объёма «как в бою» — из config и общих порогов."""
+    if base.get("VOL_MODE", config.VOL_MODE) == "pctl":
+        return ("pctl", base.get("VOL_PCTL", config.get("VOL_PCTL")),
+                base.get("VOL_WINDOW", config.VOL_WINDOW))
+    return ("mult", base.get("VOL_MULT", config.VOL_MULT))
+
+
+def vol_rule_text(base: dict) -> str:
+    """Действующее правило объёма человеческими словами — для шапки отчёта."""
+    spec = _base_vol_spec(base)
+    if spec[0] == "pctl":
+        return f"выше P{spec[1]:g} за {spec[2]} свечей"
+    return f"≥ среднего ×{spec[1]:g}"
+
+
+def build_variants(sweep: str, base: dict) -> list[dict]:
+    """Список вариантов для перебора: 'stop' — запас стопа, 'vol' — порог объёма."""
+    if sweep == "vol":
+        current = _base_vol_spec(base)
+        label = (f"×{current[1]:g} (сейчас)" if current[0] == "mult"
+                 else f"P{current[1]:g}/{current[2]} св. (сейчас)")
+        variants = [{"name": label, "patch": lambda atr: {}, "vol": current}]
+        # Контроль: тот же множитель, только слабее — чтобы отличить «процентиль
+        # лучше как мера» от «просто пропустили больше сделок».
+        for m in VOL_MULTS:
+            variants.append({
+                "name": f"множитель ×{m:g}",
+                "patch": (lambda mm: lambda atr: {"VOL_MODE": "mult", "VOL_MULT": mm})(m),
+                "vol": ("mult", m),
+            })
+        for n in VOL_WINDOWS:
+            for p in VOL_PCTLS:
+                spec = ("pctl", p, n)
+                variants.append({
+                    "name": f"P{p} / {n} свечей",
+                    "patch": (lambda pp, nn: lambda atr: {
+                        "VOL_MODE": "pctl", "VOL_PCTL": pp, "VOL_WINDOW": nn})(p, n),
+                    "vol": spec,
+                })
+        return variants
+    # Перебор стопа: объём при этом фиксирован боевым.
+    vol = _base_vol_spec(base)
+    return [{"name": name, "patch": _stop_patch(kind, value), "vol": vol}
+            for name, kind, value in STOP_VARIANTS]
+
+
+def _vol_mask(h1: pd.DataFrame, spec: tuple) -> pd.Series:
+    """Маска баров, проходящих условие объёма варианта — предфильтр прогона.
+
+    Считать уровни на каждом из тысяч баров дорого, а детектор всё равно отсеет
+    свечи без всплеска объёма. Окно кончается на предыдущем баре (shift(1)) —
+    ровно как внутри детектора, свеча в свою же норму не входит.
+    """
+    vol = h1["volume"]
+    if spec[0] == "mult":
+        avg = vol.rolling(config.VOL_LOOKBACK).mean().shift(1)
+        return vol >= avg * spec[1]
+    _, pctl, window = spec
+    threshold = vol.rolling(window).quantile(pctl / 100).shift(1)
+    return vol > threshold
 
 
 # ── Замер хода против позиции ───────────────────────────────────────────────
@@ -313,9 +401,9 @@ def measure_excursion(signal: dict, future: pd.DataFrame) -> dict:
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
-           week_filter: bool = True, trend_d1: bool = False,
+           variants: list[dict], week_filter: bool = True, trend_d1: bool = False,
            risk_filter: bool = True) -> dict[str, list[dict]]:
-    """Прогон истории бар за баром: сигналы каждого варианта стопа + их исходы.
+    """Прогон истории бар за баром: сигналы каждого варианта + их исходы.
 
     week_filter=True (как в бою) — входы только пн–чт, а сделка, не отработавшая
     к пятничному закрытию, гасится по рынку (статус 'closed_week'). False — как
@@ -328,14 +416,19 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
     Возвращает {имя варианта: [сигналы с исходом и замерами]}.
     """
     atr = _atr(h1)
-    # Предфильтр: детектор всё равно отсеет свечи без всплеска объёма, а считать
-    # уровни на каждом из тысяч баров дорого. Условие то же, что в _avg_volume.
-    avg_vol = h1["volume"].rolling(config.VOL_LOOKBACK).mean().shift(1)
-    spike = h1["volume"] > avg_vol * base["VOL_MULT"]
+    # Предфильтр — объединение условий объёма ВСЕХ вариантов. Именно объединение:
+    # если взять условие одного варианта, у остальных молча пропадут бары, где они
+    # сработали бы, а он нет — и сравнение вариантов превратится в сравнение с
+    # обрезанной выборкой. Сам детектор проверяет объём заново и точно.
+    spike = None
+    for variant in variants:
+        mask = _vol_mask(h1, variant["vol"])
+        spike = mask if spike is None else (spike | mask)
+    spike = spike.fillna(False)
 
     warmup = max(config.VOL_LOOKBACK + 3, config.H1_PIVOT_WINDOW * 2 + 2)
     last_ts = h1.index[-1]
-    results: dict[str, list[dict]] = {name: [] for name, _, _ in STOP_VARIANTS}
+    results: dict[str, list[dict]] = {v["name"]: [] for v in variants}
     # Дедуп как в бою: один и тот же паттерн не чаще SIGNAL_DEDUP_MIN минут.
     last_emit: dict[tuple[str, str, str], pd.Timestamp] = {}
 
@@ -378,10 +471,12 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
             mae_end = min(mae_end, deadline)
         mae_window = future[future.index <= mae_end]
 
-        for name, kind, value in STOP_VARIANTS:
-            settings = _variant_settings(base, kind, value, float(atr.iloc[i]))
-            if settings is None:
+        for variant in variants:
+            patch = variant["patch"](float(atr.iloc[i]))
+            if patch is None:
                 continue
+            name = variant["name"]
+            settings = {**base, **patch}
             settings["WEEK_FILTER"] = week_filter
             # None отключает фильтр цены входа — прогон «как было», для сравнения.
             settings["MAX_RISK_ATR"] = config.MAX_RISK_ATR if risk_filter else None
@@ -495,15 +590,16 @@ def report_mae(signals: list[dict]) -> None:
           + (f" (≈ ATR×{_q(in_atr, .90):.2f})" if in_atr else ""))
 
 
-def report_variants(results: dict[str, list[dict]]) -> None:
-    """Таблица сравнения вариантов стопа. Главные колонки — «итог R» (по нему и
-    выбирают) и «выбило-и-поехало» (сколько стоп забрал сделок, которые были бы в плюс)."""
-    print(f"\n  СРАВНЕНИЕ ВАРИАНТОВ СТОПА (полный прогон детектора на каждый вариант)")
-    print(f"  {'буфер':<16}{'сигн.':>6}{'плюс':>6}{'минус':>6}{'нед.':>6}{'проч.':>6}"
+def report_variants(results: dict[str, list[dict]], names: list[str],
+                    title: str, column: str) -> None:
+    """Таблица сравнения вариантов. Главные колонки — «итог R» (по нему и выбирают)
+    и «выбило-и-поехало» (сколько стоп забрал сделок, которые были бы в плюс)."""
+    print(f"\n  СРАВНЕНИЕ ВАРИАНТОВ {title} (полный прогон детектора на каждый вариант)")
+    print(f"  {column:<16}{'сигн.':>6}{'плюс':>6}{'минус':>6}{'нед.':>6}{'проч.':>6}"
           f"{'винрейт':>9}{'итог R':>16}{'ПФ':>7}{'ср.риск':>9}{'выбило-и-поехало':>19}")
     print("  " + "─" * 105)
     best = None
-    for name, _, _ in STOP_VARIANTS:
+    for name in names:
         s = summarize(results.get(name, []))
         if s["n"] == 0:
             print(f"  {name:<16}{'—':>6}  (сигналов нет)")
@@ -524,27 +620,29 @@ def report_variants(results: dict[str, list[dict]]) -> None:
 
 
 def report_instrument(code: str, h1: pd.DataFrame, source: str, base: dict,
-                      results: dict[str, list[dict]]) -> None:
+                      results: dict[str, list[dict]], names: list[str],
+                      title: str, column: str) -> None:
     info = resolve(code)
     span = (h1.index[-1] - h1.index[0]).days
     print("\n" + "═" * 96)
     print(f"  {info['name']} ({code})")
     print(f"  источник: {source}, {len(h1)} часовых свечей, "
           f"{h1.index[0]:%Y-%m-%d} … {h1.index[-1]:%Y-%m-%d} ({span} дн.)")
-    print(f"  пороги: VOL_MULT={base['VOL_MULT']}  "
+    print(f"  пороги: объём {vol_rule_text(base)}  "
           f"BREAK_PCT={base['BREAK_PCT'] * 100:.3f}%  MIN_RR={base['MIN_RR']}")
     print("═" * 96)
-    baseline = results.get(STOP_VARIANTS[0][0], [])
+    baseline = results.get(names[0], [])
     if not baseline:
         print("\n  Сигналов на этой истории не нашлось — снизь VOL_MULT/BREAK_PCT "
               "или возьми больше свечей.")
         return
     report_mae(baseline)
-    report_variants(results)
+    report_variants(results, names, title, column)
 
 
-def report_overall(per_instrument: dict[str, dict[str, list[dict]]]) -> None:
-    """Итог в R по каждому варианту стопа на всех инструментах сразу.
+def report_overall(per_instrument: dict[str, dict[str, list[dict]]],
+                   names: list[str], column: str) -> None:
+    """Итог в R по каждому варианту на всех инструментах сразу.
 
     Смысл: вариант, выигравший на одном инструменте, но проигравший на трёх —
     это подгонка, а не находка. Ищем тот, что не разваливается нигде.
@@ -555,25 +653,30 @@ def report_overall(per_instrument: dict[str, dict[str, list[dict]]]) -> None:
     print("\n" + "═" * 96)
     print("  СВОДНО ПО ВСЕМ ИНСТРУМЕНТАМ — итог в R")
     print("═" * 96)
-    print(f"  {'буфер':<16}" + "".join(f"{c:>10}" for c in codes)
-          + f"{'сумма':>10}{'сигналов':>11}{'выбило-и-поехало':>19}")
-    print("  " + "─" * 94)
-    for name, _, _ in STOP_VARIANTS:
+    print(f"  {column:<18}" + "".join(f"{c:>9}" for c in codes)
+          + f"{'сумма':>9}{'сигналов':>10}{'R/сделку':>10}{'выбило-и-поехало':>19}")
+    print("  " + "─" * 102)
+    for name in names:
         cells, total, n_all, swept_all = [], 0.0, 0, 0
         for code in codes:
             s = summarize(per_instrument[code].get(name, []))
-            cells.append(f"{s['total_r']:>+10.1f}" if s["n"] else f"{'—':>10}")
+            cells.append(f"{s['total_r']:>+9.1f}" if s["n"] else f"{'—':>9}")
             total += s["total_r"]
             n_all += s["n"]
             swept_all += s["swept"]
         share = swept_all / n_all if n_all else 0.0
-        print(f"  {name:<16}" + "".join(cells)
-              + f"{total:>+10.1f}{n_all:>11}{swept_all:>13} ({share:.0%})")
+        per_trade = f"{total / n_all:>+10.3f}" if n_all else f"{'—':>10}"
+        print(f"  {name:<18}" + "".join(cells)
+              + f"{total:>+9.1f}{n_all:>10}{per_trade}{swept_all:>13} ({share:.0%})")
     print("\n    «Выбило-и-поехало» — сколько сделок стоп закрыл в минус, хотя без него\n"
           "    цена дошла бы до цели. Это и есть цена узкого стопа.")
+    print("    «R/сделку» — по нему сравнивают варианты с РАЗНЫМ числом сделок: сумму\n"
+          "    можно нарастить, просто ослабив фильтр, а средний результат — нет.")
 
 
-def report_split(per_instrument: dict[str, dict[str, list[dict]]], mids: dict[str, pd.Timestamp]) -> None:
+def report_split(per_instrument: dict[str, dict[str, list[dict]]],
+                 mids: dict[str, pd.Timestamp], names: list[str],
+                 column: str) -> None:
     """Проверка на устойчивость: калибровка на первой половине истории, проверка на второй.
 
     Смысл. Выбирать буфер по лучшему итогу на всей истории — это подгонка: перебор
@@ -585,12 +688,12 @@ def report_split(per_instrument: dict[str, dict[str, list[dict]]], mids: dict[st
     print("\n" + "═" * 96)
     print("  ПРОВЕРКА НА УСТОЙЧИВОСТЬ — калибровка на 1-й половине, проверка на 2-й")
     print("═" * 96)
-    print(f"  {'буфер':<16}{'калибровка R':>16}{'сигн.':>7}"
-          f"{'проверка R':>14}{'сигн.':>7}{'оба плюсовые':>16}")
-    print("  " + "─" * 76)
+    print(f"  {column:<18}{'калибровка R':>16}{'сигн.':>7}{'R/сд.':>8}"
+          f"{'проверка R':>13}{'сигн.':>7}{'R/сд.':>8}{'оба плюсовые':>15}")
+    print("  " + "─" * 94)
 
     rows = []
-    for name, _, _ in STOP_VARIANTS:
+    for name in names:
         first, second = [], []
         for code, results in per_instrument.items():
             mid = mids.get(code)
@@ -599,8 +702,10 @@ def report_split(per_instrument: dict[str, dict[str, list[dict]]], mids: dict[st
         a, b = summarize(first), summarize(second)
         ok = "да" if a["total_r"] > 0 and b["total_r"] > 0 else "нет"
         rows.append((name, a, b, ok))
-        print(f"  {name:<16}{a['total_r']:>+12.1f} ±{a['se']:<3.0f}{a['n']:>7}"
-              f"{b['total_r']:>+10.1f} ±{b['se']:<3.0f}{b['n']:>7}{ok:>14}")
+        a_pt = f"{a['total_r'] / a['n']:>+8.3f}" if a["n"] else f"{'—':>8}"
+        b_pt = f"{b['total_r'] / b['n']:>+8.3f}" if b["n"] else f"{'—':>8}"
+        print(f"  {name:<18}{a['total_r']:>+12.1f} ±{a['se']:<3.0f}{a['n']:>7}{a_pt}"
+              f"{b['total_r']:>+9.1f} ±{b['se']:<3.0f}{b['n']:>7}{b_pt}{ok:>13}")
 
     calibrated = max(rows, key=lambda r: r[1]["total_r"])
     print(f"\n    Лучший на калибровке: «{calibrated[0]}» ({calibrated[1]['total_r']:+.1f}R). "
@@ -614,6 +719,38 @@ def report_split(per_instrument: dict[str, dict[str, list[dict]]], mids: dict[st
     else:
         print("    Ни один вариант не вышел в плюс на обеих половинах — "
               "устойчивого выбора эти данные не дают.")
+
+
+def report_by_source(per_instrument: dict[str, dict[str, list[dict]]],
+                     mids: dict[str, pd.Timestamp], names: list[str],
+                     column: str) -> None:
+    """То же сравнение, но отдельно по источнику объёма (Kraken против Yahoo).
+
+    Зачем. У крипты и форекса объём биржевой и полный, у золота с нефтью — с Yahoo
+    и неполный. Если у групп разойдутся оптимальные пороги, значит порог надо делать
+    зависимым от instruments.data_source(); если совпадут — общий порог годится, и
+    усложнять нечего.
+
+    Группировка по инструментам честная: сигналы каждого инструмента считаются
+    независимо, поэтому «прогнать 4 монеты отдельно» и «прогнать 6 и оставить 4»
+    дают ровно один и тот же набор сделок. Это НЕ нарезка результата по признаку,
+    на который влияет сам порог.
+    """
+    groups: dict[str, list[str]] = {}
+    for code in per_instrument:
+        groups.setdefault(data_source(code) or "без источника", []).append(code)
+    if len(groups) < 2:
+        print("\n  (разбивка по источнику не нужна — все инструменты из одного)")
+        return
+    titles = {"ccxt": "БИРЖЕВОЙ ОБЪЁМ (Kraken) — полный",
+              "yahoo": "ОБЪЁМ С YAHOO — неполный, частичный"}
+    for src, codes in groups.items():
+        subset = {c: per_instrument[c] for c in codes}
+        print("\n\n" + "█" * 96)
+        print(f"  ИСТОЧНИК: {titles.get(src, src)}   [{', '.join(codes)}]")
+        print("█" * 96)
+        report_overall(subset, names, column)
+        report_split(subset, mids, names, column)
 
 
 def write_csv(path: str, rows: list[dict]) -> None:
@@ -633,7 +770,15 @@ def write_csv(path: str, rows: list[dict]) -> None:
 async def run(codes: list[str], bars: int, base: dict, horizon: int,
               csv_path: str | None, week_filter: bool = True,
               trend_d1: bool = False, use_cache: bool = True,
-              risk_filter: bool = True) -> None:
+              risk_filter: bool = True, sweep: str = "stop",
+              by_source: bool = False) -> None:
+    variants = build_variants(sweep, base)
+    names = [v["name"] for v in variants]
+    title, column = (("ПОРОГА ОБЪЁМА", "порог объёма") if sweep == "vol"
+                     else ("СТОПА", "буфер"))
+    print(f"Перебираем:     {'порог аномального объёма' if sweep == 'vol' else 'запас стопа'}"
+          f" ({len(variants)} вариантов)")
+    print(f"Объём:          {vol_rule_text(base)}")
     print("Недельное окно: " + ("ВКЛ — входы пн–чт, пятничное закрытие гасит сделку"
                                 if week_filter else "ВЫКЛ — как было до окна"))
     print("Фильтр тренда:  " + ("по ДНЕВКЕ (D1) — как было до недельного горизонта"
@@ -655,16 +800,18 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
         if len(h1) < config.H1_LIMIT:
             print(f"\n{code}: слишком мало свечей ({len(h1)}) — пропускаем")
             continue
-        print(f"\n{code}: прогоняю {len(h1)} свечей × {len(STOP_VARIANTS)} вариантов стопа…")
-        results = replay(h1, d1, base, horizon, week_filter, trend_d1, risk_filter)
+        print(f"\n{code}: прогоняю {len(h1)} свечей × {len(variants)} вариантов…")
+        results = replay(h1, d1, base, horizon, variants, week_filter, trend_d1, risk_filter)
         per_instrument[code] = results
         mids[code] = h1.index[0] + (h1.index[-1] - h1.index[0]) / 2
-        report_instrument(code, h1, source, base, results)
+        report_instrument(code, h1, source, base, results, names, title, column)
         for variant, signals in results.items():
             for s in signals:
                 all_rows.append({**s, "instrument": code, "variant": variant})
-    report_overall(per_instrument)
-    report_split(per_instrument, mids)
+    report_overall(per_instrument, names, column)
+    report_split(per_instrument, mids, names, column)
+    if by_source:
+        report_by_source(per_instrument, mids, names, column)
     if csv_path and all_rows:
         write_csv(csv_path, all_rows)
     # Форекс грузится штатным data_fetcher — закрываем его соединения с биржей
@@ -684,7 +831,11 @@ def main() -> None:
     p.add_argument("--horizon", type=int, default=config.SIGNAL_EXPIRE_HOURS,
                    help=f"горизонт жизни сигнала в часах (по умолчанию {config.SIGNAL_EXPIRE_HOURS})")
     p.add_argument("--user", type=int, help="взять пороги из личных настроек этого пользователя")
-    p.add_argument("--vol-mult", type=float, help="переопределить VOL_MULT")
+    p.add_argument("--vol-mult", type=float,
+                   help="объём по СТАРОМУ правилу: ≥ среднего × этого множителя "
+                        "(переключает режим на «mult» — прогон «как было»)")
+    p.add_argument("--vol-pctl", type=float, help="переопределить процентиль объёма (P70 по умолчанию)")
+    p.add_argument("--vol-window", type=int, help="переопределить окно процентиля в свечах")
     p.add_argument("--break-pct", type=float, help="переопределить BREAK_PCT")
     p.add_argument("--min-rr", type=float, help="переопределить MIN_RR")
     p.add_argument("--csv", help="выгрузить все сигналы в CSV")
@@ -703,6 +854,12 @@ def main() -> None:
                         "прогон «как было», для сравнения")
     p.add_argument("--no-cache", action="store_true",
                    help="не использовать кеш истории в .backtest_cache/ — скачать заново")
+    p.add_argument("--by-source", action="store_true",
+                   help="дополнительно показать сравнение отдельно по источнику объёма "
+                        "(биржа Kraken против Yahoo) — проверить, нужен ли разный порог")
+    p.add_argument("--sweep", choices=("stop", "vol"), default="stop",
+                   help="что перебирать: stop — запас стопа (по умолчанию), "
+                        "vol — порог аномального объёма (множитель против процентиля)")
     args = p.parse_args()
 
     # Окно входа подменяем в config: trading_week читает его на каждый вызов.
@@ -720,14 +877,19 @@ def main() -> None:
         sys.exit(1)
 
     base = config.effective(database.get_user_settings(args.user) if args.user else None)
-    for key, val in (("VOL_MULT", args.vol_mult), ("BREAK_PCT", args.break_pct),
-                     ("MIN_RR", args.min_rr)):
+    for key, val in (("VOL_PCTL", args.vol_pctl), ("VOL_WINDOW", args.vol_window),
+                     ("BREAK_PCT", args.break_pct), ("MIN_RR", args.min_rr)):
         if val is not None:
             base[key] = val
+    # --vol-mult возвращает старое правило объёма целиком (режим + значение):
+    # задать множитель, оставшись в процентильном режиме, было бы бессмысленно.
+    if args.vol_mult is not None:
+        base["VOL_MODE"] = "mult"
+        base["VOL_MULT"] = args.vol_mult
 
     asyncio.run(run(codes, args.bars, base, args.horizon, args.csv,
                     not args.no_week, args.trend_d1, not args.no_cache,
-                    not args.no_risk_filter))
+                    not args.no_risk_filter, args.sweep, args.by_source))
 
 
 if __name__ == "__main__":

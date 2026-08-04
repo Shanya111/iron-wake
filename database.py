@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
+import config
 from instruments import infer_decimals
 
 DB_PATH = Path(__file__).parent / "bot.db"
@@ -166,6 +167,14 @@ def init_db() -> None:
                 UNIQUE(user_id, key)
             )
         """)
+        # Чистим личные пороги, которых больше нет в /settings (например
+        # LIQUIDITY_MULT — он оказался про отображение зон, а не про сигналы).
+        # Иначе в таблице копятся строки, которые никто уже не читает.
+        placeholders = ",".join("?" for _ in config.TUNABLE)
+        conn.execute(
+            f"DELETE FROM user_settings WHERE key NOT IN ({placeholders})",
+            config.TUNABLE,
+        )
         conn.commit()
 
 

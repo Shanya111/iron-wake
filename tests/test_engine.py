@@ -203,6 +203,71 @@ def test_spring_fallback_target_min_rr():
     assert abs(sig["take_profit"] - expected_tp) < 1e-9
 
 
+# ── Порог аномального объёма: множитель против процентиля ───────────────────
+
+def _pctl_settings(pctl: float, window: int = 20) -> dict:
+    """Пороги для режима «объём выше P-го процентиля за N свечей»."""
+    return {"VOL_MODE": "pctl", "VOL_PCTL": pctl, "VOL_WINDOW": window,
+            **NO_RISK_FILTER}
+
+
+def test_volume_percentile_accepts_top_bar():
+    # Свеча пробоя — самая объёмная из окна (300 против 100 у соседей),
+    # то есть заведомо выше любого процентиля → сигнал есть.
+    df = _spring_df()
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up", settings=_pctl_settings(90)) is not None
+
+
+def test_volume_percentile_rejects_ordinary_bar():
+    # Объём как у соседей → в верхние проценты не попадает → не Spring.
+    df = _spring_df()
+    df.iloc[23, df.columns.get_loc("volume")] = 100.0
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up", settings=_pctl_settings(90)) is None
+
+
+def test_volume_percentile_is_relative_not_absolute():
+    """Смысл процентиля: порог свой у каждого инструмента.
+
+    Здесь объём свечи пробоя (150) НИЖЕ среднего соседей (200), то есть множитель
+    ×1.5 её забракует. Но соседи разношёрстные, и 150 всё равно выше 70% из них —
+    процентиль пропустит. Ровно этого и ждём от «относительного» порога: он
+    сравнивает свечу с её же окружением, а не с общим числом.
+    """
+    rows = [(100.5, 101.0, 100.2, 100.6, 100.0 if i % 4 else 600.0) for i in range(25)]
+    rows[23] = (100.4, 100.7, 99.0, 100.5, 150.0)
+    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)
+    df = _df(rows)
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
+    # Множитель: 150 < среднее(≈225) × 1.5 → сигнала нет.
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up",
+        settings={"VOL_MODE": "mult", "VOL_MULT": 1.5, **NO_RISK_FILTER}) is None
+    # Процентиль P70: 150 выше 70% соседей (их большинство — по 100) → сигнал есть.
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up", settings=_pctl_settings(70)) is not None
+
+
+def test_volume_percentile_window_excludes_own_bar():
+    """Свеча не входит в собственную норму — иначе задирала бы порог, который
+    сама должна перепрыгнуть. Проверяем на окне, где она единственная крупная."""
+    df = _spring_df()
+    window = df["volume"].iloc[3:23]           # 20 свечей ПЕРЕД свечой пробоя
+    assert float(window.max()) == 100.0, "в окне не должно быть свечи пробоя"
+    assert pattern_detector._volume_ok(
+        df, 23, {"VOL_MODE": "pctl", "VOL_PCTL": 95, "VOL_WINDOW": 20}, 1.5)
+
+
+def test_volume_percentile_needs_enough_history():
+    # Окна короче VOL_LOOKBACK не хватает даже на осмысленный процентиль.
+    df = _spring_df()
+    assert not pattern_detector._volume_ok(
+        df, 5, {"VOL_MODE": "pctl", "VOL_PCTL": 70, "VOL_WINDOW": 20}, 1.5)
+
+
 def _upthrust_df() -> pd.DataFrame:
     rows = [(99.5, 99.8, 99.2, 99.5, 100.0) for _ in range(25)]
     # Пробой сопротивления 100 вверх, закрытие обратно ниже, всплеск объёма.
