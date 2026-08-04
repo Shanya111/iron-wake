@@ -237,6 +237,56 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     return None
 
 
+def pullback_entry(signal: dict, future: pd.DataFrame, frac: float | None = None,
+                   wait_bars: int | None = None,
+                   optimistic: bool = False) -> dict | None:
+    """Уточнение входа откатом к пробитому уровню.
+
+    Сигнал ищется как обычно, но вместо входа по закрытию свечи пробоя ставим
+    отложенную заявку ближе к уровню: `frac` — какую долю пути от закрытия к уровню
+    ждём (0.5 — полпути, 1.0 — сам уровень). Стоп и цель НЕ меняются, поэтому вход
+    ближе к стопу даёт больший R:R при том же исходе по ценам.
+
+    Возвращает сигнал с новым входом или **None**, если откат не случился — это и
+    есть цена приёма: пропущенные сделки. Причём пропускаются в первую очередь самые
+    сильные движения (что сразу пошло к цели, то не откатывалось).
+
+    Порядок событий внутри часовой свечи неизвестен, поэтому есть две границы:
+      • optimistic=False (по умолчанию) — если свеча накрыла и нашу цену, и цель,
+        считаем, что цель была раньше, и вход ПРОПУЩЕН (осторожно);
+      • optimistic=True — считаем, что заявка успела исполниться.
+    Если вывод одинаков на обеих границах, он не зависит от того, чего мы не видим.
+    """
+    frac = config.ENTRY_PULLBACK if frac is None else frac
+    wait_bars = config.ENTRY_WAIT_BARS if wait_bars is None else wait_bars
+    if not frac:
+        return signal
+
+    long = signal["direction"] == "long"
+    entry, stop, tp = signal["entry_price"], signal["stop_loss"], signal["take_profit"]
+    level = signal["level_price"]
+    limit = entry - frac * (entry - level) if long else entry + frac * (level - entry)
+    # Заявка не должна оказаться за стопом — иначе риска не остаётся вовсе.
+    if (limit <= stop) if long else (limit >= stop):
+        return None
+
+    for ts, c in future.iloc[:wait_bars].iterrows():
+        hi, lo = float(c["high"]), float(c["low"])
+        hit_limit = lo <= limit if long else hi >= limit
+        hit_tp = hi >= tp if long else lo <= tp
+        hit_stop = lo <= stop if long else hi >= stop
+        if hit_tp and not (hit_limit and optimistic):
+            return None          # ушла к цели без нас — сделка пропущена
+        if not hit_limit:
+            continue
+        # Заявка исполнилась. Стоп лежит дальше нашей цены (для лонга ниже неё),
+        # поэтому если свеча дошла и до него, порядок однозначен: сначала вход,
+        # потом стоп — сделка открылась и тут же закрылась в минус.
+        return {**signal, "entry_price": limit, "bar_time": str(ts),
+                "stopped_at_fill": bool(hit_stop)}
+    return None                  # за отведённое время откат не случился
+
+
 def evaluate_signal(signal: dict, df: pd.DataFrame, week_close: bool = False) -> str:
     """Исход открытого сигнала одной строкой (см. evaluate_signal_detailed)."""
     return evaluate_signal_detailed(signal, df, week_close)["status"]

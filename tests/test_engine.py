@@ -210,6 +210,89 @@ def test_spring_fallback_target_min_rr():
     assert abs(sig["take_profit"] - expected_tp) < 1e-9
 
 
+# ── Уточнение входа откатом к уровню ────────────────────────────────────────
+
+_PB_SIGNAL = {"direction": "long", "level_price": 100.0, "entry_price": 101.0,
+              "stop_loss": 99.0, "take_profit": 105.0, "bar_time": "2024-01-01 00:00:00+00:00"}
+
+
+def _future(rows: list[tuple]) -> pd.DataFrame:
+    """Свечи ПОСЛЕ сигнала: (high, low). Индекс начинается через час после bar_time."""
+    idx = pd.date_range("2024-01-01 01:00", periods=len(rows), freq="h", tz="UTC")
+    return pd.DataFrame([(h, l, h, l, 100) for h, l in rows],
+                        columns=["high", "low", "open", "close", "volume"], index=idx)
+
+
+def test_pullback_disabled_returns_signal_unchanged():
+    same = pattern_detector.pullback_entry(_PB_SIGNAL, _future([(101.5, 100.8)]), frac=0)
+    assert same is _PB_SIGNAL
+
+
+def test_pullback_fills_at_limit_price():
+    # frac=0.5 → заявка на полпути от 101.0 к уровню 100.0, то есть 100.5.
+    got = pattern_detector.pullback_entry(
+        _PB_SIGNAL, _future([(101.2, 100.4)]), frac=0.5, wait_bars=4)
+    assert got is not None
+    assert abs(got["entry_price"] - 100.5) < 1e-9
+    assert got["stop_loss"] == 99.0 and got["take_profit"] == 105.0   # не трогаем
+
+
+def test_pullback_improves_rr():
+    """Смысл затеи: вход ближе к стопу при той же цели — больше прибыли на риск."""
+    got = pattern_detector.pullback_entry(
+        _PB_SIGNAL, _future([(101.2, 100.4)]), frac=0.5, wait_bars=4)
+    was = (105.0 - 101.0) / (101.0 - 99.0)          # 2.0
+    now = (105.0 - got["entry_price"]) / (got["entry_price"] - 99.0)
+    assert now > was
+
+
+def test_pullback_missed_when_price_runs_away():
+    """Цена ушла к цели, не откатившись → сделки не было. Это и есть цена приёма."""
+    assert pattern_detector.pullback_entry(
+        _PB_SIGNAL, _future([(105.5, 101.0)]), frac=0.5, wait_bars=4) is None
+
+
+def test_pullback_missed_when_wait_runs_out():
+    rows = [(101.2, 100.9)] * 6          # откат до 100.5 так и не случился
+    assert pattern_detector.pullback_entry(
+        _PB_SIGNAL, _future(rows), frac=0.5, wait_bars=4) is None
+
+
+def test_pullback_ambiguous_bar_conservative_vs_optimistic():
+    """Свеча накрыла и заявку, и цель — порядок внутри часа неизвестен.
+    Осторожно: вход пропущен. Оптимистично: заявка успела исполниться."""
+    bar = _future([(105.5, 100.4)])
+    assert pattern_detector.pullback_entry(_PB_SIGNAL, bar, frac=0.5, wait_bars=4) is None
+    got = pattern_detector.pullback_entry(_PB_SIGNAL, bar, frac=0.5, wait_bars=4,
+                                          optimistic=True)
+    assert got is not None and abs(got["entry_price"] - 100.5) < 1e-9
+
+
+def test_pullback_marks_stop_hit_on_fill_bar():
+    """Свеча дошла и до заявки, и до стопа. Стоп ниже заявки, значит порядок
+    однозначен: сначала вход, потом стоп — сделка открылась и закрылась в минус."""
+    got = pattern_detector.pullback_entry(
+        _PB_SIGNAL, _future([(101.0, 98.5)]), frac=0.5, wait_bars=4)
+    assert got is not None and got["stopped_at_fill"] is True
+
+
+def test_pullback_rejects_limit_beyond_stop():
+    """Заявка за стопом — риска не остаётся, такую сделку не берём."""
+    signal = {**_PB_SIGNAL, "level_price": 98.0}    # уровень ниже стопа
+    assert pattern_detector.pullback_entry(
+        signal, _future([(101.0, 97.0)]), frac=1.0, wait_bars=4) is None
+
+
+def test_pullback_mirrors_for_short():
+    short = {"direction": "short", "level_price": 100.0, "entry_price": 99.0,
+             "stop_loss": 101.0, "take_profit": 95.0,
+             "bar_time": "2024-01-01 00:00:00+00:00"}
+    got = pattern_detector.pullback_entry(
+        short, _future([(99.6, 98.8)]), frac=0.5, wait_bars=4)
+    assert got is not None
+    assert abs(got["entry_price"] - 99.5) < 1e-9    # полпути вверх к уровню 100
+
+
 # ── Пресеты /settings (частота сигналов, вход вдогонку) ─────────────────────
 
 def test_sensitivity_presets_round_trip():

@@ -111,6 +111,12 @@ BODY_RATIOS = (0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.8)
 # оптимум мог лежать ещё ниже и просто не был проверен.
 RR_VALUES = (1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)
 
+# Варианты уточнения входа откатом (--sweep entry): какую долю пути от закрытия
+# свечи пробоя обратно к уровню ждём, прежде чем входить. Каждая доля считается
+# в двух границах — осторожной и оптимистичной (порядок событий внутри часовой
+# свечи неизвестен, см. pattern_detector.pullback_entry).
+ENTRY_PULLBACKS = (0.25, 0.5, 0.75, 1.0)
+
 ATR_PERIOD = 14
 
 # Издержки «туда-обратно» (доля от цены), по которым считается колонка «нетто R».
@@ -335,6 +341,20 @@ def vol_rule_text(base: dict) -> str:
 
 def build_variants(sweep: str, base: dict) -> list[dict]:
     """Список вариантов перебора: 'stop' — стоп, 'vol' — объём, 'liq' — зоны ликвидности."""
+    if sweep == "entry":
+        # Уточнение входа откатом. Отбор сделок не меняется — меняется только цена
+        # входа, поэтому все прочие пороги остаются боевыми.
+        vol, liq = _base_vol_spec(base), config.LIQ_LEVELS
+        variants = [{"name": "по закрытию (сейчас)", "patch": lambda atr: {},
+                     "vol": vol, "liq": liq, "pullback": (0.0, False)}]
+        for opt in (False, True):
+            for f in ENTRY_PULLBACKS:
+                variants.append({
+                    "name": f"откат {f:g} {'оптимист.' if opt else 'осторожно'}",
+                    "patch": lambda atr: {}, "vol": vol, "liq": liq,
+                    "pullback": (f, opt),
+                })
+        return variants
     if sweep == "rr":
         # Минимальная прибыль/риск. Порог двигает не только отбор, но и сами цели
         # (запасная цель = MIN_RR × риск), поэтому каждый вариант — полный прогон.
@@ -470,7 +490,7 @@ def measure_excursion(signal: dict, future: pd.DataFrame) -> dict:
 
 def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
            variants: list[dict], week_filter: bool = True, trend_d1: bool = False,
-           risk_filter: bool = True) -> dict[str, list[dict]]:
+           risk_filter: bool = True) -> tuple[dict[str, list[dict]], dict[str, int]]:
     """Прогон истории бар за баром: сигналы каждого варианта + их исходы.
 
     week_filter=True (как в бою) — входы только пн–чт, а сделка, не отработавшая
@@ -481,7 +501,8 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
     по дневному, как было до перехода на недельный горизонт: даёт сравнить, что
     даёт смена таймфрейма ориентира, замером, а не на глаз.
 
-    Возвращает {имя варианта: [сигналы с исходом и замерами]}.
+    Возвращает ({имя варианта: [сигналы с исходом и замерами]},
+    {имя варианта: сколько сделок пропущено из-за неслучившегося отката}).
     """
     atr = _atr(h1)
     # Предфильтр — объединение условий объёма ВСЕХ вариантов. Именно объединение:
@@ -497,6 +518,7 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
     warmup = max(config.VOL_LOOKBACK + 3, config.H1_PIVOT_WINDOW * 2 + 2)
     last_ts = h1.index[-1]
     results: dict[str, list[dict]] = {v["name"]: [] for v in variants}
+    missed: dict[str, int] = {}      # сделки, не состоявшиеся из-за отсутствия отката
     # Режимы зон ликвидности, встречающиеся среди вариантов. Уровни от режима
     # зависят, поэтому считаем по набору на бар — но обычно режим один на всех
     # (перебор стопа/объёма), и лишней работы не возникает.
@@ -563,6 +585,16 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
                     continue
                 last_emit[key] = bar_ts
 
+                # Уточнение входа откатом к уровню. Вернуло None — цена не откатилась,
+                # сделки не было вовсе. Такие считаем отдельно: это прямая цена приёма.
+                frac, optimistic = variant.get("pullback", (config.ENTRY_PULLBACK, False))
+                filled = pattern_detector.pullback_entry(
+                    signal, future, frac, config.ENTRY_WAIT_BARS, optimistic)
+                if filled is None:
+                    missed[name] = missed.get(name, 0) + 1
+                    continue
+                signal = filled
+
                 candle = h1.iloc[i]
                 signal["break_extreme"] = float(
                     candle["low"] if signal["direction"] == "long" else candle["high"]
@@ -570,8 +602,13 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
                 signal["atr"] = float(atr.iloc[i])
                 # Горизонт мы уже отмотали целиком (проверка выше), поэтому
                 # 'pending' здесь означает ровно «не дошёл никуда» = истёк.
-                res = pattern_detector.evaluate_signal_detailed(
-                    signal, future, week_close=week_filter)
+                if signal.pop("stopped_at_fill", False):
+                    # Заявка исполнилась и та же свеча дошла до стопа: стоп лежит
+                    # дальше нашей цены, значит порядок однозначен — вход, потом стоп.
+                    res = {"status": "hit_sl", "exit_price": signal["stop_loss"]}
+                else:
+                    res = pattern_detector.evaluate_signal_detailed(
+                        signal, future, week_close=week_filter)
                 signal["outcome"] = "expired" if res["status"] == "pending" else res["status"]
                 signal["exit_price"] = res["exit_price"]
                 signal["risk"] = abs(signal["entry_price"] - signal["stop_loss"])
@@ -579,7 +616,7 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
                                 / signal["risk"] if signal["risk"] else 0.0)
                 signal.update(measure_excursion(signal, mae_window))
                 results[name].append(signal)
-    return results
+    return results, missed
 
 
 # ── Отчёт ───────────────────────────────────────────────────────────────────
@@ -854,10 +891,12 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
                      "liq": ("ЗОН ЛИКВИДНОСТИ", "зоны как уровни"),
                      "body": ("ФИЛЬТРА «ПОГЛОЩЕНИЕ»", "тело свечи"),
                      "rr": ("ПРИБЫЛЬ / РИСК", "мин. R:R"),
+                     "entry": ("ТОЧКИ ВХОДА", "вход"),
                      "stop": ("СТОПА", "буфер")}[sweep]
     what = {"vol": "порог аномального объёма", "liq": "зоны ликвидности как уровни",
             "body": "фильтр «поглощение» (тело свечи пробоя)",
-            "rr": "минимальную прибыль/риск", "stop": "запас стопа"}[sweep]
+            "rr": "минимальную прибыль/риск", "entry": "уточнение входа откатом",
+            "stop": "запас стопа"}[sweep]
     print(f"Перебираем:     {what} ({len(variants)} вариантов)")
     print(f"Объём:          {vol_rule_text(base)}")
     print(f"Зоны-уровни:    {config.LIQ_LEVELS}")
@@ -873,6 +912,7 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
     all_rows: list[dict] = []
     per_instrument: dict[str, dict[str, list[dict]]] = {}
     mids: dict[str, pd.Timestamp] = {}   # середина истории — граница калибровка/проверка
+    missed_total: dict[str, int] = {}    # сделки, сорвавшиеся из-за неслучившегося отката
     for code in codes:
         try:
             h1, d1, source = await load_history(code, bars, use_cache)
@@ -883,14 +923,28 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
             print(f"\n{code}: слишком мало свечей ({len(h1)}) — пропускаем")
             continue
         print(f"\n{code}: прогоняю {len(h1)} свечей × {len(variants)} вариантов…")
-        results = replay(h1, d1, base, horizon, variants, week_filter, trend_d1, risk_filter)
+        results, missed = replay(h1, d1, base, horizon, variants,
+                                 week_filter, trend_d1, risk_filter)
         per_instrument[code] = results
+        for name, n in missed.items():
+            missed_total[name] = missed_total.get(name, 0) + n
         mids[code] = h1.index[0] + (h1.index[-1] - h1.index[0]) / 2
         report_instrument(code, h1, source, base, results, names, title, column)
         for variant, signals in results.items():
             for s in signals:
                 all_rows.append({**s, "instrument": code, "variant": variant})
     report_overall(per_instrument, names, column)
+    if missed_total:
+        print("\n  ПРОПУЩЕННЫЕ СДЕЛКИ — цена не откатилась к заявке, входа не было")
+        print(f"  {column:<24}{'состоялось':>12}{'пропущено':>12}{'доля пропусков':>17}")
+        print("  " + "─" * 65)
+        for name in names:
+            took = sum(len(r.get(name, [])) for r in per_instrument.values())
+            lost = missed_total.get(name, 0)
+            share = lost / (took + lost) if (took + lost) else 0.0
+            print(f"  {name:<24}{took:>12}{lost:>12}{share:>16.0%}")
+        print("\n    Пропускаются в первую очередь САМЫЕ СИЛЬНЫЕ движения: что сразу\n"
+              "    пошло к цели, то и не откатывалось. Это главная цена уточнения входа.")
     report_split(per_instrument, mids, names, column)
     if by_source:
         report_by_source(per_instrument, mids, names, column)
@@ -948,12 +1002,13 @@ def main() -> None:
     p.add_argument("--by-source", action="store_true",
                    help="дополнительно показать сравнение отдельно по источнику объёма "
                         "(биржа Kraken против Yahoo) — проверить, нужен ли разный порог")
-    p.add_argument("--sweep", choices=("stop", "vol", "liq", "body", "rr"), default="stop",
+    p.add_argument("--sweep", choices=("stop", "vol", "liq", "body", "rr", "entry"), default="stop",
                    help="что перебирать: stop — запас стопа (по умолчанию), "
                         "vol — порог аномального объёма (множитель против процентиля), "
                         "liq — зоны ликвидности как уровни для пробоя (выкл/середина/край), "
                         "body — фильтр «поглощение» (тело свечи пробоя ≤ доли размаха), "
-                        "rr — минимальная прибыль/риск (1:1 … 1:3)")
+                        "rr — минимальная прибыль/риск (1:1 … 1:3), "
+                        "entry — уточнение входа откатом к уровню вместо входа по закрытию")
     args = p.parse_args()
 
     # Окно входа подменяем в config: trading_week читает его на каждый вызов.
