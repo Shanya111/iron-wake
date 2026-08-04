@@ -35,6 +35,35 @@ def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
     return float(window.mean()) if len(window) else 0.0
 
 
+def _volume_ok(df: pd.DataFrame, pos: int, s: dict, vol_mult: float) -> bool:
+    """Аномален ли объём свечи `pos`? Два способа, см. config.VOL_MODE.
+
+    «mult» — объём ≥ среднего за VOL_LOOKBACK свечей × vol_mult (как было всегда).
+    «pctl» — объём выше VOL_PCTL-го процентиля за последние VOL_WINDOW свечей, то
+    есть свеча входит в самые объёмные среди соседних. Порог получается свой у
+    каждого инструмента и подстраивается сам: у золота с Yahoo объём неполный, и
+    требование «в 1.5 раза выше среднего» там режет нормальные сетапы, а «выше
+    80% соседей» — нет, потому что сравнивается с такими же неполными данными.
+
+    Окно в обоих случаях кончается ПЕРЕД свечой pos — саму свечу в свою же норму
+    не включаем, иначе она задирала бы порог, который сама должна перепрыгнуть.
+    """
+    vol = float(df["volume"].iloc[pos])
+    if s.get("VOL_MODE", config.VOL_MODE) == "pctl":
+        window_n = int(s.get("VOL_WINDOW", config.VOL_WINDOW))
+        pctl = float(s.get("VOL_PCTL", config.get("VOL_PCTL")))
+        window = df["volume"].iloc[max(0, pos - window_n):pos]
+        # На совсем коротком окне процентиль — шум, а не мера. Ниже VOL_LOOKBACK
+        # свечей не считаем вовсе (детектор и так требует такую историю).
+        if len(window) < config.VOL_LOOKBACK:
+            return False
+        threshold = float(window.quantile(pctl / 100))
+        return threshold > 0 and vol > threshold
+
+    avg_vol = _avg_volume(df, pos)
+    return avg_vol > 0 and vol >= avg_vol * vol_mult
+
+
 def _atr(df: pd.DataFrame, pos: int, period: int) -> float:
     """ATR (средний истинный диапазон) на свече `pos` — мера волатильности.
 
@@ -57,11 +86,20 @@ def _atr(df: pd.DataFrame, pos: int, period: int) -> float:
     return float(tr.mean())
 
 
-def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool):
-    """Ближайший уровень нужного типа выше (above=True) или ниже ref_price."""
+def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool,
+             use_liquidity: bool = False):
+    """Ближайший уровень нужного типа выше (above=True) или ниже ref_price.
+
+    use_liquidity=False — зоны ликвидности в выборе ЦЕЛИ не участвуют, даже если
+    работают уровнями для пробоя. Причина замерена: зон много, ближайшая цель
+    оказывается слишком близко, R:R не дотягивает до порога и сигнал отбрасывается.
+    В прогоне это срезало число сделок вдвое (306 → 156) — то есть «зоны как цели»
+    не добавляют сетапы, а убивают уже имеющиеся. См. «Зоны ликвидности» в CLAUDE.md.
+    """
     prices = [
         l["price"] for l in levels
         if l["type"] == level_type
+        and (use_liquidity or not l.get("is_liquidity"))
         and (l["price"] > ref_price if above else l["price"] < ref_price)
     ]
     if not prices:
@@ -73,9 +111,10 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             settings: dict | None = None) -> dict | None:
     # Действующие пороги: личные значения подписчика поверх общих (None → общие).
     s = settings or {}
-    vol_mult = s.get("VOL_MULT", config.get("VOL_MULT"))
+    vol_mult = s.get("VOL_MULT", config.VOL_MULT)
     break_pct = s.get("BREAK_PCT", config.get("BREAK_PCT"))
     min_rr = s.get("MIN_RR", config.get("MIN_RR"))
+    liq_target = s.get("LIQ_AS_TARGET", config.LIQ_AS_TARGET)
     # Запас стопа за экстремум свечи пробоя — см. config.STOP_MODE. По умолчанию
     # он в долях ATR (подстраивается под волатильность), запасной вариант — процент
     # от цены. Настройки могут переопределить: STOP_ABS — готовый запас числом,
@@ -104,12 +143,21 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             return None
     candle = df.iloc[pos]
     h, l, c = float(candle["high"]), float(candle["low"]), float(candle["close"])
-    vol = float(candle["volume"])
 
-    # Условие №3: аномальный объём на свече пробоя.
-    avg_vol = _avg_volume(df, pos)
-    if avg_vol <= 0 or vol < avg_vol * vol_mult:
+    # Условие №3: аномальный объём на свече пробоя (множитель или процентиль).
+    if not _volume_ok(df, pos, s, vol_mult):
         return None
+
+    # Фильтр «поглощение» (VSA): тело свечи маленькое относительно её размаха —
+    # цена сходила далеко, а закрылась почти там же, откуда открылась. По методике
+    # это и есть признак, что крупный игрок принял весь объём. None — фильтр выключен.
+    max_body = s.get("MAX_BODY_RATIO", config.MAX_BODY_RATIO)
+    if max_body is not None:
+        span = h - l
+        if span <= 0:
+            return None
+        if abs(c - float(candle["open"])) / span > max_body:
+            return None
 
     # ATR считаем только здесь, когда свеча уже прошла фильтр объёма — на каждом
     # баре подряд это была бы лишняя работа.
@@ -155,7 +203,8 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             entry = c
             stop = l - (stop_abs if stop_abs is not None else l * stop_spread)
             risk = entry - stop
-            target = _nearest(levels, "resistance", entry, above=True)
+            target = _nearest(levels, "resistance", entry, above=True,
+                              use_liquidity=liq_target)
             if target is None:
                 tp = entry + risk * min_rr
             elif (target - entry) >= risk * min_rr:
@@ -166,7 +215,8 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             entry = c
             stop = h + (stop_abs if stop_abs is not None else h * stop_spread)
             risk = stop - entry
-            target = _nearest(levels, "support", entry, above=False)
+            target = _nearest(levels, "support", entry, above=False,
+                              use_liquidity=liq_target)
             if target is None:
                 tp = entry - risk * min_rr
             elif (entry - target) >= risk * min_rr:
@@ -185,6 +235,56 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             "bar_time": str(df.index[pos]),
         }
     return None
+
+
+def pullback_entry(signal: dict, future: pd.DataFrame, frac: float | None = None,
+                   wait_bars: int | None = None,
+                   optimistic: bool = False) -> dict | None:
+    """Уточнение входа откатом к пробитому уровню.
+
+    Сигнал ищется как обычно, но вместо входа по закрытию свечи пробоя ставим
+    отложенную заявку ближе к уровню: `frac` — какую долю пути от закрытия к уровню
+    ждём (0.5 — полпути, 1.0 — сам уровень). Стоп и цель НЕ меняются, поэтому вход
+    ближе к стопу даёт больший R:R при том же исходе по ценам.
+
+    Возвращает сигнал с новым входом или **None**, если откат не случился — это и
+    есть цена приёма: пропущенные сделки. Причём пропускаются в первую очередь самые
+    сильные движения (что сразу пошло к цели, то не откатывалось).
+
+    Порядок событий внутри часовой свечи неизвестен, поэтому есть две границы:
+      • optimistic=False (по умолчанию) — если свеча накрыла и нашу цену, и цель,
+        считаем, что цель была раньше, и вход ПРОПУЩЕН (осторожно);
+      • optimistic=True — считаем, что заявка успела исполниться.
+    Если вывод одинаков на обеих границах, он не зависит от того, чего мы не видим.
+    """
+    frac = config.ENTRY_PULLBACK if frac is None else frac
+    wait_bars = config.ENTRY_WAIT_BARS if wait_bars is None else wait_bars
+    if not frac:
+        return signal
+
+    long = signal["direction"] == "long"
+    entry, stop, tp = signal["entry_price"], signal["stop_loss"], signal["take_profit"]
+    level = signal["level_price"]
+    limit = entry - frac * (entry - level) if long else entry + frac * (level - entry)
+    # Заявка не должна оказаться за стопом — иначе риска не остаётся вовсе.
+    if (limit <= stop) if long else (limit >= stop):
+        return None
+
+    for ts, c in future.iloc[:wait_bars].iterrows():
+        hi, lo = float(c["high"]), float(c["low"])
+        hit_limit = lo <= limit if long else hi >= limit
+        hit_tp = hi >= tp if long else lo <= tp
+        hit_stop = lo <= stop if long else hi >= stop
+        if hit_tp and not (hit_limit and optimistic):
+            return None          # ушла к цели без нас — сделка пропущена
+        if not hit_limit:
+            continue
+        # Заявка исполнилась. Стоп лежит дальше нашей цены (для лонга ниже неё),
+        # поэтому если свеча дошла и до него, порядок однозначен: сначала вход,
+        # потом стоп — сделка открылась и тут же закрылась в минус.
+        return {**signal, "entry_price": limit, "bar_time": str(ts),
+                "stopped_at_fill": bool(hit_stop)}
+    return None                  # за отведённое время откат не случился
 
 
 def evaluate_signal(signal: dict, df: pd.DataFrame, week_close: bool = False) -> str:

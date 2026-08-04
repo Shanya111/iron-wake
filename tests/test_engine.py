@@ -87,6 +87,13 @@ def test_find_liquidity_zones():
 # (тренд, объём, R:R, стоп), поэтому фильтр им отключаем — у него свои тесты.
 NO_RISK_FILTER = {"MAX_RISK_ATR": None}
 
+# Фикстуры ниже проходят и боевой фильтр «поглощение» (config.MAX_BODY_RATIO=0.15):
+# у свечи пробоя тело 0.1 при размахе 0.8–1.7, то есть 0.06–0.13 размаха. Это не
+# случайность — так выглядит пружина по VSA. Если будешь добавлять фикстуру, где
+# свеча пробоя закрывается далеко от открытия, детектор её забракует, и тест упадёт
+# не по той причине, которую проверяет: тогда фильтр надо отключить явно
+# ({"MAX_BODY_RATIO": None}), как это сделано для фильтра цены входа.
+
 
 def _spring_df() -> pd.DataFrame:
     rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
@@ -201,6 +208,286 @@ def test_spring_fallback_target_min_rr():
     risk = sig["entry_price"] - sig["stop_loss"]
     expected_tp = sig["entry_price"] + risk * config.get("MIN_RR")
     assert abs(sig["take_profit"] - expected_tp) < 1e-9
+
+
+# ── Уточнение входа откатом к уровню ────────────────────────────────────────
+
+_PB_SIGNAL = {"direction": "long", "level_price": 100.0, "entry_price": 101.0,
+              "stop_loss": 99.0, "take_profit": 105.0, "bar_time": "2024-01-01 00:00:00+00:00"}
+
+
+def _future(rows: list[tuple]) -> pd.DataFrame:
+    """Свечи ПОСЛЕ сигнала: (high, low). Индекс начинается через час после bar_time."""
+    idx = pd.date_range("2024-01-01 01:00", periods=len(rows), freq="h", tz="UTC")
+    return pd.DataFrame([(h, l, h, l, 100) for h, l in rows],
+                        columns=["high", "low", "open", "close", "volume"], index=idx)
+
+
+def test_pullback_disabled_returns_signal_unchanged():
+    same = pattern_detector.pullback_entry(_PB_SIGNAL, _future([(101.5, 100.8)]), frac=0)
+    assert same is _PB_SIGNAL
+
+
+def test_pullback_fills_at_limit_price():
+    # frac=0.5 → заявка на полпути от 101.0 к уровню 100.0, то есть 100.5.
+    got = pattern_detector.pullback_entry(
+        _PB_SIGNAL, _future([(101.2, 100.4)]), frac=0.5, wait_bars=4)
+    assert got is not None
+    assert abs(got["entry_price"] - 100.5) < 1e-9
+    assert got["stop_loss"] == 99.0 and got["take_profit"] == 105.0   # не трогаем
+
+
+def test_pullback_improves_rr():
+    """Смысл затеи: вход ближе к стопу при той же цели — больше прибыли на риск."""
+    got = pattern_detector.pullback_entry(
+        _PB_SIGNAL, _future([(101.2, 100.4)]), frac=0.5, wait_bars=4)
+    was = (105.0 - 101.0) / (101.0 - 99.0)          # 2.0
+    now = (105.0 - got["entry_price"]) / (got["entry_price"] - 99.0)
+    assert now > was
+
+
+def test_pullback_missed_when_price_runs_away():
+    """Цена ушла к цели, не откатившись → сделки не было. Это и есть цена приёма."""
+    assert pattern_detector.pullback_entry(
+        _PB_SIGNAL, _future([(105.5, 101.0)]), frac=0.5, wait_bars=4) is None
+
+
+def test_pullback_missed_when_wait_runs_out():
+    rows = [(101.2, 100.9)] * 6          # откат до 100.5 так и не случился
+    assert pattern_detector.pullback_entry(
+        _PB_SIGNAL, _future(rows), frac=0.5, wait_bars=4) is None
+
+
+def test_pullback_ambiguous_bar_conservative_vs_optimistic():
+    """Свеча накрыла и заявку, и цель — порядок внутри часа неизвестен.
+    Осторожно: вход пропущен. Оптимистично: заявка успела исполниться."""
+    bar = _future([(105.5, 100.4)])
+    assert pattern_detector.pullback_entry(_PB_SIGNAL, bar, frac=0.5, wait_bars=4) is None
+    got = pattern_detector.pullback_entry(_PB_SIGNAL, bar, frac=0.5, wait_bars=4,
+                                          optimistic=True)
+    assert got is not None and abs(got["entry_price"] - 100.5) < 1e-9
+
+
+def test_pullback_marks_stop_hit_on_fill_bar():
+    """Свеча дошла и до заявки, и до стопа. Стоп ниже заявки, значит порядок
+    однозначен: сначала вход, потом стоп — сделка открылась и закрылась в минус."""
+    got = pattern_detector.pullback_entry(
+        _PB_SIGNAL, _future([(101.0, 98.5)]), frac=0.5, wait_bars=4)
+    assert got is not None and got["stopped_at_fill"] is True
+
+
+def test_pullback_rejects_limit_beyond_stop():
+    """Заявка за стопом — риска не остаётся, такую сделку не берём."""
+    signal = {**_PB_SIGNAL, "level_price": 98.0}    # уровень ниже стопа
+    assert pattern_detector.pullback_entry(
+        signal, _future([(101.0, 97.0)]), frac=1.0, wait_bars=4) is None
+
+
+def test_pullback_mirrors_for_short():
+    short = {"direction": "short", "level_price": 100.0, "entry_price": 99.0,
+             "stop_loss": 101.0, "take_profit": 95.0,
+             "bar_time": "2024-01-01 00:00:00+00:00"}
+    got = pattern_detector.pullback_entry(
+        short, _future([(99.6, 98.8)]), frac=0.5, wait_bars=4)
+    assert got is not None
+    assert abs(got["entry_price"] - 99.5) < 1e-9    # полпути вверх к уровню 100
+
+
+# ── Пресеты /settings (частота сигналов, вход вдогонку) ─────────────────────
+
+def test_sensitivity_presets_round_trip():
+    """Каждый пресет узнаётся обратно по действующим порогам — иначе меню
+    показывало бы «средне» на любом положении кнопок."""
+    for name, (_, values) in config.SENSITIVITY.items():
+        assert config.sensitivity_of(config.effective(values)) == name
+
+
+def test_sensitivity_presets_stay_in_measured_range():
+    """Кнопки двигают порог объёма только внутри диапазона, который прошёл
+    проверку на устойчивость (P60–P80). За его границами замер разваливается."""
+    for _, values in config.SENSITIVITY.values():
+        assert 60 <= values["VOL_PCTL"] <= 80
+
+
+def test_sensitivity_unknown_combo_returns_none():
+    """Ручные пороги не совпадают ни с одним пресетом → None, а не «ближайший».
+    Иначе меню поставило бы галочку на положении, в котором пользователя нет."""
+    assert config.sensitivity_of({"VOL_PCTL": 70, "BREAK_PCT": 0.0004}) is None
+    assert config.sensitivity_of({"VOL_PCTL": 42, "BREAK_PCT": 0.0005}) is None
+
+
+def test_chase_filter_toggles_off_with_zero():
+    """«Не входить вдогонку: выкл» пишет 0 — в БД нельзя положить None."""
+    df = _spring_df()          # у него риск ≈ 1.85×ATR, это вход вдогонку
+    assert pattern_detector.detect_spring(
+        df, _SUPPORT_AND_TARGET, trend="up", settings=config.effective()) is None
+    assert pattern_detector.detect_spring(
+        df, _SUPPORT_AND_TARGET, trend="up",
+        settings=config.effective({"MAX_RISK_ATR": 0})) is not None
+
+
+# ── Фильтр «поглощение» (тело свечи пробоя мало относительно размаха) ───────
+
+def _body_df(open_price: float) -> pd.DataFrame:
+    """Пружина с размахом 1.7 (99.0…100.7); тело задаётся ценой открытия."""
+    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
+    rows[23] = (open_price, 100.7, 99.0, 100.5, 300.0)
+    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)
+    return _df(rows)
+
+
+_BODY_LEVELS = [{"price": 100.0, "type": "support", "strength": "strong"},
+                {"price": 110.0, "type": "resistance", "strength": "weak"}]
+
+
+def test_absorption_passes_small_body():
+    # open 100.4, close 100.5 → тело 0.1 при размахе 1.7 ≈ 0.06 размаха.
+    sig = pattern_detector.detect_spring(
+        _body_df(100.4), _BODY_LEVELS, trend="up",
+        settings={"MAX_BODY_RATIO": 0.3, **NO_RISK_FILTER})
+    assert sig is not None
+
+
+def test_absorption_rejects_large_body():
+    # open 99.2, close 100.5 → тело 1.3 при размахе 1.7 ≈ 0.76 размаха.
+    sig = pattern_detector.detect_spring(
+        _body_df(99.2), _BODY_LEVELS, trend="up",
+        settings={"MAX_BODY_RATIO": 0.3, **NO_RISK_FILTER})
+    assert sig is None
+
+
+def test_absorption_off_by_default():
+    """None отключает фильтр — свеча с большим телом проходит."""
+    sig = pattern_detector.detect_spring(
+        _body_df(99.2), _BODY_LEVELS, trend="up",
+        settings={"MAX_BODY_RATIO": None, **NO_RISK_FILTER})
+    assert sig is not None
+
+
+# ── Зоны ликвидности как уровни для пробоя ──────────────────────────────────
+
+def _zone_df() -> pd.DataFrame:
+    """Одна объёмная свеча (размах 99…101) среди спокойных — будущая зона."""
+    rows = [(100.0, 100.3, 99.8, 100.1, 100.0) for _ in range(10)]
+    rows[4] = (100.0, 101.0, 99.0, 100.5, 900.0)
+    return _df(rows)
+
+
+def test_liquidity_levels_mid_uses_candle_middle():
+    zones = analyzer.find_liquidity_zones(_zone_df())
+    levels = analyzer.liquidity_levels(zones, "mid")
+    assert {l["price"] for l in levels} == {100.0}          # (101 + 99) / 2
+    assert {l["type"] for l in levels} == {"support", "resistance"}
+
+
+def test_liquidity_levels_edge_uses_candle_bounds():
+    zones = analyzer.find_liquidity_zones(_zone_df())
+    levels = analyzer.liquidity_levels(zones, "edge")
+    by_type = {l["type"]: l["price"] for l in levels}
+    assert by_type["support"] == 99.0        # низ объёмной свечи
+    assert by_type["resistance"] == 101.0    # её верх
+
+
+def test_liquidity_levels_are_weak():
+    """Сигнал по зоне — обычного приоритета: ⭐ остаётся уровням с подтверждением D1."""
+    levels = analyzer.liquidity_levels(analyzer.find_liquidity_zones(_zone_df()), "mid")
+    assert all(l["strength"] == "weak" and l["is_liquidity"] == 1 for l in levels)
+
+
+def test_liquidity_zone_becomes_tradable_level():
+    """Главное, ради чего всё затевалось: по зоне детектор ловит пробой.
+
+    Уровней-пивотов тут нет вовсе — ровно та ситуация, когда /analyze пишет
+    «сильных часовых уровней нет, ориентируйся на зоны ликвидности».
+    """
+    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
+    rows[5] = (100.4, 100.6, 99.9, 100.5, 900.0)   # объёмная свеча → зона на 100.25
+    rows[23] = (100.4, 100.7, 99.9, 100.5, 300.0)  # пробой зоны вниз и возврат
+    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)
+    df = _df(rows)
+    zones = analyzer.find_liquidity_zones(df.iloc[:-config.LIQ_SKIP_LAST])
+    levels = analyzer.liquidity_levels(zones, "mid")
+    assert levels, "объёмная свеча должна дать зону"
+    sig = pattern_detector.detect_spring(df, levels, trend="up", settings=NO_RISK_FILTER)
+    assert sig is not None
+    assert sig["priority"] == "normal"      # зона не даёт ⭐
+
+
+def test_liquidity_zone_cannot_break_itself():
+    """Ловушка самоссылки: свеча пробоя объёмная по построению, и её собственная
+    середина не должна становиться уровнем, который она же «пробивает».
+
+    Здесь других объёмных свечей нет вовсе — значит после исключения последних
+    LIQ_SKIP_LAST свечей зон не остаётся, и сигналу взяться неоткуда.
+    """
+    df = _spring_df()          # объёмная только свеча 23 — она же свеча пробоя
+    source = df.iloc[:-config.LIQ_SKIP_LAST]
+    assert not analyzer.find_liquidity_zones(source), "свеча пробоя не должна давать зону"
+
+
+# ── Порог аномального объёма: множитель против процентиля ───────────────────
+
+def _pctl_settings(pctl: float, window: int = 20) -> dict:
+    """Пороги для режима «объём выше P-го процентиля за N свечей»."""
+    return {"VOL_MODE": "pctl", "VOL_PCTL": pctl, "VOL_WINDOW": window,
+            **NO_RISK_FILTER}
+
+
+def test_volume_percentile_accepts_top_bar():
+    # Свеча пробоя — самая объёмная из окна (300 против 100 у соседей),
+    # то есть заведомо выше любого процентиля → сигнал есть.
+    df = _spring_df()
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up", settings=_pctl_settings(90)) is not None
+
+
+def test_volume_percentile_rejects_ordinary_bar():
+    # Объём как у соседей → в верхние проценты не попадает → не Spring.
+    df = _spring_df()
+    df.iloc[23, df.columns.get_loc("volume")] = 100.0
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up", settings=_pctl_settings(90)) is None
+
+
+def test_volume_percentile_is_relative_not_absolute():
+    """Смысл процентиля: порог свой у каждого инструмента.
+
+    Здесь объём свечи пробоя (150) НИЖЕ среднего соседей (200), то есть множитель
+    ×1.5 её забракует. Но соседи разношёрстные, и 150 всё равно выше 70% из них —
+    процентиль пропустит. Ровно этого и ждём от «относительного» порога: он
+    сравнивает свечу с её же окружением, а не с общим числом.
+    """
+    rows = [(100.5, 101.0, 100.2, 100.6, 100.0 if i % 4 else 600.0) for i in range(25)]
+    rows[23] = (100.4, 100.7, 99.0, 100.5, 150.0)
+    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)
+    df = _df(rows)
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
+    # Множитель: 150 < среднее(≈225) × 1.5 → сигнала нет.
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up",
+        settings={"VOL_MODE": "mult", "VOL_MULT": 1.5, **NO_RISK_FILTER}) is None
+    # Процентиль P70: 150 выше 70% соседей (их большинство — по 100) → сигнал есть.
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up", settings=_pctl_settings(70)) is not None
+
+
+def test_volume_percentile_window_excludes_own_bar():
+    """Свеча не входит в собственную норму — иначе задирала бы порог, который
+    сама должна перепрыгнуть. Проверяем на окне, где она единственная крупная."""
+    df = _spring_df()
+    window = df["volume"].iloc[3:23]           # 20 свечей ПЕРЕД свечой пробоя
+    assert float(window.max()) == 100.0, "в окне не должно быть свечи пробоя"
+    assert pattern_detector._volume_ok(
+        df, 23, {"VOL_MODE": "pctl", "VOL_PCTL": 95, "VOL_WINDOW": 20}, 1.5)
+
+
+def test_volume_percentile_needs_enough_history():
+    # Окна короче VOL_LOOKBACK не хватает даже на осмысленный процентиль.
+    df = _spring_df()
+    assert not pattern_detector._volume_ok(
+        df, 5, {"VOL_MODE": "pctl", "VOL_PCTL": 70, "VOL_WINDOW": 20}, 1.5)
 
 
 def _upthrust_df() -> pd.DataFrame:

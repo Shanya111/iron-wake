@@ -417,7 +417,7 @@ HELP_TEXT = (
     "/signals — последние сигналы\n"
     "/stats — статистика сигналов (винрейт, итог в R) за 30 дней / всё время\n"
     "/trades — журнал сделок (статус цель/стоп, закрытие)\n"
-    "/settings — пороги движка сигналов под себя (объём, пробой, R:R)\n"
+    "/settings — настройки сигналов под себя (частота, прибыль/риск, вход вдогонку)\n"
     "/cancel — отменить текущий сценарий\n\n"
     "Можно просто писать словами — я пойму:\n"
     "• «алерт золото 2400» — поставлю алерт\n"
@@ -963,10 +963,9 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     trend = analyzer.get_trend(h1)
     trend_d1 = analyzer.get_trend(d1)
     levels = engine.analyze_and_store(code, d1, h1)  # считает и сохраняет уровни в БД
-    # Зоны ликвидности — под личный порог пользователя (LIQUIDITY_MULT): кто-то хочет
-    # видеть только самые жирные всплески объёма, кто-то — больше зон. На сигналы не влияет.
-    liq_mult = config.effective(database.get_user_settings(user_id))["LIQUIDITY_MULT"]
-    zones = analyzer.find_liquidity_zones(h1, liq_mult)
+    # Зоны ликвидности — порог общий (config.LIQUIDITY_MULT), настройкой он больше
+    # не является: зоны видны только здесь, в отчёте, и на отбор сигналов не влияют.
+    zones = analyzer.find_liquidity_zones(h1)
 
     # Стакан (DOM) есть только у биржевых инструментов (Kraken). У золота/нефти (Yahoo)
     # стакана нет → пропускаем; анализ это переживает (ob=None обрабатывается ниже).
@@ -1232,58 +1231,71 @@ async def cb_stats(call: CallbackQuery):
 
 
 def settings_text(user_id: int, is_admin: bool) -> str:
+    """Меню настроек человеческим языком: три решения вместо четырёх сырых чисел.
+
+    Владелец бота — трейдер, а не программист: «процентиль объёма 70» ему ничего не
+    говорит, а «сигналы средней частоты» — говорит. Поэтому пороги спрятаны за
+    понятные названия, а под каждым написано, что он меняет на практике.
+    """
     # Пороги персональные: подписчик крутит их под себя, поверх общих значений.
     # Админ правит ОБЩИЙ дефолт (для всех, кто не настроил своё) — у него личных нет.
     overrides = {} if is_admin else database.get_user_settings(user_id)
     eff = config.effective(overrides)
-
-    def mark(key: str) -> str:
-        return " (личное)" if key in overrides else ""
+    sens = config.sensitivity_of(eff)
+    # None — действующие пороги не совпадают ни с одним пресетом (настраивали
+    # вручную до появления кнопок). Пишем честно, а не выбираем ближайшее.
+    sens_name = (config.SENSITIVITY[sens][0] if sens
+                 else "своё значение — нажми кнопку, чтобы перейти на измеренное")
+    personal = " (личное)" if overrides else ""
+    chase = "включено" if eff["MAX_RISK_ATR"] else "выключено"
 
     if is_admin:
-        footer = (
-            "Это общие пороги по умолчанию — для всех, кто не настроил своё.\n"
-            "Меняй кнопками ниже (применится сразу ко всем «по умолчанию»):"
-        )
+        footer = ("Это общие настройки — для всех, кто не менял их под себя.\n"
+                  "Кнопки применяются сразу ко всем.")
     else:
-        footer = (
-            "Это твои личные пороги — крути сигналы (и зоны в /analyze) под себя кнопками.\n"
-            "«Сбросить» вернёт общие значения. Метка «(личное)» = твоё переопределение."
-        )
+        footer = ("Это твои личные настройки сигналов.\n"
+                  "«Сбросить» вернёт общие.")
     return (
-        "⚙️ Настройки движка сигналов:\n"
-        f"• Аномальный объём: × {eff['VOL_MULT']:g}{mark('VOL_MULT')}\n"
-        f"• Глубина ложного пробоя: {eff['BREAK_PCT'] * 100:.3g}%{mark('BREAK_PCT')}\n"
-        f"• Объём зоны ликвидности (для /analyze): × {eff['LIQUIDITY_MULT']:g}{mark('LIQUIDITY_MULT')}\n"
-        f"• Мин. прибыль/риск (R:R): 1:{eff['MIN_RR']:g}{mark('MIN_RR')}\n\n"
+        f"⚙️ Настройки сигналов{personal}\n\n"
+        f"🎚 Частота сигналов: {sens_name}\n"
+        "   Насколько редким должен быть всплеск объёма, чтобы считаться сигналом.\n"
+        "   Реже — сигналов меньше, но отобраны строже.\n\n"
+        f"🎯 Прибыль к риску: 1:{eff['MIN_RR']:g}\n"
+        "   Сколько бот хочет заработать на каждый доллар риска. Выше — сигналы\n"
+        "   реже, зато каждый крупнее.\n\n"
+        f"🚫 Не входить вдогонку: {chase}\n"
+        "   Пропускать сигналы, где цена уже далеко ушла от уровня. Пружина\n"
+        "   торгуется ОТ уровня; входы вдогонку по замеру убыточны.\n\n"
         + footer
     )
 
 
-def settings_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
+def settings_keyboard(user_id: int, is_admin: bool) -> InlineKeyboardMarkup:
+    """Три решения — три ряда кнопок. Текущее положение помечено галочкой."""
+    eff = config.effective({} if is_admin else database.get_user_settings(user_id))
+    sens = config.sensitivity_of(eff)
+    chase_on = bool(eff["MAX_RISK_ATR"])
+
+    def tick(active: bool, text: str) -> str:
+        return f"✅ {text}" if active else text
+
     rows = [
-        [
-            InlineKeyboardButton(text="Объём ×1.3", callback_data="set:VOL_MULT:1.3"),
-            InlineKeyboardButton(text="×1.5", callback_data="set:VOL_MULT:1.5"),
-            InlineKeyboardButton(text="×2.0", callback_data="set:VOL_MULT:2.0"),
-        ],
-        [
-            InlineKeyboardButton(text="Пробой 0.03%", callback_data="set:BREAK_PCT:0.0003"),
-            InlineKeyboardButton(text="0.05%", callback_data="set:BREAK_PCT:0.0005"),
-            InlineKeyboardButton(text="0.1%", callback_data="set:BREAK_PCT:0.001"),
-        ],
-        [
-            InlineKeyboardButton(text="R:R 1:2", callback_data="set:MIN_RR:2.0"),
-            InlineKeyboardButton(text="1:2.5", callback_data="set:MIN_RR:2.5"),
-            InlineKeyboardButton(text="1:3", callback_data="set:MIN_RR:3.0"),
-        ],
-        [
-            InlineKeyboardButton(text="Ликвидн. ×1.3", callback_data="set:LIQUIDITY_MULT:1.3"),
-            InlineKeyboardButton(text="×1.5", callback_data="set:LIQUIDITY_MULT:1.5"),
-            InlineKeyboardButton(text="×2.0", callback_data="set:LIQUIDITY_MULT:2.0"),
-        ],
+        [InlineKeyboardButton(text=tick(sens == key, label),
+                              callback_data=f"set:SENS:{key}")
+         for key, (label, _) in config.SENSITIVITY.items()],
+        # Оптимум (1:2) стоит В СЕРЕДИНЕ ряда, а не с краю: по замеру он выигрывает
+        # и у более мягких порогов, и у более жёстких, поэтому кнопки идут по обе
+        # стороны от него. 1:3 из меню убран — он измеренно худший из проверенных
+        # (1 420$ против 1 751$ на счёте, см. «Прибыль/риск» в CLAUDE.md).
+        [InlineKeyboardButton(text=tick(abs(eff["MIN_RR"] - value) < 1e-9, f"1:{value:g}"),
+                              callback_data=f"set:MIN_RR:{value}")
+         for value in (1.5, 2.0, 2.5)],
+        [InlineKeyboardButton(
+            text=("🚫 Не входить вдогонку: вкл" if chase_on
+                  else "🚫 Не входить вдогонку: выкл"),
+            callback_data=f"set:CHASE:{'off' if chase_on else 'on'}")],
     ]
-    # Подписчику — сброс личных порогов к общим. Админу нечего сбрасывать (он и есть общие).
+    # Подписчику — сброс личных настроек к общим. Админу нечего сбрасывать (он и есть общие).
     if not is_admin:
         rows.append([InlineKeyboardButton(text="↩️ Сбросить к общим", callback_data="set:reset")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1295,41 +1307,71 @@ async def cmd_settings(message: Message):
     is_admin = ADMIN_ID is None or message.from_user.id == ADMIN_ID
     await message.answer(
         settings_text(message.from_user.id, is_admin),
-        reply_markup=settings_keyboard(is_admin),
+        reply_markup=settings_keyboard(message.from_user.id, is_admin),
     )
+
+
+def _apply_settings(user_id: int, is_admin: bool, values: dict) -> None:
+    """Записать пороги: админу — в общий дефолт, подписчику — в личные."""
+    for key, value in values.items():
+        if is_admin:
+            config.set_value(key, value)                    # общий дефолт для всех
+        else:
+            database.set_user_setting(user_id, key, value)  # личный порог
 
 
 @dp.callback_query(F.data.startswith("set:"))
 async def cb_settings(call: CallbackQuery):
     is_admin = ADMIN_ID is None or call.from_user.id == ADMIN_ID
+    user_id = call.from_user.id          # call.message.from_user — это бот, не человек
     parts = call.data.split(":")
 
-    # Сброс личных порогов подписчика к общим.
-    if len(parts) == 2 and parts[1] == "reset":
-        database.reset_user_settings(call.from_user.id)
-        await call.answer("Сброшено к общим")
+    async def redraw(note: str) -> None:
+        await call.answer(note)
         await call.message.edit_text(
-            settings_text(call.from_user.id, is_admin), reply_markup=settings_keyboard(is_admin)
+            settings_text(user_id, is_admin),
+            reply_markup=settings_keyboard(user_id, is_admin),
         )
+
+    # Сброс личных настроек подписчика к общим.
+    if len(parts) == 2 and parts[1] == "reset":
+        database.reset_user_settings(user_id)
+        await redraw("Сброшено к общим")
         return
 
     try:
-        _, key, value = parts
-        value = float(value)
+        _, key, raw = parts
+    except ValueError:
+        await call.answer("Не понял настройку")
+        return
+
+    # Частота сигналов — пресет: одно нажатие задаёт сразу несколько порогов.
+    if key == "SENS":
+        preset = config.SENSITIVITY.get(raw)
+        if preset is None:
+            await call.answer("Не понял настройку")
+            return
+        _apply_settings(user_id, is_admin, preset[1])
+        await redraw(f"Частота: {preset[0]}")
+        return
+
+    # «Не входить вдогонку» — переключатель. 0 отключает фильтр (см. config).
+    if key == "CHASE":
+        _apply_settings(user_id, is_admin,
+                        {"MAX_RISK_ATR": config.MAX_RISK_ATR if raw == "on" else 0})
+        await redraw("Готово")
+        return
+
+    try:
+        value = float(raw)
         if key not in config.TUNABLE:
             raise KeyError(key)
     except (ValueError, KeyError):
         await call.answer("Не понял настройку")
         return
 
-    if is_admin:
-        config.set_value(key, value)                       # общий дефолт для всех
-    else:
-        database.set_user_setting(call.from_user.id, key, value)  # личный порог
-    await call.answer("Готово")
-    await call.message.edit_text(
-        settings_text(call.from_user.id, is_admin), reply_markup=settings_keyboard(is_admin)
-    )
+    _apply_settings(user_id, is_admin, {key: value})
+    await redraw("Готово")
 
 
 # ── Telegram Payments ─────────────────────────────────────────────────────────

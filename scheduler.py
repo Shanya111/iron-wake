@@ -77,17 +77,27 @@ def analyze_and_store(code: str, d1, h1) -> list[dict]:
     local_levels = analyzer.find_levels(h1, config.H1_PIVOT_WINDOW, "H1")
     prioritized = analyzer.prioritize_levels(global_levels, local_levels)
     zones = analyzer.find_liquidity_zones(d1)
-    liquidity_levels = [
+    liquidity_rows = [
         {"price": z["price"], "type": "liquidity", "strength": "strong",
          "is_liquidity": 1, "timeframe": "D1"}
         for z in zones
     ]
-    database.save_levels(code, prioritized + liquidity_levels)
+    # Зоны ликвидности по ЧАСОВИКУ — те самые, что показывает /analyze, — кладём
+    # уровнями (support/resistance), чтобы детектор мог ловить по ним пробой.
+    # Последние LIQ_SKIP_LAST свечей в источник не берём: свеча пробоя объёмная
+    # сама по себе, иначе она «пробивала» бы уровень, построенный по ней же.
+    tradable_zones = []
+    if config.LIQ_LEVELS != "off":
+        source = h1.iloc[:-config.LIQ_SKIP_LAST] if config.LIQ_SKIP_LAST else h1
+        tradable_zones = analyzer.liquidity_levels(
+            analyzer.find_liquidity_zones(source), config.LIQ_LEVELS)
+    database.save_levels(code, prioritized + tradable_zones + liquidity_rows)
     # Печатаем оба тренда: H1 — рабочий (по нему отбираются сигналы и строится
     # /analyze), D1 — фон. Когда сигналов нет, по логу сразу видно, тренд ли виноват.
     print(f"[analysis] {code}: тренд H1={analyzer.get_trend(h1)} "
           f"(D1={analyzer.get_trend(d1)}), "
-          f"уровней={len(prioritized)}, зон ликвидности={len(zones)}")
+          f"уровней={len(prioritized)}, зон ликвидности={len(zones)}, "
+          f"торгуемых зон H1={len(tradable_zones) // 2}")
     return prioritized
 
 

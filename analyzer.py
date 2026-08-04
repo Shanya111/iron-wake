@@ -64,10 +64,10 @@ def find_liquidity_zones(df: pd.DataFrame, mult: float | None = None) -> list[di
     """Зоны скопления объёма (Smart Money): свечи, где volume > среднего × mult.
 
     Возвращает ценовые уровни (середина свечи) с объёмом — это зоны ликвидности,
-    куда рынок может тянуться. mult по умолчанию из настроек (/settings).
+    куда рынок может тянуться. mult по умолчанию — config.LIQUIDITY_MULT.
     """
     if mult is None:
-        mult = config.get("LIQUIDITY_MULT")
+        mult = config.LIQUIDITY_MULT
     vol = df["volume"]
     if vol.empty or float(vol.mean()) == 0:
         return []
@@ -75,9 +75,39 @@ def find_liquidity_zones(df: pd.DataFrame, mult: float | None = None) -> list[di
     zones = []
     for i in range(len(df)):
         if float(vol.iloc[i]) > avg * mult:
-            mid = float((df["high"].iloc[i] + df["low"].iloc[i]) / 2)
-            zones.append({"price": mid, "volume": float(vol.iloc[i])})
+            high, low = float(df["high"].iloc[i]), float(df["low"].iloc[i])
+            zones.append({"price": (high + low) / 2, "volume": float(vol.iloc[i]),
+                          "high": high, "low": low})
     return zones
+
+
+def liquidity_levels(zones: list[dict], mode: str = "mid") -> list[dict]:
+    """Зоны ликвидности в виде уровней — чтобы по ним можно было ловить пробой.
+
+    Зачем. Отчёт `/analyze` регулярно пишет «сильных часовых уровней нет,
+    ориентируйся на зоны ликвидности» и называет по ним точки входа, а детектор
+    сигналов зоны игнорировал: он отбирал уровни по типу support/resistance, а
+    зоны лежали с типом 'liquidity'. Бот советовал одно, а сигналил по другому —
+    в описанной ситуации не выдавал ничего.
+
+    Каждая зона даёт пару уровней (поддержку и сопротивление) — какую роль она
+    сыграет, решит сам пробой: детектор проверяет, что цена ушла за уровень и
+    вернулась. mode задаёт цену:
+      • 'mid'  — середина объёмной свечи (как зона считалась всегда);
+      • 'edge' — её край: low для поддержки, high для сопротивления.
+
+    Сила всегда 'weak': сигнал по зоне получает обычный приоритет, а ⭐ остаётся
+    за уровнями, подтверждёнными дневкой.
+    """
+    levels: list[dict] = []
+    for z in zones:
+        support = z["low"] if mode == "edge" else z["price"]
+        resistance = z["high"] if mode == "edge" else z["price"]
+        levels.append({"price": support, "type": "support", "strength": "weak",
+                       "is_liquidity": 1, "timeframe": "H1"})
+        levels.append({"price": resistance, "type": "resistance", "strength": "weak",
+                       "is_liquidity": 1, "timeframe": "H1"})
+    return levels
 
 
 def analyze_order_book(ob: dict, wall_mult: float | None = None) -> dict | None:
