@@ -203,6 +203,67 @@ def test_spring_fallback_target_min_rr():
     assert abs(sig["take_profit"] - expected_tp) < 1e-9
 
 
+# ── Зоны ликвидности как уровни для пробоя ──────────────────────────────────
+
+def _zone_df() -> pd.DataFrame:
+    """Одна объёмная свеча (размах 99…101) среди спокойных — будущая зона."""
+    rows = [(100.0, 100.3, 99.8, 100.1, 100.0) for _ in range(10)]
+    rows[4] = (100.0, 101.0, 99.0, 100.5, 900.0)
+    return _df(rows)
+
+
+def test_liquidity_levels_mid_uses_candle_middle():
+    zones = analyzer.find_liquidity_zones(_zone_df())
+    levels = analyzer.liquidity_levels(zones, "mid")
+    assert {l["price"] for l in levels} == {100.0}          # (101 + 99) / 2
+    assert {l["type"] for l in levels} == {"support", "resistance"}
+
+
+def test_liquidity_levels_edge_uses_candle_bounds():
+    zones = analyzer.find_liquidity_zones(_zone_df())
+    levels = analyzer.liquidity_levels(zones, "edge")
+    by_type = {l["type"]: l["price"] for l in levels}
+    assert by_type["support"] == 99.0        # низ объёмной свечи
+    assert by_type["resistance"] == 101.0    # её верх
+
+
+def test_liquidity_levels_are_weak():
+    """Сигнал по зоне — обычного приоритета: ⭐ остаётся уровням с подтверждением D1."""
+    levels = analyzer.liquidity_levels(analyzer.find_liquidity_zones(_zone_df()), "mid")
+    assert all(l["strength"] == "weak" and l["is_liquidity"] == 1 for l in levels)
+
+
+def test_liquidity_zone_becomes_tradable_level():
+    """Главное, ради чего всё затевалось: по зоне детектор ловит пробой.
+
+    Уровней-пивотов тут нет вовсе — ровно та ситуация, когда /analyze пишет
+    «сильных часовых уровней нет, ориентируйся на зоны ликвидности».
+    """
+    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
+    rows[5] = (100.4, 100.6, 99.9, 100.5, 900.0)   # объёмная свеча → зона на 100.25
+    rows[23] = (100.4, 100.7, 99.9, 100.5, 300.0)  # пробой зоны вниз и возврат
+    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)
+    df = _df(rows)
+    zones = analyzer.find_liquidity_zones(df.iloc[:-config.LIQ_SKIP_LAST])
+    levels = analyzer.liquidity_levels(zones, "mid")
+    assert levels, "объёмная свеча должна дать зону"
+    sig = pattern_detector.detect_spring(df, levels, trend="up", settings=NO_RISK_FILTER)
+    assert sig is not None
+    assert sig["priority"] == "normal"      # зона не даёт ⭐
+
+
+def test_liquidity_zone_cannot_break_itself():
+    """Ловушка самоссылки: свеча пробоя объёмная по построению, и её собственная
+    середина не должна становиться уровнем, который она же «пробивает».
+
+    Здесь других объёмных свечей нет вовсе — значит после исключения последних
+    LIQ_SKIP_LAST свечей зон не остаётся, и сигналу взяться неоткуда.
+    """
+    df = _spring_df()          # объёмная только свеча 23 — она же свеча пробоя
+    source = df.iloc[:-config.LIQ_SKIP_LAST]
+    assert not analyzer.find_liquidity_zones(source), "свеча пробоя не должна давать зону"
+
+
 # ── Порог аномального объёма: множитель против процентиля ───────────────────
 
 def _pctl_settings(pctl: float, window: int = 20) -> dict:

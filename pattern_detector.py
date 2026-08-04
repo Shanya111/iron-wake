@@ -86,11 +86,20 @@ def _atr(df: pd.DataFrame, pos: int, period: int) -> float:
     return float(tr.mean())
 
 
-def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool):
-    """Ближайший уровень нужного типа выше (above=True) или ниже ref_price."""
+def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool,
+             use_liquidity: bool = False):
+    """Ближайший уровень нужного типа выше (above=True) или ниже ref_price.
+
+    use_liquidity=False — зоны ликвидности в выборе ЦЕЛИ не участвуют, даже если
+    работают уровнями для пробоя. Причина замерена: зон много, ближайшая цель
+    оказывается слишком близко, R:R не дотягивает до порога и сигнал отбрасывается.
+    В прогоне это срезало число сделок вдвое (306 → 156) — то есть «зоны как цели»
+    не добавляют сетапы, а убивают уже имеющиеся. См. «Зоны ликвидности» в CLAUDE.md.
+    """
     prices = [
         l["price"] for l in levels
         if l["type"] == level_type
+        and (use_liquidity or not l.get("is_liquidity"))
         and (l["price"] > ref_price if above else l["price"] < ref_price)
     ]
     if not prices:
@@ -105,6 +114,7 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     vol_mult = s.get("VOL_MULT", config.VOL_MULT)
     break_pct = s.get("BREAK_PCT", config.get("BREAK_PCT"))
     min_rr = s.get("MIN_RR", config.get("MIN_RR"))
+    liq_target = s.get("LIQ_AS_TARGET", config.LIQ_AS_TARGET)
     # Запас стопа за экстремум свечи пробоя — см. config.STOP_MODE. По умолчанию
     # он в долях ATR (подстраивается под волатильность), запасной вариант — процент
     # от цены. Настройки могут переопределить: STOP_ABS — готовый запас числом,
@@ -182,7 +192,8 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             entry = c
             stop = l - (stop_abs if stop_abs is not None else l * stop_spread)
             risk = entry - stop
-            target = _nearest(levels, "resistance", entry, above=True)
+            target = _nearest(levels, "resistance", entry, above=True,
+                              use_liquidity=liq_target)
             if target is None:
                 tp = entry + risk * min_rr
             elif (target - entry) >= risk * min_rr:
@@ -193,7 +204,8 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             entry = c
             stop = h + (stop_abs if stop_abs is not None else h * stop_spread)
             risk = stop - entry
-            target = _nearest(levels, "support", entry, above=False)
+            target = _nearest(levels, "support", entry, above=False,
+                              use_liquidity=liq_target)
             if target is None:
                 tp = entry - risk * min_rr
             elif (entry - target) >= risk * min_rr:

@@ -257,15 +257,26 @@ def _d1_view(d1: pd.DataFrame, h1: pd.DataFrame, i: int) -> pd.DataFrame:
     return closed.tail(config.D1_LIMIT)
 
 
-def _levels_at(d1_view: pd.DataFrame, h1_window: pd.DataFrame) -> list[dict]:
+def _levels_at(d1_view: pd.DataFrame, h1_window: pd.DataFrame,
+               liq_mode: str = "off") -> list[dict]:
     """Уровни, какими их посчитал бы run_analysis по этим окнам.
 
-    Зоны ликвидности пропускаем осознанно: detect_spring/upthrust фильтруют
-    уровни по type support/resistance, так что на сигналы они не влияют.
+    liq_mode ('off'/'mid'/'edge') — работают ли зоны ликвидности как уровни для
+    пробоя (см. analyzer.liquidity_levels). Зоны идут ПОСЛЕ пиков: детектор
+    возвращает первый подошедший уровень, и приоритет остаётся за пивотами — зона
+    срабатывает там, где обычного уровня нет, ровно как советует /analyze.
+
+    Последняя свеча окна — та самая свеча пробоя, и она объёмная по построению.
+    В источник зон её не берём, иначе она «пробивала» бы уровень, построенный
+    по ней же (сигнал из ничего).
     """
     global_levels = analyzer.find_levels(d1_view, config.D1_PIVOT_WINDOW, "D1")
     local_levels = analyzer.find_levels(h1_window, config.H1_PIVOT_WINDOW, "H1")
-    return analyzer.prioritize_levels(global_levels, local_levels)
+    levels = analyzer.prioritize_levels(global_levels, local_levels)
+    if liq_mode != "off":
+        zones = analyzer.find_liquidity_zones(h1_window.iloc[:-1])
+        levels += analyzer.liquidity_levels(zones, liq_mode)
+    return levels
 
 
 # ── Варианты перебора ───────────────────────────────────────────────────────
@@ -307,19 +318,34 @@ def vol_rule_text(base: dict) -> str:
 
 
 def build_variants(sweep: str, base: dict) -> list[dict]:
-    """Список вариантов для перебора: 'stop' — запас стопа, 'vol' — порог объёма."""
+    """Список вариантов перебора: 'stop' — стоп, 'vol' — объём, 'liq' — зоны ликвидности."""
+    if sweep == "liq":
+        # Работают ли зоны ликвидности как уровни для пробоя, по какой цене и
+        # берутся ли они ещё и в цель. Последнее — отдельный рычаг: зон много,
+        # и как цели они тянут R:R вниз, убивая сигналы вместо добавления новых.
+        vol = _base_vol_spec(base)
+        combos = (("выкл (сейчас)", "off", False),
+                  ("середина, пробой", "mid", False),
+                  ("край, пробой", "edge", False),
+                  ("середина + цели", "mid", True),
+                  ("край + цели", "edge", True))
+        return [{"name": name,
+                 "patch": (lambda t: lambda atr: {"LIQ_AS_TARGET": t})(as_target),
+                 "vol": vol, "liq": mode}
+                for name, mode, as_target in combos]
     if sweep == "vol":
         current = _base_vol_spec(base)
         label = (f"×{current[1]:g} (сейчас)" if current[0] == "mult"
                  else f"P{current[1]:g}/{current[2]} св. (сейчас)")
-        variants = [{"name": label, "patch": lambda atr: {}, "vol": current}]
+        liq = config.LIQ_LEVELS
+        variants = [{"name": label, "patch": lambda atr: {}, "vol": current, "liq": liq}]
         # Контроль: тот же множитель, только слабее — чтобы отличить «процентиль
         # лучше как мера» от «просто пропустили больше сделок».
         for m in VOL_MULTS:
             variants.append({
                 "name": f"множитель ×{m:g}",
                 "patch": (lambda mm: lambda atr: {"VOL_MODE": "mult", "VOL_MULT": mm})(m),
-                "vol": ("mult", m),
+                "vol": ("mult", m), "liq": liq,
             })
         for n in VOL_WINDOWS:
             for p in VOL_PCTLS:
@@ -328,12 +354,13 @@ def build_variants(sweep: str, base: dict) -> list[dict]:
                     "name": f"P{p} / {n} свечей",
                     "patch": (lambda pp, nn: lambda atr: {
                         "VOL_MODE": "pctl", "VOL_PCTL": pp, "VOL_WINDOW": nn})(p, n),
-                    "vol": spec,
+                    "vol": spec, "liq": liq,
                 })
         return variants
-    # Перебор стопа: объём при этом фиксирован боевым.
+    # Перебор стопа: объём и зоны при этом фиксированы боевыми.
     vol = _base_vol_spec(base)
-    return [{"name": name, "patch": _stop_patch(kind, value), "vol": vol}
+    return [{"name": name, "patch": _stop_patch(kind, value), "vol": vol,
+             "liq": config.LIQ_LEVELS}
             for name, kind, value in STOP_VARIANTS]
 
 
@@ -433,6 +460,10 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
     warmup = max(config.VOL_LOOKBACK + 3, config.H1_PIVOT_WINDOW * 2 + 2)
     last_ts = h1.index[-1]
     results: dict[str, list[dict]] = {v["name"]: [] for v in variants}
+    # Режимы зон ликвидности, встречающиеся среди вариантов. Уровни от режима
+    # зависят, поэтому считаем по набору на бар — но обычно режим один на всех
+    # (перебор стопа/объёма), и лишней работы не возникает.
+    liq_modes = {v["liq"] for v in variants}
     # Дедуп как в бою: один и тот же паттерн не чаще SIGNAL_DEDUP_MIN минут.
     last_emit: dict[tuple[str, str, str], pd.Timestamp] = {}
 
@@ -463,7 +494,7 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
         # Считаем по окну до свечи пробоя включительно: в бою тренд берётся по всему
         # H1 вместе с ещё формирующимся баром, здесь строже — без будущего.
         trend = analyzer.get_trend(d1_view if trend_d1 else h1_window)
-        levels = _levels_at(d1_view, h1_window)
+        levels_by_liq = {m: _levels_at(d1_view, h1_window, m) for m in liq_modes}
         # Детектор берёт свечу как df.iloc[-2], поэтому окно на бар длиннее;
         # сам бар i+1 он не читает (только df.iloc[pos] и объёмы до pos).
         window = h1.iloc[max(0, i + 2 - config.H1_LIMIT):i + 2]
@@ -484,6 +515,7 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
             settings["WEEK_FILTER"] = week_filter
             # None отключает фильтр цены входа — прогон «как было», для сравнения.
             settings["MAX_RISK_ATR"] = config.MAX_RISK_ATR if risk_filter else None
+            levels = levels_by_liq[variant["liq"]]
             for detector in (pattern_detector.detect_spring, pattern_detector.detect_upthrust):
                 signal = detector(window, levels, trend, settings)
                 if signal is None:
@@ -778,11 +810,14 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
               by_source: bool = False) -> None:
     variants = build_variants(sweep, base)
     names = [v["name"] for v in variants]
-    title, column = (("ПОРОГА ОБЪЁМА", "порог объёма") if sweep == "vol"
-                     else ("СТОПА", "буфер"))
-    print(f"Перебираем:     {'порог аномального объёма' if sweep == 'vol' else 'запас стопа'}"
-          f" ({len(variants)} вариантов)")
+    title, column = {"vol": ("ПОРОГА ОБЪЁМА", "порог объёма"),
+                     "liq": ("ЗОН ЛИКВИДНОСТИ", "зоны как уровни"),
+                     "stop": ("СТОПА", "буфер")}[sweep]
+    what = {"vol": "порог аномального объёма", "liq": "зоны ликвидности как уровни",
+            "stop": "запас стопа"}[sweep]
+    print(f"Перебираем:     {what} ({len(variants)} вариантов)")
     print(f"Объём:          {vol_rule_text(base)}")
+    print(f"Зоны-уровни:    {config.LIQ_LEVELS}")
     print("Недельное окно: " + ("ВКЛ — входы пн–чт, пятничное закрытие гасит сделку"
                                 if week_filter else "ВЫКЛ — как было до окна"))
     print("Фильтр тренда:  " + ("по ДНЕВКЕ (D1) — как было до недельного горизонта"
@@ -861,9 +896,10 @@ def main() -> None:
     p.add_argument("--by-source", action="store_true",
                    help="дополнительно показать сравнение отдельно по источнику объёма "
                         "(биржа Kraken против Yahoo) — проверить, нужен ли разный порог")
-    p.add_argument("--sweep", choices=("stop", "vol"), default="stop",
+    p.add_argument("--sweep", choices=("stop", "vol", "liq"), default="stop",
                    help="что перебирать: stop — запас стопа (по умолчанию), "
-                        "vol — порог аномального объёма (множитель против процентиля)")
+                        "vol — порог аномального объёма (множитель против процентиля), "
+                        "liq — зоны ликвидности как уровни для пробоя (выкл/середина/край)")
     args = p.parse_args()
 
     # Окно входа подменяем в config: trading_week читает его на каждый вызов.
