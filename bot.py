@@ -1280,9 +1280,13 @@ def settings_keyboard(user_id: int, is_admin: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=tick(sens == key, label),
                               callback_data=f"set:SENS:{key}")
          for key, (label, _) in config.SENSITIVITY.items()],
+        # Оптимум (1:2) стоит В СЕРЕДИНЕ ряда, а не с краю: по замеру он выигрывает
+        # и у более мягких порогов, и у более жёстких, поэтому кнопки идут по обе
+        # стороны от него. 1:3 из меню убран — он измеренно худший из проверенных
+        # (1 420$ против 1 751$ на счёте, см. «Прибыль/риск» в CLAUDE.md).
         [InlineKeyboardButton(text=tick(abs(eff["MIN_RR"] - value) < 1e-9, f"1:{value:g}"),
                               callback_data=f"set:MIN_RR:{value}")
-         for value in (2.0, 2.5, 3.0)],
+         for value in (1.5, 2.0, 2.5)],
         [InlineKeyboardButton(
             text=("🚫 Не входить вдогонку: вкл" if chase_on
                   else "🚫 Не входить вдогонку: выкл"),
