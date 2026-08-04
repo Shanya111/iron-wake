@@ -45,6 +45,7 @@ import pandas as pd
 import analyzer
 import config
 import database
+import money
 import pattern_detector
 import trading_week
 from instruments import INSTRUMENTS, data_source, engine_codes, resolve
@@ -100,7 +101,17 @@ VOL_PCTLS = (50, 60, 70, 80, 90, 95)
 VOL_WINDOWS = (20, 50, 100)
 VOL_MULTS = (1.0, 1.1, 1.2, 1.3)
 
+# Варианты фильтра «поглощение» (--sweep body): доля тела свечи пробоя от её размаха.
+# Сетка широкая с обеих сторон: 0.2 — очень строго (почти доджи), 0.8 — почти не
+# фильтрует. Если победит крайний вариант, сетку надо расширять.
+BODY_RATIOS = (0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.8)
+
 ATR_PERIOD = 14
+
+# Издержки «туда-обратно» (доля от цены), по которым считается колонка «нетто R».
+# 0.1% — намеренно щадящая оценка (лимитные заявки, крупный объём); на розничном
+# тарифе Kraken выходит впятеро больше. Полный разбор сценариев — в money.py.
+REF_COST = 0.001
 
 # Кеш скачанной истории. Лежит рядом с кодом, в .gitignore. Нужен, чтобы разные
 # варианты движка сравнивались на одном и том же срезе данных (и чтобы биржа не
@@ -319,6 +330,18 @@ def vol_rule_text(base: dict) -> str:
 
 def build_variants(sweep: str, base: dict) -> list[dict]:
     """Список вариантов перебора: 'stop' — стоп, 'vol' — объём, 'liq' — зоны ликвидности."""
+    if sweep == "body":
+        # Фильтр «поглощение»: тело свечи пробоя ≤ доли её размаха.
+        vol, liq = _base_vol_spec(base), config.LIQ_LEVELS
+        variants = [{"name": "выкл (сейчас)", "patch": lambda atr: {"MAX_BODY_RATIO": None},
+                     "vol": vol, "liq": liq}]
+        for r in BODY_RATIOS:
+            variants.append({
+                "name": f"тело ≤ {r:g} размаха",
+                "patch": (lambda rr: lambda atr: {"MAX_BODY_RATIO": rr})(r),
+                "vol": vol, "liq": liq,
+            })
+        return variants
     if sweep == "liq":
         # Работают ли зоны ликвидности как уровни для пробоя, по какой цене и
         # берутся ли они ещё и в цель. Последнее — отдельный рычаг: зон много,
@@ -553,19 +576,15 @@ def summarize(signals: list[dict]) -> dict:
     Итог в R: цель даёт +фактический R:R, стоп −1, истёкшие 0. Считаем в R, а не в
     деньгах, чтобы варианты с разной шириной стопа были сравнимы между собой.
     """
-    def trade_r(s: dict) -> float:
-        """Результат сделки в R. Закрытая по неделе считается по фактической цене
-        выхода (её R — любой между −1 и +R:R), как и в /stats у бота."""
-        if s["outcome"] == "hit_tp":
-            return s["rr"]
-        if s["outcome"] == "hit_sl":
-            return -1.0
-        if s["outcome"] == "closed_week" and s.get("exit_price") is not None:
-            return trading_week.realized_r(s["direction"], s["entry_price"],
-                                           s["stop_loss"], s["exit_price"])
-        return 0.0
-
+    # Результат сделки в R считает money.trade_r — общий с денежной симуляцией,
+    # чтобы отчёт в R и отчёт в деньгах не разъезжались.
+    trade_r = money.trade_r
     per_trade = [trade_r(s) for s in signals]
+    # Итог за вычетом издержек. Без него сумму R легко переоценить: её всегда можно
+    # нарастить, добавив пограничных сделок, а каждая сделка стоит комиссии со
+    # спредом. При среднем риске ~0.5% от цены даже щадящие 0.1% туда-обратно
+    # весят ~0.2R — на сотнях сделок это десятки R. См. «Зоны ликвидности» в CLAUDE.md.
+    net = [r - money.cost_in_r(s, REF_COST) for r, s in zip(per_trade, signals)]
     tp = [s for s in signals if trade_r(s) > 0]
     sl = [s for s in signals if trade_r(s) < 0]
     week = [s for s in signals if s["outcome"] == "closed_week"]
@@ -585,7 +604,7 @@ def summarize(signals: list[dict]) -> dict:
         "n": len(signals), "tp": len(tp), "sl": len(sl), "other": len(other),
         "week": len(week),
         "winrate": len(tp) / decided if decided else 0.0,
-        "total_r": plus - minus, "se": se,
+        "total_r": plus - minus, "se": se, "net_r": sum(net),
         "pf": (plus / minus) if minus else (float("inf") if plus else 0.0),
         "avg_risk_pct": (sum(s["risk"] / s["entry_price"] for s in signals) / len(signals)
                          if signals else 0.0),
@@ -690,24 +709,30 @@ def report_overall(per_instrument: dict[str, dict[str, list[dict]]],
     print("  СВОДНО ПО ВСЕМ ИНСТРУМЕНТАМ — итог в R")
     print("═" * 96)
     print(f"  {column:<18}" + "".join(f"{c:>9}" for c in codes)
-          + f"{'сумма':>9}{'сигналов':>10}{'R/сделку':>10}{'выбило-и-поехало':>19}")
-    print("  " + "─" * 102)
+          + f"{'сумма':>9}{'сигн.':>7}{'R/сделку':>10}{'НЕТТО R':>10}{'выбило-и-поехало':>19}")
+    print("  " + "─" * 109)
     for name in names:
-        cells, total, n_all, swept_all = [], 0.0, 0, 0
+        cells, total, net, n_all, swept_all = [], 0.0, 0.0, 0, 0
         for code in codes:
             s = summarize(per_instrument[code].get(name, []))
             cells.append(f"{s['total_r']:>+9.1f}" if s["n"] else f"{'—':>9}")
             total += s["total_r"]
+            net += s["net_r"]
             n_all += s["n"]
             swept_all += s["swept"]
         share = swept_all / n_all if n_all else 0.0
         per_trade = f"{total / n_all:>+10.3f}" if n_all else f"{'—':>10}"
         print(f"  {name:<18}" + "".join(cells)
-              + f"{total:>+9.1f}{n_all:>10}{per_trade}{swept_all:>13} ({share:.0%})")
+              + f"{total:>+9.1f}{n_all:>7}{per_trade}{net:>+10.1f}"
+              + f"{swept_all:>13} ({share:.0%})")
     print("\n    «Выбило-и-поехало» — сколько сделок стоп закрыл в минус, хотя без него\n"
           "    цена дошла бы до цели. Это и есть цена узкого стопа.")
     print("    «R/сделку» — по нему сравнивают варианты с РАЗНЫМ числом сделок: сумму\n"
           "    можно нарастить, просто ослабив фильтр, а средний результат — нет.")
+    print(f"    «НЕТТО R» — итог за вычетом издержек {REF_COST * 100:g}% туда-обратно "
+          f"(щадящая оценка).\n    При среднем риске ~0.5% от цены это ~0.2R на сделку, "
+          "поэтому вариант с бо́льшим\n    числом сделок может выиграть по сумме и "
+          "проиграть по факту. Выбирать по НЕТТО.")
 
 
 def report_split(per_instrument: dict[str, dict[str, list[dict]]],
@@ -724,9 +749,9 @@ def report_split(per_instrument: dict[str, dict[str, list[dict]]],
     print("\n" + "═" * 96)
     print("  ПРОВЕРКА НА УСТОЙЧИВОСТЬ — калибровка на 1-й половине, проверка на 2-й")
     print("═" * 96)
-    print(f"  {column:<18}{'калибровка R':>16}{'сигн.':>7}{'R/сд.':>8}"
-          f"{'проверка R':>13}{'сигн.':>7}{'R/сд.':>8}{'оба плюсовые':>15}")
-    print("  " + "─" * 94)
+    print(f"  {column:<18}{'калибровка R':>16}{'сигн.':>7}{'нетто':>8}"
+          f"{'проверка R':>13}{'сигн.':>7}{'нетто':>8}{'оба нетто+':>13}")
+    print("  " + "─" * 92)
 
     rows = []
     for name in names:
@@ -736,25 +761,26 @@ def report_split(per_instrument: dict[str, dict[str, list[dict]]],
             for s in results.get(name, []):
                 (first if pd.Timestamp(s["bar_time"]) < mid else second).append(s)
         a, b = summarize(first), summarize(second)
-        ok = "да" if a["total_r"] > 0 and b["total_r"] > 0 else "нет"
+        # Устойчивость проверяем по НЕТТО: вариант, плюсовой только до вычета
+        # издержек, торговать нельзя — на счёте он даст минус.
+        ok = "да" if a["net_r"] > 0 and b["net_r"] > 0 else "нет"
         rows.append((name, a, b, ok))
-        a_pt = f"{a['total_r'] / a['n']:>+8.3f}" if a["n"] else f"{'—':>8}"
-        b_pt = f"{b['total_r'] / b['n']:>+8.3f}" if b["n"] else f"{'—':>8}"
-        print(f"  {name:<18}{a['total_r']:>+12.1f} ±{a['se']:<3.0f}{a['n']:>7}{a_pt}"
-              f"{b['total_r']:>+9.1f} ±{b['se']:<3.0f}{b['n']:>7}{b_pt}{ok:>13}")
+        print(f"  {name:<18}{a['total_r']:>+12.1f} ±{a['se']:<3.0f}{a['n']:>7}"
+              f"{a['net_r']:>+8.1f}{b['total_r']:>+9.1f} ±{b['se']:<3.0f}{b['n']:>7}"
+              f"{b['net_r']:>+8.1f}{ok:>11}")
 
-    calibrated = max(rows, key=lambda r: r[1]["total_r"])
-    print(f"\n    Лучший на калибровке: «{calibrated[0]}» ({calibrated[1]['total_r']:+.1f}R). "
-          f"На проверке он дал {calibrated[2]['total_r']:+.1f}R.")
+    calibrated = max(rows, key=lambda r: r[1]["net_r"])
+    print(f"\n    Лучший на калибровке (нетто): «{calibrated[0]}» "
+          f"({calibrated[1]['net_r']:+.1f}R). На проверке он дал {calibrated[2]['net_r']:+.1f}R.")
     survivors = [r for r in rows if r[3] == "да"]
     if survivors:
-        pick = max(survivors, key=lambda r: min(r[1]["total_r"], r[2]["total_r"]))
-        print(f"    Плюсовые на обеих половинах: {', '.join(r[0] for r in survivors)}.")
+        pick = max(survivors, key=lambda r: min(r[1]["net_r"], r[2]["net_r"]))
+        print(f"    Плюсовые нетто на обеих половинах: {', '.join(r[0] for r in survivors)}.")
         print(f"    Самый ровный (лучший худший результат): «{pick[0]}» — "
-              f"{pick[1]['total_r']:+.1f}R и {pick[2]['total_r']:+.1f}R.")
+              f"{pick[1]['net_r']:+.1f}R и {pick[2]['net_r']:+.1f}R нетто.")
     else:
-        print("    Ни один вариант не вышел в плюс на обеих половинах — "
-              "устойчивого выбора эти данные не дают.")
+        print("    Ни один вариант не вышел в плюс НЕТТО на обеих половинах — "
+              "торговать этим нельзя.")
 
 
 def report_by_source(per_instrument: dict[str, dict[str, list[dict]]],
@@ -807,13 +833,15 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
               csv_path: str | None, week_filter: bool = True,
               trend_d1: bool = False, use_cache: bool = True,
               risk_filter: bool = True, sweep: str = "stop",
-              by_source: bool = False) -> None:
+              by_source: bool = False, money_report: bool = False) -> None:
     variants = build_variants(sweep, base)
     names = [v["name"] for v in variants]
     title, column = {"vol": ("ПОРОГА ОБЪЁМА", "порог объёма"),
                      "liq": ("ЗОН ЛИКВИДНОСТИ", "зоны как уровни"),
+                     "body": ("ФИЛЬТРА «ПОГЛОЩЕНИЕ»", "тело свечи"),
                      "stop": ("СТОПА", "буфер")}[sweep]
     what = {"vol": "порог аномального объёма", "liq": "зоны ликвидности как уровни",
+            "body": "фильтр «поглощение» (тело свечи пробоя)",
             "stop": "запас стопа"}[sweep]
     print(f"Перебираем:     {what} ({len(variants)} вариантов)")
     print(f"Объём:          {vol_rule_text(base)}")
@@ -851,6 +879,12 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
     report_split(per_instrument, mids, names, column)
     if by_source:
         report_by_source(per_instrument, mids, names, column)
+    if money_report and per_instrument:
+        # Сначала сравнение вариантов в деньгах (при каких издержках вариант жив),
+        # затем подробный разбор БОЕВОГО варианта (первый в списке — «сейчас»).
+        if len(names) > 1:
+            money.compare(per_instrument, names, column)
+        money.report({c: r.get(names[0], []) for c, r in per_instrument.items()}, mids)
     if csv_path and all_rows:
         write_csv(csv_path, all_rows)
     # Форекс грузится штатным data_fetcher — закрываем его соединения с биржей
@@ -893,13 +927,17 @@ def main() -> None:
                         "прогон «как было», для сравнения")
     p.add_argument("--no-cache", action="store_true",
                    help="не использовать кеш истории в .backtest_cache/ — скачать заново")
+    p.add_argument("--money", action="store_true",
+                   help="перевести результат из R в деньги: итоговый счёт, максимальная "
+                        "просадка, серия убытков, сделок в месяц — с учётом издержек")
     p.add_argument("--by-source", action="store_true",
                    help="дополнительно показать сравнение отдельно по источнику объёма "
                         "(биржа Kraken против Yahoo) — проверить, нужен ли разный порог")
-    p.add_argument("--sweep", choices=("stop", "vol", "liq"), default="stop",
+    p.add_argument("--sweep", choices=("stop", "vol", "liq", "body"), default="stop",
                    help="что перебирать: stop — запас стопа (по умолчанию), "
                         "vol — порог аномального объёма (множитель против процентиля), "
-                        "liq — зоны ликвидности как уровни для пробоя (выкл/середина/край)")
+                        "liq — зоны ликвидности как уровни для пробоя (выкл/середина/край), "
+                        "body — фильтр «поглощение» (тело свечи пробоя ≤ доли размаха)")
     args = p.parse_args()
 
     # Окно входа подменяем в config: trading_week читает его на каждый вызов.
@@ -929,7 +967,7 @@ def main() -> None:
 
     asyncio.run(run(codes, args.bars, base, args.horizon, args.csv,
                     not args.no_week, args.trend_d1, not args.no_cache,
-                    not args.no_risk_filter, args.sweep, args.by_source))
+                    not args.no_risk_filter, args.sweep, args.by_source, args.money))
 
 
 if __name__ == "__main__":

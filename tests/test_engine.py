@@ -87,6 +87,13 @@ def test_find_liquidity_zones():
 # (тренд, объём, R:R, стоп), поэтому фильтр им отключаем — у него свои тесты.
 NO_RISK_FILTER = {"MAX_RISK_ATR": None}
 
+# Фикстуры ниже проходят и боевой фильтр «поглощение» (config.MAX_BODY_RATIO=0.15):
+# у свечи пробоя тело 0.1 при размахе 0.8–1.7, то есть 0.06–0.13 размаха. Это не
+# случайность — так выглядит пружина по VSA. Если будешь добавлять фикстуру, где
+# свеча пробоя закрывается далеко от открытия, детектор её забракует, и тест упадёт
+# не по той причине, которую проверяет: тогда фильтр надо отключить явно
+# ({"MAX_BODY_RATIO": None}), как это сделано для фильтра цены входа.
+
 
 def _spring_df() -> pd.DataFrame:
     rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
@@ -201,6 +208,74 @@ def test_spring_fallback_target_min_rr():
     risk = sig["entry_price"] - sig["stop_loss"]
     expected_tp = sig["entry_price"] + risk * config.get("MIN_RR")
     assert abs(sig["take_profit"] - expected_tp) < 1e-9
+
+
+# ── Пресеты /settings (частота сигналов, вход вдогонку) ─────────────────────
+
+def test_sensitivity_presets_round_trip():
+    """Каждый пресет узнаётся обратно по действующим порогам — иначе меню
+    показывало бы «средне» на любом положении кнопок."""
+    for name, (_, values) in config.SENSITIVITY.items():
+        assert config.sensitivity_of(config.effective(values)) == name
+
+
+def test_sensitivity_presets_stay_in_measured_range():
+    """Кнопки двигают порог объёма только внутри диапазона, который прошёл
+    проверку на устойчивость (P60–P80). За его границами замер разваливается."""
+    for _, values in config.SENSITIVITY.values():
+        assert 60 <= values["VOL_PCTL"] <= 80
+
+
+def test_sensitivity_unknown_combo_falls_back_to_mid():
+    assert config.sensitivity_of({"VOL_PCTL": 42, "BREAK_PCT": 0.0005}) == "mid"
+
+
+def test_chase_filter_toggles_off_with_zero():
+    """«Не входить вдогонку: выкл» пишет 0 — в БД нельзя положить None."""
+    df = _spring_df()          # у него риск ≈ 1.85×ATR, это вход вдогонку
+    assert pattern_detector.detect_spring(
+        df, _SUPPORT_AND_TARGET, trend="up", settings=config.effective()) is None
+    assert pattern_detector.detect_spring(
+        df, _SUPPORT_AND_TARGET, trend="up",
+        settings=config.effective({"MAX_RISK_ATR": 0})) is not None
+
+
+# ── Фильтр «поглощение» (тело свечи пробоя мало относительно размаха) ───────
+
+def _body_df(open_price: float) -> pd.DataFrame:
+    """Пружина с размахом 1.7 (99.0…100.7); тело задаётся ценой открытия."""
+    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
+    rows[23] = (open_price, 100.7, 99.0, 100.5, 300.0)
+    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)
+    return _df(rows)
+
+
+_BODY_LEVELS = [{"price": 100.0, "type": "support", "strength": "strong"},
+                {"price": 110.0, "type": "resistance", "strength": "weak"}]
+
+
+def test_absorption_passes_small_body():
+    # open 100.4, close 100.5 → тело 0.1 при размахе 1.7 ≈ 0.06 размаха.
+    sig = pattern_detector.detect_spring(
+        _body_df(100.4), _BODY_LEVELS, trend="up",
+        settings={"MAX_BODY_RATIO": 0.3, **NO_RISK_FILTER})
+    assert sig is not None
+
+
+def test_absorption_rejects_large_body():
+    # open 99.2, close 100.5 → тело 1.3 при размахе 1.7 ≈ 0.76 размаха.
+    sig = pattern_detector.detect_spring(
+        _body_df(99.2), _BODY_LEVELS, trend="up",
+        settings={"MAX_BODY_RATIO": 0.3, **NO_RISK_FILTER})
+    assert sig is None
+
+
+def test_absorption_off_by_default():
+    """None отключает фильтр — свеча с большим телом проходит."""
+    sig = pattern_detector.detect_spring(
+        _body_df(99.2), _BODY_LEVELS, trend="up",
+        settings={"MAX_BODY_RATIO": None, **NO_RISK_FILTER})
+    assert sig is not None
 
 
 # ── Зоны ликвидности как уровни для пробоя ──────────────────────────────────

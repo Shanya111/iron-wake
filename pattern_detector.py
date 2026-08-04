@@ -148,6 +148,17 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     if not _volume_ok(df, pos, s, vol_mult):
         return None
 
+    # Фильтр «поглощение» (VSA): тело свечи маленькое относительно её размаха —
+    # цена сходила далеко, а закрылась почти там же, откуда открылась. По методике
+    # это и есть признак, что крупный игрок принял весь объём. None — фильтр выключен.
+    max_body = s.get("MAX_BODY_RATIO", config.MAX_BODY_RATIO)
+    if max_body is not None:
+        span = h - l
+        if span <= 0:
+            return None
+        if abs(c - float(candle["open"])) / span > max_body:
+            return None
+
     # ATR считаем только здесь, когда свеча уже прошла фильтр объёма — на каждом
     # баре подряд это была бы лишняя работа.
     atr = _atr(df, pos, config.STOP_ATR_PERIOD)
