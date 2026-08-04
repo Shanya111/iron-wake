@@ -313,7 +313,8 @@ def measure_excursion(signal: dict, future: pd.DataFrame) -> dict:
 # ── Прогон ──────────────────────────────────────────────────────────────────
 
 def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
-           week_filter: bool = True, trend_d1: bool = False) -> dict[str, list[dict]]:
+           week_filter: bool = True, trend_d1: bool = False,
+           risk_filter: bool = True) -> dict[str, list[dict]]:
     """Прогон истории бар за баром: сигналы каждого варианта стопа + их исходы.
 
     week_filter=True (как в бою) — входы только пн–чт, а сделка, не отработавшая
@@ -382,6 +383,8 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
             if settings is None:
                 continue
             settings["WEEK_FILTER"] = week_filter
+            # None отключает фильтр цены входа — прогон «как было», для сравнения.
+            settings["MAX_RISK_ATR"] = config.MAX_RISK_ATR if risk_filter else None
             for detector in (pattern_detector.detect_spring, pattern_detector.detect_upthrust):
                 signal = detector(window, levels, trend, settings)
                 if signal is None:
@@ -629,7 +632,8 @@ def write_csv(path: str, rows: list[dict]) -> None:
 
 async def run(codes: list[str], bars: int, base: dict, horizon: int,
               csv_path: str | None, week_filter: bool = True,
-              trend_d1: bool = False, use_cache: bool = True) -> None:
+              trend_d1: bool = False, use_cache: bool = True,
+              risk_filter: bool = True) -> None:
     print("Недельное окно: " + ("ВКЛ — входы пн–чт, пятничное закрытие гасит сделку"
                                 if week_filter else "ВЫКЛ — как было до окна"))
     print("Фильтр тренда:  " + ("по ДНЕВКЕ (D1) — как было до недельного горизонта"
@@ -637,6 +641,8 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
     days = "".join("пнвтсрчтптсбвс"[i * 2:i * 2 + 2] for i in range(7)
                    if i not in config.NO_ENTRY_WEEKDAYS)
     print(f"Окно входа:     {days or 'нет разрешённых дней'}")
+    print("Фильтр входа:   " + (f"риск ≤ {config.MAX_RISK_ATR}×ATR — как в бою"
+                                if risk_filter else "ВЫКЛ — как было до фильтра"))
     all_rows: list[dict] = []
     per_instrument: dict[str, dict[str, list[dict]]] = {}
     mids: dict[str, pd.Timestamp] = {}   # середина истории — граница калибровка/проверка
@@ -650,7 +656,7 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
             print(f"\n{code}: слишком мало свечей ({len(h1)}) — пропускаем")
             continue
         print(f"\n{code}: прогоняю {len(h1)} свечей × {len(STOP_VARIANTS)} вариантов стопа…")
-        results = replay(h1, d1, base, horizon, week_filter, trend_d1)
+        results = replay(h1, d1, base, horizon, week_filter, trend_d1, risk_filter)
         per_instrument[code] = results
         mids[code] = h1.index[0] + (h1.index[-1] - h1.index[0]) / 2
         report_instrument(code, h1, source, base, results)
@@ -692,6 +698,9 @@ def main() -> None:
                    help="дни недели, когда вход РАЗРЕШЁН (0=пн): «0,1,2» — только пн–ср. "
                         "По умолчанию из config.NO_ENTRY_WEEKDAYS (сейчас пн–чт). "
                         "Нужно, чтобы подобрать окно входа замером, а не на глаз")
+    p.add_argument("--no-risk-filter", action="store_true",
+                   help="отключить фильтр цены входа (риск ≤ MAX_RISK_ATR×ATR) — "
+                        "прогон «как было», для сравнения")
     p.add_argument("--no-cache", action="store_true",
                    help="не использовать кеш истории в .backtest_cache/ — скачать заново")
     args = p.parse_args()
@@ -717,7 +726,8 @@ def main() -> None:
             base[key] = val
 
     asyncio.run(run(codes, args.bars, base, args.horizon, args.csv,
-                    not args.no_week, args.trend_d1, not args.no_cache))
+                    not args.no_week, args.trend_d1, not args.no_cache,
+                    not args.no_risk_filter))
 
 
 if __name__ == "__main__":

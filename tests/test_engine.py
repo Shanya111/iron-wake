@@ -81,6 +81,13 @@ def test_find_liquidity_zones():
 
 # ── Spring / Upthrust ────────────────────────────────────────────────────────
 
+# Синтетические свечи пробоя нарочно с большим фитилём — так паттерн однозначен.
+# В бою такой вход отсекает фильтр цены входа (риск ≤ MAX_RISK_ATR×ATR, см. config):
+# он бракует именно аномально размашистые свечи. Тесты ниже проверяют ДРУГУЮ логику
+# (тренд, объём, R:R, стоп), поэтому фильтр им отключаем — у него свои тесты.
+NO_RISK_FILTER = {"MAX_RISK_ATR": None}
+
+
 def _spring_df() -> pd.DataFrame:
     rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
     # Последняя ЗАКРЫТАЯ свеча (индекс -2 = 23): пробой поддержки 100 вниз,
@@ -96,7 +103,7 @@ def test_detect_spring():
         {"price": 100.0, "type": "support", "strength": "strong"},
         {"price": 110.0, "type": "resistance", "strength": "weak"},
     ]
-    sig = pattern_detector.detect_spring(df, levels, trend="up")
+    sig = pattern_detector.detect_spring(df, levels, trend="up", settings=NO_RISK_FILTER)
     assert sig is not None
     assert sig["direction"] == "long"
     assert sig["priority"] == "high"               # пробитый уровень сильный
@@ -108,14 +115,70 @@ def test_detect_spring():
 def test_spring_filtered_by_downtrend():
     df = _spring_df()
     levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
-    assert pattern_detector.detect_spring(df, levels, trend="down") is None
+    assert pattern_detector.detect_spring(df, levels, trend="down", settings=NO_RISK_FILTER) is None
 
 
 def test_spring_needs_abnormal_volume():
     df = _spring_df()
     df.iloc[23, df.columns.get_loc("volume")] = 100.0   # объём как у соседей — не Spring
     levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
-    assert pattern_detector.detect_spring(df, levels, trend="up") is None
+    assert pattern_detector.detect_spring(df, levels, trend="up", settings=NO_RISK_FILTER) is None
+
+
+# ── Фильтр цены входа (риск ≤ MAX_RISK_ATR × ATR) ───────────────────────────
+
+def _tight_spring_df() -> pd.DataFrame:
+    """Аккуратная пружина: свеча пробоя не крупнее соседних, вход рядом с уровнем.
+    Риск (закрытие → минимум + запас) ≈ 0.70 при ATR ≈ 0.80, то есть внутри 1×ATR."""
+    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
+    rows[23] = (100.4, 100.7, 99.9, 100.5, 300.0)   # сходили под 100 и вернулись
+    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)   # формирующаяся
+    return _df(rows)
+
+
+_SUPPORT_AND_TARGET = [
+    {"price": 100.0, "type": "support", "strength": "strong"},
+    {"price": 110.0, "type": "resistance", "strength": "weak"},
+]
+
+
+def test_entry_filter_allows_tight_spring():
+    """Вход рядом с уровнем проходит фильтр — это и есть рабочий сетап."""
+    sig = pattern_detector.detect_spring(_tight_spring_df(), _SUPPORT_AND_TARGET, trend="up")
+    assert sig is not None
+    risk = sig["entry_price"] - sig["stop_loss"]
+    atr = pattern_detector._atr(_tight_spring_df(), 23, config.STOP_ATR_PERIOD)
+    assert risk <= atr * config.MAX_RISK_ATR
+
+
+def test_entry_filter_rejects_oversized_break_candle():
+    """Свеча пробоя вдвое размашистее соседних → вход далеко от уровня, бракуем.
+    Именно эти сделки убыточны по бэктесту (см. config.MAX_RISK_ATR)."""
+    df = _spring_df()          # у него риск ≈ 1.85×ATR
+    atr = pattern_detector._atr(df, 23, config.STOP_ATR_PERIOD)
+    risk = 100.5 - 99.0 + 99.0 * config.STOP_SPREAD
+    assert risk > atr * config.MAX_RISK_ATR, "фикстура должна быть за порогом"
+    assert pattern_detector.detect_spring(df, _SUPPORT_AND_TARGET, trend="up") is None
+
+
+def test_entry_filter_can_be_disabled():
+    """MAX_RISK_ATR=None снимает фильтр — нужно бэктесту (--no-risk-filter) и тестам
+    другой логики, которые пользуются нарочно размашистыми фикстурами."""
+    df = _spring_df()
+    assert pattern_detector.detect_spring(
+        df, _SUPPORT_AND_TARGET, trend="up", settings={"MAX_RISK_ATR": None}) is not None
+
+
+def test_entry_filter_mirrors_for_upthrust():
+    """Шорт считает риск вверх от закрытия до максимума — зеркально лонгу."""
+    rows = [(99.5, 99.8, 99.0, 99.4, 100.0) for _ in range(25)]
+    rows[23] = (99.6, 102.0, 99.5, 99.5, 300.0)    # огромный вынос вверх → вход далеко
+    rows[24] = (99.5, 99.7, 99.2, 99.4, 50.0)
+    levels = [{"price": 100.0, "type": "resistance", "strength": "strong"},
+              {"price": 90.0, "type": "support", "strength": "weak"}]
+    assert pattern_detector.detect_upthrust(_df(rows), levels, trend="down") is None
+    assert pattern_detector.detect_upthrust(
+        _df(rows), levels, trend="down", settings={"MAX_RISK_ATR": None}) is not None
 
 
 def test_spring_filtered_by_bad_rr():
@@ -126,14 +189,14 @@ def test_spring_filtered_by_bad_rr():
         {"price": 100.0, "type": "support", "strength": "strong"},
         {"price": 101.5, "type": "resistance", "strength": "weak"},
     ]
-    assert pattern_detector.detect_spring(df, levels, trend="up") is None
+    assert pattern_detector.detect_spring(df, levels, trend="up", settings=NO_RISK_FILTER) is None
 
 
 def test_spring_fallback_target_min_rr():
     # Сопротивления впереди нет → цель ставится ровно на MIN_RR × риск.
     df = _spring_df()
     levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
-    sig = pattern_detector.detect_spring(df, levels, trend="up")
+    sig = pattern_detector.detect_spring(df, levels, trend="up", settings=NO_RISK_FILTER)
     assert sig is not None
     risk = sig["entry_price"] - sig["stop_loss"]
     expected_tp = sig["entry_price"] + risk * config.get("MIN_RR")
@@ -154,7 +217,7 @@ def test_detect_upthrust():
         {"price": 100.0, "type": "resistance", "strength": "strong"},
         {"price": 90.0, "type": "support", "strength": "weak"},
     ]
-    sig = pattern_detector.detect_upthrust(df, levels, trend="down")
+    sig = pattern_detector.detect_upthrust(df, levels, trend="down", settings=NO_RISK_FILTER)
     assert sig is not None
     assert sig["direction"] == "short"
     assert abs(sig["entry_price"] - 99.5) < 1e-9
@@ -165,7 +228,7 @@ def test_detect_upthrust():
 def test_upthrust_filtered_by_uptrend():
     df = _upthrust_df()
     levels = [{"price": 100.0, "type": "resistance", "strength": "strong"}]
-    assert pattern_detector.detect_upthrust(df, levels, trend="up") is None
+    assert pattern_detector.detect_upthrust(df, levels, trend="up", settings=NO_RISK_FILTER) is None
 
 
 # ── Трекинг исхода сигналов (evaluate_signal) ────────────────────────────────

@@ -145,7 +145,7 @@ def _spring_setup():
 def test_stop_spread_override_widens_stop():
     """STOP_SPREAD из настроек переопределяет config.STOP_SPREAD."""
     df, levels = _spring_setup()
-    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5}
+    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5, "MAX_RISK_ATR": None}
     narrow = pattern_detector.detect_spring(df, levels, "sideways", {**base, "STOP_SPREAD": 0.001})
     wide = pattern_detector.detect_spring(df, levels, "sideways", {**base, "STOP_SPREAD": 0.01})
     assert narrow is not None and wide is not None
@@ -157,7 +157,7 @@ def test_stop_spread_override_widens_stop():
 def test_stop_abs_beats_percent():
     """STOP_ABS (например k×ATR) задаёт запас абсолютным числом и главнее процента."""
     df, levels = _spring_setup()
-    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5}
+    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5, "MAX_RISK_ATR": None}
     sig = pattern_detector.detect_spring(
         df, levels, "sideways", {**base, "STOP_SPREAD": 0.001, "STOP_ABS": 2.0})
     assert sig is not None
@@ -180,7 +180,7 @@ def test_default_stop_is_pct():
     проценту и по сумме R, и на сделку, и на обеих половинах истории (см. config)."""
     assert config.STOP_MODE == "pct"
     df, levels = _spring_setup()
-    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5}
+    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5, "MAX_RISK_ATR": None}
     sig = pattern_detector.detect_spring(df, levels, "sideways", base)
     assert sig is not None
     assert round(sig["stop_loss"], 6) == round(98.0 * (1 - config.STOP_SPREAD), 6)
@@ -190,7 +190,7 @@ def test_atr_mode_uses_atr():
     """Режим STOP_MODE='atr' считает запас в долях ATR. Сейчас не включён, но
     механизм рабочий — на нём гоняются ATR-варианты в бэктесте."""
     df, levels = _spring_setup()
-    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5}
+    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5, "MAX_RISK_ATR": None}
     sig = _detect_in_mode("atr", df, levels, base)
     assert sig is not None
     atr = pattern_detector._atr(df, len(df) - 2, config.STOP_ATR_PERIOD)
@@ -207,7 +207,7 @@ def test_atr_stop_scales_with_volatility():
     # Раздуваем размах свечей ДО пробоя, сам пробой и уровень не трогаем.
     for col, shift in (("high", +2.0), ("low", -2.0)):
         wild.iloc[:-2, wild.columns.get_loc(col)] = quiet[col].iloc[:-2] + shift
-    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5}
+    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5, "MAX_RISK_ATR": None}
     a = _detect_in_mode("atr", quiet, levels, base)
     b = _detect_in_mode("atr", wild, levels, base)
     assert a is not None and b is not None
@@ -217,7 +217,7 @@ def test_atr_stop_scales_with_volatility():
 def test_wider_stop_lowers_rr():
     """Расширение стопа не бесплатно: тот же вход даёт меньший R:R."""
     df, levels = _spring_setup()
-    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.0}
+    base = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.0, "MAX_RISK_ATR": None}
     narrow = pattern_detector.detect_spring(df, levels, "sideways", {**base, "STOP_SPREAD": 0.001})
     wide = pattern_detector.detect_spring(df, levels, "sideways", {**base, "STOP_SPREAD": 0.01})
     risk_n = narrow["entry_price"] - narrow["stop_loss"]

@@ -113,7 +113,9 @@ def _spring_rows() -> list[tuple]:
 
 LEVELS = [{"price": 100.0, "type": "support", "strength": "strong",
            "is_liquidity": 0, "timeframe": "H1"}]
-BASE = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5}
+# MAX_RISK_ATR=None — у фикстуры нарочно размашистая свеча пробоя, и фильтр
+# цены входа забраковал бы её раньше недельного окна. Здесь проверяется окно.
+BASE = {"VOL_MULT": 1.5, "BREAK_PCT": 0.0005, "MIN_RR": 1.5, "MAX_RISK_ATR": None}
 
 
 def _detect_with_break_at(day: str, hour: int):

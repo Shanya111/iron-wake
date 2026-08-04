@@ -111,13 +111,27 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     if avg_vol <= 0 or vol < avg_vol * vol_mult:
         return None
 
-    # Запас стопа в долях ATR. Считаем только здесь, когда свеча уже прошла все
-    # фильтры — на каждом баре подряд это была бы лишняя работа. Если ATR посчитать
-    # не на чем (плоские свечи, короткая история), молча падаем на процент.
-    if use_atr:
-        atr = _atr(df, pos, config.STOP_ATR_PERIOD)
-        if atr > 0:
-            stop_abs = atr * config.STOP_ATR_MULT
+    # ATR считаем только здесь, когда свеча уже прошла фильтр объёма — на каждом
+    # баре подряд это была бы лишняя работа.
+    atr = _atr(df, pos, config.STOP_ATR_PERIOD)
+    # Запас стопа в долях ATR (если включён режим "atr"). Не на чем посчитать
+    # (плоские свечи, короткая история) — молча падаем на процент.
+    if use_atr and atr > 0:
+        stop_abs = atr * config.STOP_ATR_MULT
+
+    # Фильтр цены входа: риск (закрытие → экстремум свечи пробоя + запас) не должен
+    # превышать MAX_RISK_ATR × ATR. Смысл не статистический, а механический: если
+    # свеча пробоя аномально большая, вход по её закрытию оказывается далеко от
+    # уровня — в конце размашистого бара. Пружина торгуется ОТ уровня, а не вдогонку,
+    # и такие «догоняющие» входы в бэктесте суммарно теряют (−15.4R на 63 сделках,
+    # минус на обеих половинах истории). Риск от уровня не зависит (вход — закрытие,
+    # стоп — экстремум той же свечи), поэтому считаем один раз до перебора уровней.
+    max_risk_atr = s.get("MAX_RISK_ATR", config.MAX_RISK_ATR)
+    if atr > 0 and max_risk_atr:
+        buffer = stop_abs if stop_abs is not None else (l if side == "long" else h) * stop_spread
+        risk_now = (c - l + buffer) if side == "long" else (h - c + buffer)
+        if risk_now > atr * max_risk_atr:
+            return None
 
     level_type = "support" if side == "long" else "resistance"
     relevant = [lvl for lvl in levels if lvl["type"] == level_type]
