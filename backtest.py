@@ -346,10 +346,14 @@ def _vol_mask(h1: pd.DataFrame, spec: tuple) -> pd.Series:
     """
     vol = h1["volume"]
     if spec[0] == "mult":
-        avg = vol.rolling(config.VOL_LOOKBACK).mean().shift(1)
+        avg = vol.rolling(config.VOL_LOOKBACK, min_periods=1).mean().shift(1)
         return vol >= avg * spec[1]
     _, pctl, window = spec
-    threshold = vol.rolling(window).quantile(pctl / 100).shift(1)
+    # min_periods — ровно то же требование, что у детектора (не меньше VOL_LOOKBACK
+    # свечей). Без него rolling(100) молчит первые 99 баров, и вариант с длинным
+    # окном терял бы сигналы начала истории, которых вариант с коротким окном не
+    # терял, — то есть варианты сравнивались бы на разных отрезках.
+    threshold = vol.rolling(window, min_periods=config.VOL_LOOKBACK).quantile(pctl / 100).shift(1)
     return vol > threshold
 
 
