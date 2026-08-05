@@ -63,6 +63,15 @@ HISTORY_EXCHANGE = {
     "ETH": [("bitfinex", "ETH/USD"), ("bitstamp", "ETH/USD"), ("kucoin", "ETH/USDT")],
     "SOL": [("bitfinex", "SOL/USD"), ("bitstamp", "SOL/USD"), ("kucoin", "SOL/USDT")],
     "TON": [("bitfinex", "TON/USD"), ("gate", "TON/USDT")],
+    # Форекс. В бою пары берутся с Kraken, но он отдаёт максимум 720 часовых свечей
+    # (30 дней) — на таком отрезке форекс невозможно было проверить, и он выпадал из
+    # всех выводов. Bitstamp отдаёт EUR/USD и GBP/USD постранично на год назад с
+    # настоящим объёмом. Остальных пар (AUD/USD, USD/CAD, USD/JPY) нет ни у одной
+    # доступной биржи с глубокой историей — они так и остаются непроверенными.
+    # ВНИМАНИЕ по GBP/USD: у Bitstamp там ~20% свечей с НУЛЕВЫМ объёмом, а объём —
+    # основа фильтра. Выводы по нему заведомо слабее, чем по EUR/USD (0% нулей).
+    "EURUSD": [("bitstamp", "EUR/USD")],
+    "GBPUSD": [("bitstamp", "GBP/USD")],
 }
 
 # Варианты запаса стопа за экстремум свечи пробоя.
@@ -182,6 +191,19 @@ async def _fetch_paged(exchange: str, symbol: str, timeframe: str, bars: int) ->
     return df.drop(columns=["ts"])
 
 
+def _cache_key(code: str) -> str:
+    """Метка источника в имени файла кеша.
+
+    Без неё смена источника проходит НЕЗАМЕТНО: файл называется одинаково, кеш
+    отдаёт старые данные, и прогон молча считает не то, что ты думаешь. Именно так
+    первый прогон форекса вернул 720 свечей Kraken вместо годовой истории Bitstamp
+    и показал ноль сигналов.
+    """
+    if code in HISTORY_EXCHANGE:
+        return HISTORY_EXCHANGE[code][0][0]      # первая биржа списка
+    return data_source(code) or "none"
+
+
 async def load_history(code: str, bars: int,
                        use_cache: bool = True) -> tuple[pd.DataFrame, pd.DataFrame, str]:
     """H1 и D1 свечи инструмента на максимальную доступную глубину + описание источника.
@@ -197,7 +219,7 @@ async def load_history(code: str, bars: int,
     смешается с разницей выборок. Плюс биржа не банит за повторные закачки.
     `--no-cache` качает заново.
     """
-    cached = CACHE_DIR / f"{code}_{bars}.pkl"
+    cached = CACHE_DIR / f"{code}_{bars}_{_cache_key(code)}.pkl"
     if use_cache and cached.exists():
         h1, d1, source = pd.read_pickle(cached)
         age = (time.time() - cached.stat().st_mtime) / 3600
