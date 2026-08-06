@@ -10,7 +10,8 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (TelegramBadRequest, TelegramForbiddenError,
+                                TelegramRetryAfter)
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
@@ -131,14 +132,16 @@ def confirm_keyboard() -> InlineKeyboardMarkup:
 
 
 def pairs_keyboard() -> InlineKeyboardMarkup:
-    """Список инструментов кнопками (по 2 в ряд) + своя пара + отмена.
+    """Список инструментов кнопками (по 3 в ряд) + своя пара + отмена.
+    Три, а не два: инструментов стало 20, и по два в ряд список превращается
+    в простыню на десять экранов. Названия для этого держим короткими.
     Цены здесь НЕ запрашиваем — только названия, чтобы не дёргать Yahoo зря."""
     codes = list(INSTRUMENTS.keys())
     rows = []
-    for i in range(0, len(codes), 2):
+    for i in range(0, len(codes), 3):
         rows.append([
             InlineKeyboardButton(text=INSTRUMENTS[c]["name"], callback_data=f"alertpair_{c}")
-            for c in codes[i:i + 2]
+            for c in codes[i:i + 3]
         ])
     rows.append([InlineKeyboardButton(text="✏️ Своя пара", callback_data="alertpair_custom")])
     rows.append([InlineKeyboardButton(text="Отмена", callback_data="alertpair_cancel")])
@@ -779,18 +782,25 @@ async def cb_close_trade(call: CallbackQuery):
 # ── Торговый движок: анализ, подписки, сигналы, настройки ───────────────────────
 
 def engine_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKeyboardMarkup:
-    """Кнопки инструментов движка — крипта + форекс (по 2 в ряд). prefix — начало
-    callback_data. Если передан subscribed — отмечает галочкой подписанные (для /subscribe)."""
+    """Кнопки инструментов движка (по 3 в ряд). prefix — начало callback_data.
+    Если передан subscribed — отмечает галочкой подписанные и добавляет снизу
+    массовые кнопки: инструментов 16, и подписываться на каждый отдельным тычком
+    — это 16 нажатий, чего никто делать не станет."""
     codes = engine_codes()
     rows = []
-    for i in range(0, len(codes), 2):
+    for i in range(0, len(codes), 3):
         row = []
-        for c in codes[i:i + 2]:
+        for c in codes[i:i + 3]:
             mark = "✅ " if subscribed and c in subscribed else ""
             row.append(InlineKeyboardButton(
                 text=f"{mark}{INSTRUMENTS[c]['name']}", callback_data=f"{prefix}{c}"
             ))
         rows.append(row)
+    if subscribed is not None:
+        rows.append([
+            InlineKeyboardButton(text="✅ Подписаться на всё", callback_data=f"{prefix}__all"),
+            InlineKeyboardButton(text="🚫 Отписаться от всего", callback_data=f"{prefix}__none"),
+        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1029,6 +1039,32 @@ async def cmd_subscribe(message: Message):
 @dp.callback_query(F.data.startswith("subtoggle_"))
 async def cb_subtoggle(call: CallbackQuery):
     code = call.data.removeprefix("subtoggle_")
+
+    # Массовые кнопки. Коды инструментов — заглавные буквы, поэтому «__all»/«__none»
+    # с ними не столкнутся ни при каком расширении реестра.
+    if code in ("__all", "__none"):
+        subs = set(database.get_user_subscriptions(call.from_user.id))
+        if code == "__all":
+            for c in engine_codes():
+                if c not in subs:
+                    database.add_subscription(call.from_user.id, c)
+            subs = set(engine_codes())
+            await call.answer("Подписал на все инструменты")
+        else:
+            for c in subs:
+                database.remove_subscription(call.from_user.id, c)
+            subs = set()
+            await call.answer("Отписал от всех")
+        # Повторное нажатие той же кнопки клавиатуру не меняет, а Telegram на
+        # правку «в то же самое» отвечает ошибкой. Для пользователя это не ошибка:
+        # он нажал «подписаться на всё», уже будучи подписанным на всё.
+        try:
+            await call.message.edit_reply_markup(
+                reply_markup=engine_keyboard("subtoggle_", subs))
+        except TelegramBadRequest:
+            pass
+        return
+
     if code not in engine_codes():
         await call.answer()
         return

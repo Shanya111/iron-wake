@@ -63,6 +63,20 @@ HISTORY_EXCHANGE = {
     "ETH": [("bitfinex", "ETH/USD"), ("bitstamp", "ETH/USD"), ("kucoin", "ETH/USDT")],
     "SOL": [("bitfinex", "SOL/USD"), ("bitstamp", "SOL/USD"), ("kucoin", "SOL/USDT")],
     "TON": [("bitfinex", "TON/USD"), ("gate", "TON/USDT")],
+    # Расширение набора (6 августа 2026). Каждая пара берётся с Bitfinex — только там
+    # у всех десяти есть годовая почасовая история с объёмом; KuCoin на USDT-парах
+    # оставлен запасным, т.к. биржа временно банит по рейт-лимиту, и без запасного
+    # инструмент молча выпал бы из прогона (а выводы делались бы по половине набора).
+    "XRP":  [("bitfinex", "XRP/USD"),  ("kucoin", "XRP/USDT")],
+    "ADA":  [("bitfinex", "ADA/USD"),  ("kucoin", "ADA/USDT")],
+    "XLM":  [("bitfinex", "XLM/USD"),  ("kucoin", "XLM/USDT")],
+    "AVAX": [("bitfinex", "AVAX/USD"), ("kucoin", "AVAX/USDT")],
+    "SUI":  [("bitfinex", "SUI/USD"),  ("kucoin", "SUI/USDT")],
+    "UNI":  [("bitfinex", "UNI/USD"),  ("kucoin", "UNI/USDT")],
+    "LTC":  [("bitfinex", "LTC/USD"),  ("kucoin", "LTC/USDT")],
+    "AAVE": [("bitfinex", "AAVE/USD"), ("kucoin", "AAVE/USDT")],
+    "DOGE": [("bitfinex", "DOGE/USD"), ("kucoin", "DOGE/USDT")],
+    "LINK": [("bitfinex", "LINK/USD"), ("kucoin", "LINK/USDT")],
     # Форекс. В бою пары берутся с Kraken, но он отдаёт максимум 720 часовых свечей
     # (30 дней) — на таком отрезке форекс невозможно было проверить, и он выпадал из
     # всех выводов. Bitstamp отдаёт EUR/USD и GBP/USD постранично на год назад с
@@ -512,12 +526,16 @@ def measure_excursion(signal: dict, future: pd.DataFrame) -> dict:
 
 def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
            variants: list[dict], week_filter: bool = True, trend_d1: bool = False,
-           risk_filter: bool = True) -> tuple[dict[str, list[dict]], dict[str, int]]:
+           risk_filter: bool | None = None) -> tuple[dict[str, list[dict]], dict[str, int]]:
     """Прогон истории бар за баром: сигналы каждого варианта + их исходы.
 
-    week_filter=True (как в бою) — входы только пн–чт, а сделка, не отработавшая
-    к пятничному закрытию, гасится по рынку (статус 'closed_week'). False — как
-    было до недельного окна, для сравнения.
+    week_filter=True (как в бою) — входы пн–чт плюс пятница до полудня по Москве,
+    а сделка, не отработавшая к пятничному закрытию, гасится по рынку (статус
+    'closed_week'). False — как было до недельного окна, для сравнения.
+
+    risk_filter=None (по умолчанию) — фильтр цены входа берётся ИЗ НАСТРОЕК, то
+    есть ровно как в бою; сейчас там выключено. True/False принудительно включают
+    и выключают его — этим и сравниваем, во что обходится решение.
 
     trend_d1=False (как в бою) — фильтр направления по часовому тренду. True —
     по дневному, как было до перехода на недельный горизонт: даёт сравнить, что
@@ -594,8 +612,13 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
             name = variant["name"]
             settings = {**base, **patch}
             settings["WEEK_FILTER"] = week_filter
-            # None отключает фильтр цены входа — прогон «как было», для сравнения.
-            settings["MAX_RISK_ATR"] = config.MAX_RISK_ATR if risk_filter else None
+            # Фильтр цены входа. Ничего не трогаем (None) — значение приходит из
+            # base, то есть из боевых настроек: прогон повторяет бой. Явные True/
+            # False принудительно включают и выключают его для сравнения.
+            if risk_filter is False:
+                settings["MAX_RISK_ATR"] = None
+            elif risk_filter is True:
+                settings["MAX_RISK_ATR"] = config.MAX_RISK_ATR
             levels = levels_by_liq[variant["liq"]]
             for detector in (pattern_detector.detect_spring, pattern_detector.detect_upthrust):
                 signal = detector(window, levels, trend, settings)
@@ -905,7 +928,7 @@ def write_csv(path: str, rows: list[dict]) -> None:
 async def run(codes: list[str], bars: int, base: dict, horizon: int,
               csv_path: str | None, week_filter: bool = True,
               trend_d1: bool = False, use_cache: bool = True,
-              risk_filter: bool = True, sweep: str = "stop",
+              risk_filter: bool | None = None, sweep: str = "stop",
               by_source: bool = False, money_report: bool = False) -> None:
     variants = build_variants(sweep, base)
     names = [v["name"] for v in variants]
@@ -928,9 +951,17 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
                                 if trend_d1 else "по ЧАСОВИКУ (H1) — как в бою"))
     days = "".join("пнвтсрчтптсбвс"[i * 2:i * 2 + 2] for i in range(7)
                    if i not in config.NO_ENTRY_WEEKDAYS)
-    print(f"Окно входа:     {days or 'нет разрешённых дней'}")
-    print("Фильтр входа:   " + (f"риск ≤ {config.MAX_RISK_ATR}×ATR — как в бою"
-                                if risk_filter else "ВЫКЛ — как было до фильтра"))
+    print(f"Окно входа:     {days or 'нет разрешённых дней'}"
+          f" (хвост недели — за {config.MIN_HOURS_BEFORE_CLOSE}ч до закрытия входов нет)")
+    live_risk = base.get("MAX_RISK_ATR")
+    print("Фильтр входа:   " + (
+        f"риск ≤ {config.MAX_RISK_ATR}×ATR — ПРИНУДИТЕЛЬНО ВКЛ" if risk_filter is True
+        else "ПРИНУДИТЕЛЬНО ВЫКЛ — прогон «как было»" if risk_filter is False
+        else f"риск ≤ {live_risk}×ATR — как в бою" if live_risk
+        else "выключен — как в бою"))
+    body = base.get("MAX_BODY_RATIO", config.MAX_BODY_RATIO)
+    print("Поглощение:     " + (f"тело свечи ≤ {body} размаха" if body is not None
+                                else "выключено — как в бою"))
     all_rows: list[dict] = []
     per_instrument: dict[str, dict[str, list[dict]]] = {}
     mids: dict[str, pd.Timestamp] = {}   # середина истории — граница калибровка/проверка
@@ -1014,8 +1045,12 @@ def main() -> None:
                         "По умолчанию из config.NO_ENTRY_WEEKDAYS (сейчас пн–чт). "
                         "Нужно, чтобы подобрать окно входа замером, а не на глаз")
     p.add_argument("--no-risk-filter", action="store_true",
-                   help="отключить фильтр цены входа (риск ≤ MAX_RISK_ATR×ATR) — "
-                        "прогон «как было», для сравнения")
+                   help="принудительно отключить фильтр цены входа "
+                        "(риск ≤ MAX_RISK_ATR×ATR) — для сравнения")
+    p.add_argument("--risk-filter", action="store_true",
+                   help="принудительно ВКЛЮЧИТЬ фильтр цены входа. В бою он сейчас "
+                        "выключен, и без этого флага прогон повторяет бой — "
+                        "флаг показывает, во что обошлось решение его снять")
     p.add_argument("--no-cache", action="store_true",
                    help="не использовать кеш истории в .backtest_cache/ — скачать заново")
     p.add_argument("--money", action="store_true",
@@ -1058,9 +1093,13 @@ def main() -> None:
         base["VOL_MODE"] = "mult"
         base["VOL_MULT"] = args.vol_mult
 
+    # Фильтр цены входа: без флагов — None, то есть «как в бою» (значение придёт
+    # из настроек). Флаги принудительно включают и выключают его для сравнения.
+    risk_filter = True if args.risk_filter else False if args.no_risk_filter else None
+
     asyncio.run(run(codes, args.bars, base, args.horizon, args.csv,
                     not args.no_week, args.trend_d1, not args.no_cache,
-                    not args.no_risk_filter, args.sweep, args.by_source, args.money))
+                    risk_filter, args.sweep, args.by_source, args.money))
 
 
 if __name__ == "__main__":

@@ -42,6 +42,47 @@ INSTRUMENTS = {
                "ccxt": {"symbol": "ETH/USD", "exchange": "kraken"}},
     "TON":    {"name": "Toncoin (TON)", "ticker": "TON11419-USD", "decimals": 4,
                "ccxt": {"symbol": "TON/USD", "exchange": "kraken"}},
+    # ── Расширение крипто-набора (6 августа 2026) ───────────────────────────────
+    # Зачем: владельцу нужно больше сигналов, а ослаблять фильтры отбора нельзя —
+    # каждое ослабление измерено и каждое уводит счёт вниз (см. «Возврат к частым
+    # сигналам» в CLAUDE.md). Единственный честный способ — расширить поле поиска:
+    # больше инструментов при той же планке качества.
+    #
+    # Отбор пар — по ДВУМ условиям сразу, оба обязательны:
+    #   1. пара есть на Kraken (боевой источник свечей и стакана);
+    #   2. пара есть на Bitfinex с годовой почасовой историей — иначе её нечем
+    #      проверить, а брать инструмент в бой непроверенным мы не будем.
+    # Отсеялись по второму условию: ATOM, OP, INJ, TIA (на Bitfinex их нет).
+    #
+    # Порог ликвидности — оборот Kraken не ниже TON (~1.1 млн $/сутки), самой тонкой
+    # из уже принятых пар. Это не вкусовщина: на USD/JPY мы уже обожглись — там
+    # мёртвая ликвидность давала застрявшую цену и плоские свечи, а VSA по плоским
+    # свечам не работает вовсе. Не прошли порог: TRX (0.70), NEAR (0.50), BCH (0.37),
+    # DOT (0.28), POL (0.28), ALGO (0.28), FIL (0.28), ARB (0.12), SEI (0.11),
+    # ETC (0.04), APT (0.03) — все в млн $/сутки.
+    #
+    # Тикеры Yahoo проверены на живых данных. У UNI и SUI обычные имена заняты
+    # акциями, поэтому числовой суффикс — как у TON.
+    "XRP":    {"name": "XRP",           "ticker": "XRP-USD",      "decimals": 4,
+               "ccxt": {"symbol": "XRP/USD", "exchange": "kraken"}},
+    "ADA":    {"name": "Cardano",       "ticker": "ADA-USD",      "decimals": 4,
+               "ccxt": {"symbol": "ADA/USD", "exchange": "kraken"}},
+    "XLM":    {"name": "Stellar",       "ticker": "XLM-USD",      "decimals": 4,
+               "ccxt": {"symbol": "XLM/USD", "exchange": "kraken"}},
+    "AVAX":   {"name": "Avalanche",     "ticker": "AVAX-USD",     "decimals": 2,
+               "ccxt": {"symbol": "AVAX/USD", "exchange": "kraken"}},
+    "SUI":    {"name": "Sui",           "ticker": "SUI20947-USD", "decimals": 4,
+               "ccxt": {"symbol": "SUI/USD", "exchange": "kraken"}},
+    "UNI":    {"name": "Uniswap",       "ticker": "UNI7083-USD",  "decimals": 4,
+               "ccxt": {"symbol": "UNI/USD", "exchange": "kraken"}},
+    "LTC":    {"name": "Litecoin",      "ticker": "LTC-USD",      "decimals": 2,
+               "ccxt": {"symbol": "LTC/USD", "exchange": "kraken"}},
+    "AAVE":   {"name": "Aave",          "ticker": "AAVE-USD",     "decimals": 2,
+               "ccxt": {"symbol": "AAVE/USD", "exchange": "kraken"}},
+    "DOGE":   {"name": "Dogecoin",      "ticker": "DOGE-USD",     "decimals": 5,
+               "ccxt": {"symbol": "DOGE/USD", "exchange": "kraken"}},
+    "LINK":   {"name": "Chainlink",     "ticker": "LINK-USD",     "decimals": 2,
+               "ccxt": {"symbol": "LINK/USD", "exchange": "kraken"}},
 }
 
 

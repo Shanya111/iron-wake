@@ -87,12 +87,11 @@ def test_find_liquidity_zones():
 # (тренд, объём, R:R, стоп), поэтому фильтр им отключаем — у него свои тесты.
 NO_RISK_FILTER = {"MAX_RISK_ATR": None}
 
-# Фикстуры ниже проходят и боевой фильтр «поглощение» (config.MAX_BODY_RATIO=0.15):
-# у свечи пробоя тело 0.1 при размахе 0.8–1.7, то есть 0.06–0.13 размаха. Это не
-# случайность — так выглядит пружина по VSA. Если будешь добавлять фикстуру, где
-# свеча пробоя закрывается далеко от открытия, детектор её забракует, и тест упадёт
-# не по той причине, которую проверяет: тогда фильтр надо отключить явно
-# ({"MAX_BODY_RATIO": None}), как это сделано для фильтра цены входа.
+# Фильтр «поглощение» в бою сейчас ВЫКЛЮЧЕН (config.MAX_BODY_RATIO=None), поэтому
+# фикстурам он не мешает. Но они его и так проходят — у свечи пробоя тело 0.1 при
+# размахе 0.8–1.7, то есть 0.06–0.13 размаха. Это не случайность: так выглядит
+# пружина по VSA. Если фильтр когда-нибудь вернут в бой, фикстуры останутся
+# рабочими; у самого фильтра свои тесты ниже, они задают порог явно.
 
 
 def _spring_df() -> pd.DataFrame:
@@ -316,14 +315,26 @@ def test_sensitivity_unknown_combo_returns_none():
     assert config.sensitivity_of({"VOL_PCTL": 42, "BREAK_PCT": 0.0005}) is None
 
 
-def test_chase_filter_toggles_off_with_zero():
-    """«Не входить вдогонку: выкл» пишет 0 — в БД нельзя положить None."""
+def test_chase_filter_toggles_both_ways():
+    """Кнопка «Не входить вдогонку» работает в обе стороны: вкл пишет
+    config.MAX_RISK_ATR, выкл пишет 0 (в колонку REAL нельзя положить None)."""
     df = _spring_df()          # у него риск ≈ 1.85×ATR, это вход вдогонку
     assert pattern_detector.detect_spring(
-        df, _SUPPORT_AND_TARGET, trend="up", settings=config.effective()) is None
+        df, _SUPPORT_AND_TARGET, trend="up",
+        settings=config.effective({"MAX_RISK_ATR": config.MAX_RISK_ATR})) is None
     assert pattern_detector.detect_spring(
         df, _SUPPORT_AND_TARGET, trend="up",
         settings=config.effective({"MAX_RISK_ATR": 0})) is not None
+
+
+def test_chase_filter_off_by_default():
+    """В бою фильтр ВЫКЛЮЧЕН (владелец вернул более частые сигналы 5 августа 2026):
+    вход вдогонку проходит, пока кнопку не нажали. Тест сторожит именно решение —
+    если дефолт вернут, он упадёт и напомнит поправить /settings и документацию."""
+    assert config.effective()["MAX_RISK_ATR"] == 0
+    assert pattern_detector.detect_spring(
+        _spring_df(), _SUPPORT_AND_TARGET, trend="up",
+        settings=config.effective()) is not None
 
 
 # ── Фильтр «поглощение» (тело свечи пробоя мало относительно размаха) ───────

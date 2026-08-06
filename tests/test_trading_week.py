@@ -65,12 +65,22 @@ def test_naive_time_treated_as_utc():
 
 # ── Разрешение на вход ───────────────────────────────────────────────────────
 
-def test_no_entry_on_friday_at_all():
-    """Пятница закрыта целиком — даже утром, когда времени до закрытия ещё вагон."""
-    for hour in (0, 6, 12, 20):
+def test_friday_entry_allowed_until_noon_msk():
+    """Пятница до полудня по Москве открыта: 12:00 МСК = 09:00 UTC, и до этого
+    момента вход разрешён. Границу задаёт не список дней, а MIN_HOURS_BEFORE_CLOSE
+    (12ч до закрытия в 21:00 UTC) — потому оба числа и связаны в config."""
+    for hour in (0, 6, 8, 9):
         allowed, why = trading_week.is_entry_allowed(_ts(FRI, hour))
-        assert allowed is False, f"пятница {hour}:00 не должна пускать вход"
-        assert why == "weekday"
+        assert allowed is True, f"пятница {hour}:00 UTC должна пускать вход ({why})"
+
+
+def test_no_friday_entry_after_noon_msk():
+    """После 12:00 МСК пятницы входов нет — сделка не успеет отработать до
+    закрытия недели, а через выходные мы ничего не переносим."""
+    for hour in (10, 12, 16, 20):
+        allowed, why = trading_week.is_entry_allowed(_ts(FRI, hour))
+        assert allowed is False, f"пятница {hour}:00 UTC не должна пускать вход"
+        assert why == "tail"
 
 
 def test_no_entry_on_weekend():
@@ -135,7 +145,13 @@ def test_detector_gives_signal_on_thursday():
     assert _detect_with_break_at(THU, 12) is not None
 
 
-def test_detector_silent_on_friday():
+def test_detector_gives_signal_on_friday_morning():
+    """Пятничное утро — рабочее время: свеча пробоя в 06:00 UTC (09:00 МСК) сигналит."""
+    assert _detect_with_break_at(FRI, 6) is not None
+
+
+def test_detector_silent_on_friday_afternoon():
+    """А после полудня по Москве детектор молчит — до закрытия недели мало времени."""
     assert _detect_with_break_at(FRI, 12) is None
 
 
