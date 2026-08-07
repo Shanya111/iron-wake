@@ -48,7 +48,8 @@ import database
 import money
 import pattern_detector
 import trading_week
-from instruments import INSTRUMENTS, data_source, engine_codes, resolve
+from instruments import (INSTRUMENTS, data_source, engine_codes, resolve,
+                         trades_round_clock)
 
 # Kraken (боевой источник движка) отдаёт максимум 720 часовых свечей — 30 дней,
 # на статистику не хватает. Для глубокой истории берём биржу с пагинацией по
@@ -139,6 +140,18 @@ RR_VALUES = (1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)
 # в двух границах — осторожной и оптимистичной (порядок событий внутри часовой
 # свечи неизвестен, см. pattern_detector.pullback_entry).
 ENTRY_PULLBACKS = (0.25, 0.5, 0.75, 1.0)
+
+# Варианты фильтра дистанции входа до уровня (--sweep dist): на сколько ATR закрытие
+# свечи пробоя может отстоять от пробитого уровня.
+#
+# Сетка кончается на 1.0 намеренно, и это не лень. Дистанция АРИФМЕТИЧЕСКИ всегда
+# меньше риска: для лонга риск = closeˆ− low + буфер, дистанция = close − уровень, а
+# пробой требует, чтобы low ушёл под уровень. Значит включённый фильтр «вдогонку»
+# (MAX_RISK_ATR = 1×ATR) уже ограничивает дистанцию сверху, и варианты 1.0/1.5/2.0/3.0
+# в первом прогоне дали строку «выкл» до последнего знака. Работать этому фильтру
+# есть где только НИЖЕ 1 ATR — туда сетка и расширена (было 0.25 нижним краем, и
+# именно он выиграл; по правилу «победитель на краю → расширяем» добавлены 0.1–0.2).
+ENTRY_DISTS = (0.1, 0.15, 0.2, 0.25, 0.35, 0.5, 0.75, 1.0)
 
 ATR_PERIOD = 14
 
@@ -316,7 +329,8 @@ def _d1_view(d1: pd.DataFrame, h1: pd.DataFrame, i: int) -> pd.DataFrame:
 
 
 def _levels_at(d1_view: pd.DataFrame, h1_window: pd.DataFrame,
-               liq_mode: str = "off") -> list[dict]:
+               liq_mode: str = "off", h4_levels: bool = False,
+               h4_source: pd.DataFrame | None = None) -> list[dict]:
     """Уровни, какими их посчитал бы run_analysis по этим окнам.
 
     liq_mode ('off'/'mid'/'edge') — работают ли зоны ликвидности как уровни для
@@ -324,13 +338,24 @@ def _levels_at(d1_view: pd.DataFrame, h1_window: pd.DataFrame,
     возвращает первый подошедший уровень, и приоритет остаётся за пивотами — зона
     срабатывает там, где обычного уровня нет, ровно как советует /analyze.
 
+    h4_levels — участвует ли средний слой H4. Он ресемплится из h4_source — более
+    длинного окна тех же часовых свечей, кончающегося на той же свече (как в бою:
+    H1_FETCH_LIMIT против рабочего H1_LIMIT), поэтому будущего в нём нет.
+    False полностью воспроизводит прежнее поведение — прогон «как было» обязан
+    совпадать с прежними числами до последней цифры.
+
     Последняя свеча окна — та самая свеча пробоя, и она объёмная по построению.
     В источник зон её не берём, иначе она «пробивала» бы уровень, построенный
     по ней же (сигнал из ничего).
     """
     global_levels = analyzer.find_levels(d1_view, config.D1_PIVOT_WINDOW, "D1")
     local_levels = analyzer.find_levels(h1_window, config.H1_PIVOT_WINDOW, "H1")
-    levels = analyzer.prioritize_levels(global_levels, local_levels)
+    mid = None
+    if h4_levels:
+        src = h4_source if h4_source is not None else h1_window
+        mid = analyzer.find_levels(
+            analyzer.resample_h4(src), config.H4_PIVOT_WINDOW, "H4")
+    levels = analyzer.prioritize_levels(global_levels, local_levels, mid_levels=mid)
     if liq_mode != "off":
         zones = analyzer.find_liquidity_zones(h1_window.iloc[:-1])
         levels += analyzer.liquidity_levels(zones, liq_mode)
@@ -400,6 +425,63 @@ def build_variants(sweep: str, base: dict) -> list[dict]:
                  "patch": (lambda vv: lambda atr: {"MIN_RR": vv})(v),
                  "vol": vol, "liq": liq}
                 for v in RR_VALUES]
+    if sweep == "d1":
+        # Дневка как контекст режима рынка. "hard" здесь обязателен как контроль:
+        # без него не видно, отличается ли мягкий гейт от простого запрета
+        # контртренда — а именно в этом различии вся идея.
+        vol, liq = _base_vol_spec(base), config.LIQ_LEVELS
+        variants = [{"name": "выкл (сейчас)",
+                     "patch": lambda atr: {"D1_GATE": "off"},
+                     "vol": vol, "liq": liq}]
+        for confirm, label in (("strong", "подтв. сильным уровнем"),
+                               ("volume", f"подтв. объёмом P{config.D1_CONFIRM_PCTL:g}"),
+                               ("rr", f"подтв. R:R ≥ {config.D1_CONFIRM_RR:g}")):
+            variants.append({
+                "name": f"мягкий: {label}",
+                "patch": (lambda cc: lambda atr: {"D1_GATE": "soft", "D1_CONFIRM": cc})(confirm),
+                "vol": vol, "liq": liq, "needs_d1": True,
+            })
+        variants.append({"name": "жёсткий запрет контртренда",
+                         "patch": lambda atr: {"D1_GATE": "hard"},
+                         "vol": vol, "liq": liq, "needs_d1": True})
+        return variants
+    if sweep == "tf":
+        # Слой H4: два рычага сразу, но каждый вариант меняет ровно один — иначе
+        # непонятно, что дало разницу. Первый рычаг — таймфрейм тренд-фильтра
+        # (h1/h4/d1), второй — участвуют ли уровни H4 в отборе.
+        vol, liq = _base_vol_spec(base), config.LIQ_LEVELS
+        cur_tf, cur_h4 = config.TREND_TF, config.H4_LEVELS
+        combos = [("тренд H1", "h1", cur_h4), ("тренд H4", "h4", cur_h4),
+                  ("тренд D1", "d1", cur_h4),
+                  ("уровни H4 в отборе", cur_tf, not cur_h4)]
+        variants = []
+        for name, tf, h4 in combos:
+            if tf == cur_tf and h4 == cur_h4:
+                name += " (сейчас)"
+            variants.append({"name": name, "patch": lambda atr: {},
+                             "vol": vol, "liq": liq, "trend_tf": tf, "h4": h4})
+        # Комбинация «лучший тренд + уровни H4» проверяется отдельно: если оба
+        # рычага полезны по отдельности, вместе они могут и мешать друг другу.
+        for tf in ("h4", "d1"):
+            variants.append({"name": f"тренд {tf.upper()} + уровни H4",
+                             "patch": lambda atr: {}, "vol": vol, "liq": liq,
+                             "trend_tf": tf, "h4": not cur_h4})
+        return variants
+    if sweep == "dist":
+        # Дистанция входа до пробитого уровня. Порог задан в ATR, поэтому переносится
+        # между инструментами (в отличие от процента цены — на нём мы обожглись
+        # с форексом). Отбор меняется только этим рычагом, прочие пороги боевые.
+        vol, liq = _base_vol_spec(base), config.LIQ_LEVELS
+        variants = [{"name": "выкл (сейчас)",
+                     "patch": lambda atr: {"MAX_ENTRY_DIST_ATR": None},
+                     "vol": vol, "liq": liq}]
+        for d in ENTRY_DISTS:
+            variants.append({
+                "name": f"вход ≤ {d:g} ATR от уровня",
+                "patch": (lambda dd: lambda atr: {"MAX_ENTRY_DIST_ATR": dd})(d),
+                "vol": vol, "liq": liq,
+            })
+        return variants
     if sweep == "body":
         # Фильтр «поглощение»: тело свечи пробоя ≤ доли её размаха.
         vol, liq = _base_vol_spec(base), config.LIQ_LEVELS
@@ -526,6 +608,7 @@ def measure_excursion(signal: dict, future: pd.DataFrame) -> dict:
 
 def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
            variants: list[dict], week_filter: bool = True, trend_d1: bool = False,
+           round_clock: bool = False,
            risk_filter: bool | None = None) -> tuple[dict[str, list[dict]], dict[str, int]]:
     """Прогон истории бар за баром: сигналы каждого варианта + их исходы.
 
@@ -559,10 +642,18 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
     last_ts = h1.index[-1]
     results: dict[str, list[dict]] = {v["name"]: [] for v in variants}
     missed: dict[str, int] = {}      # сделки, не состоявшиеся из-за отсутствия отката
-    # Режимы зон ликвидности, встречающиеся среди вариантов. Уровни от режима
-    # зависят, поэтому считаем по набору на бар — но обычно режим один на всех
+    # Чего вариант не задал явно — берётся из боя, чтобы прогон без флагов повторял
+    # боевую конфигурацию (--trend-d1 остался синонимом trend_tf='d1').
+    default_tf = "d1" if trend_d1 else config.TREND_TF
+    default_h4 = config.H4_LEVELS
+    # Наборы уровней и трендов, встречающиеся среди вариантов. И то и другое зависит
+    # от варианта, поэтому считаем по набору на бар — но обычно набор один на всех
     # (перебор стопа/объёма), и лишней работы не возникает.
-    liq_modes = {v["liq"] for v in variants}
+    level_specs = {(v["liq"], v.get("h4", default_h4)) for v in variants}
+    trend_tfs = {v.get("trend_tf", default_tf) for v in variants}
+    # Мягкому дневному гейту нужен дневной тренд, даже когда рабочий таймфрейм другой.
+    if config.D1_GATE != "off" or any(v.get("needs_d1") for v in variants):
+        trend_tfs.add("d1")
     # Дедуп как в бою: один и тот же паттерн не чаще SIGNAL_DEDUP_MIN минут.
     last_emit: dict[tuple[str, str, str], pd.Timestamp] = {}
 
@@ -576,7 +667,10 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
             break
         # С недельным окном исход может решиться пятничным закрытием, поэтому
         # свечей нужно с запасом за него — иначе не увидим, что неделя кончилась.
-        deadline = trading_week.week_close_after(bar_ts) if week_filter else None
+        # У круглосуточного инструмента (крипта) недели нет: сделку к пятнице не
+        # гасим, дедлайна не существует — горизонт задаёт только SIGNAL_EXPIRE_HOURS.
+        deadline = (trading_week.week_close_after(bar_ts)
+                    if week_filter and not round_clock else None)
         eval_end = bar_ts + timedelta(hours=horizon)
         if deadline is not None:
             eval_end = max(eval_end, deadline + timedelta(hours=2))
@@ -589,11 +683,24 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
         # Окно уровней заканчивается на самой свече пробоя (в бою оно на бар
         # длиннее) — так гарантированно без будущего.
         h1_window = h1.iloc[max(0, i + 1 - config.H1_LIMIT):i + 1]
-        # Фильтр направления — по часовому тренду, как в бою (scheduler.monitor_signals).
+        # Более длинное окно тех же свечей — источник H4 (в бою это H1_FETCH_LIMIT).
+        # Кончается на той же свече пробоя, поэтому будущего в нём нет.
+        h4_window = h1.iloc[max(0, i + 1 - config.H1_FETCH_LIMIT):i + 1]
+        # Фильтр направления — с таймфрейма варианта (в бою это scheduler.trend_for).
         # Считаем по окну до свечи пробоя включительно: в бою тренд берётся по всему
         # H1 вместе с ещё формирующимся баром, здесь строже — без будущего.
-        trend = analyzer.get_trend(d1_view if trend_d1 else h1_window)
-        levels_by_liq = {m: _levels_at(d1_view, h1_window, m) for m in liq_modes}
+        # H4 ресемплим из того же окна H1, поэтому будущего в нём нет по построению.
+        trends = {
+            tf: analyzer.get_trend(
+                d1_view if tf == "d1"
+                else analyzer.resample_h4(h4_window) if tf == "h4"
+                else h1_window)
+            for tf in trend_tfs
+        }
+        levels_by_spec = {
+            spec: _levels_at(d1_view, h1_window, spec[0], spec[1], h4_source=h4_window)
+            for spec in level_specs
+        }
         # Детектор берёт свечу как df.iloc[-2], поэтому окно на бар длиннее;
         # сам бар i+1 он не читает (только df.iloc[pos] и объёмы до pos).
         window = h1.iloc[max(0, i + 2 - config.H1_LIMIT):i + 2]
@@ -612,6 +719,7 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
             name = variant["name"]
             settings = {**base, **patch}
             settings["WEEK_FILTER"] = week_filter
+            settings["ROUND_CLOCK"] = round_clock
             # Фильтр цены входа. Ничего не трогаем (None) — значение приходит из
             # base, то есть из боевых настроек: прогон повторяет бой. Явные True/
             # False принудительно включают и выключают его для сравнения.
@@ -619,9 +727,13 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
                 settings["MAX_RISK_ATR"] = None
             elif risk_filter is True:
                 settings["MAX_RISK_ATR"] = config.MAX_RISK_ATR
-            levels = levels_by_liq[variant["liq"]]
+            levels = levels_by_spec[(variant["liq"], variant.get("h4", default_h4))]
+            trend = trends[variant.get("trend_tf", default_tf)]
+            # Дневной тренд для мягкого гейта. Отдаём только когда гейт включён —
+            # иначе детектор получил бы higher_trend и повёл себя не как в бою.
+            higher = trends["d1"] if settings.get("D1_GATE", config.D1_GATE) != "off" else None
             for detector in (pattern_detector.detect_spring, pattern_detector.detect_upthrust):
-                signal = detector(window, levels, trend, settings)
+                signal = detector(window, levels, trend, settings, higher)
                 if signal is None:
                     continue
                 key = (name, signal["pattern"], signal["direction"])
@@ -653,7 +765,7 @@ def replay(h1: pd.DataFrame, d1: pd.DataFrame, base: dict, horizon: int,
                     res = {"status": "hit_sl", "exit_price": signal["stop_loss"]}
                 else:
                     res = pattern_detector.evaluate_signal_detailed(
-                        signal, future, week_close=week_filter)
+                        signal, future, week_close=week_filter and not round_clock)
                 signal["outcome"] = "expired" if res["status"] == "pending" else res["status"]
                 signal["exit_price"] = res["exit_price"]
                 signal["risk"] = abs(signal["entry_price"] - signal["stop_loss"])
@@ -937,18 +1049,38 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
                      "body": ("ФИЛЬТРА «ПОГЛОЩЕНИЕ»", "тело свечи"),
                      "rr": ("ПРИБЫЛЬ / РИСК", "мин. R:R"),
                      "entry": ("ТОЧКИ ВХОДА", "вход"),
+                     "dist": ("ДИСТАНЦИИ ДО УРОВНЯ", "дистанция входа"),
+                     "tf": ("СЛОЯ H4 И ТРЕНД-ФИЛЬТРА", "конфигурация"),
+                     "d1": ("ДНЕВНОГО КОНТЕКСТА", "режим дневки"),
                      "stop": ("СТОПА", "буфер")}[sweep]
     what = {"vol": "порог аномального объёма", "liq": "зоны ликвидности как уровни",
             "body": "фильтр «поглощение» (тело свечи пробоя)",
             "rr": "минимальную прибыль/риск", "entry": "уточнение входа откатом",
+            "dist": "дистанцию входа до пробитого уровня",
+            "tf": "слой H4: таймфрейм тренд-фильтра и участие уровней H4 в отборе",
+            "d1": "дневку как контекст режима (мягкий гейт против жёсткого запрета)",
             "stop": "запас стопа"}[sweep]
     print(f"Перебираем:     {what} ({len(variants)} вариантов)")
     print(f"Объём:          {vol_rule_text(base)}")
     print(f"Зоны-уровни:    {config.LIQ_LEVELS}")
     print("Недельное окно: " + ("ВКЛ — входы пн–чт, пятничное закрытие гасит сделку"
                                 if week_filter else "ВЫКЛ — как было до окна"))
-    print("Фильтр тренда:  " + ("по ДНЕВКЕ (D1) — как было до недельного горизонта"
-                                if trend_d1 else "по ЧАСОВИКУ (H1) — как в бою"))
+    if week_filter:
+        crypto = [c for c in codes if trades_round_clock(c)]
+        print("Крипта 24/7:    " + (
+            f"ДА — {len(crypto)} пар вне окна (выходные торгуются, к пятнице не гасим)"
+            if crypto else "НЕТ — крипта под общим окном (--no-round-clock)"))
+    tf_ru = {"h1": "по ЧАСОВИКУ (H1)", "h4": "по ЧЕТЫРЁХЧАСОВИКУ (H4)",
+             "d1": "по ДНЕВКЕ (D1)"}
+    print("Фильтр тренда:  " + ("по ДНЕВКЕ (D1) — принудительно, как было до "
+                                "недельного горизонта" if trend_d1
+                                else f"{tf_ru[config.TREND_TF]} — как в бою"))
+    print("Уровни H4:      " + ("участвуют в отборе" if config.H4_LEVELS
+                                else "не участвуют — как в бою"))
+    print("Дневной гейт:   " + (
+        "выключен — как в бою" if config.D1_GATE == "off"
+        else "жёсткий запрет контртренда" if config.D1_GATE == "hard"
+        else f"мягкий, подтверждение: {config.D1_CONFIRM}"))
     days = "".join("пнвтсрчтптсбвс"[i * 2:i * 2 + 2] for i in range(7)
                    if i not in config.NO_ENTRY_WEEKDAYS)
     print(f"Окно входа:     {days or 'нет разрешённых дней'}"
@@ -962,6 +1094,9 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
     body = base.get("MAX_BODY_RATIO", config.MAX_BODY_RATIO)
     print("Поглощение:     " + (f"тело свечи ≤ {body} размаха" if body is not None
                                 else "выключено — как в бою"))
+    dist = base.get("MAX_ENTRY_DIST_ATR", config.MAX_ENTRY_DIST_ATR)
+    print("Дистанция:      " + (f"вход ≤ {dist}×ATR от уровня" if dist is not None
+                                else "выключена — как в бою"))
     all_rows: list[dict] = []
     per_instrument: dict[str, dict[str, list[dict]]] = {}
     mids: dict[str, pd.Timestamp] = {}   # середина истории — граница калибровка/проверка
@@ -975,9 +1110,14 @@ async def run(codes: list[str], bars: int, base: dict, horizon: int,
         if len(h1) < config.H1_LIMIT:
             print(f"\n{code}: слишком мало свечей ({len(h1)}) — пропускаем")
             continue
-        print(f"\n{code}: прогоняю {len(h1)} свечей × {len(variants)} вариантов…")
+        # Круглосуточность — свойство ИНСТРУМЕНТА, поэтому берётся здесь, а не
+        # флагом на весь прогон: в одном отчёте крипта идёт без окна, а форекс с
+        # золотом и нефтью — под окном, ровно как в бою.
+        round_clock = trades_round_clock(code) and week_filter
+        mark = " (24/7, без недельного окна)" if round_clock else ""
+        print(f"\n{code}: прогоняю {len(h1)} свечей × {len(variants)} вариантов…{mark}")
         results, missed = replay(h1, d1, base, horizon, variants,
-                                 week_filter, trend_d1, risk_filter)
+                                 week_filter, trend_d1, round_clock, risk_filter)
         per_instrument[code] = results
         for name, n in missed.items():
             missed_total[name] = missed_total.get(name, 0) + n
@@ -1045,12 +1185,17 @@ def main() -> None:
                         "По умолчанию из config.NO_ENTRY_WEEKDAYS (сейчас пн–чт). "
                         "Нужно, чтобы подобрать окно входа замером, а не на глаз")
     p.add_argument("--no-risk-filter", action="store_true",
-                   help="принудительно отключить фильтр цены входа "
-                        "(риск ≤ MAX_RISK_ATR×ATR) — для сравнения")
+                   help="принудительно ОТКЛЮЧИТЬ фильтр цены входа "
+                        "(риск ≤ MAX_RISK_ATR×ATR). В бою он с 7 августа 2026 включён, "
+                        "и без флагов прогон повторяет бой — этот флаг даёт прогон "
+                        "«как было», когда фильтр был снят ради частоты сигналов")
     p.add_argument("--risk-filter", action="store_true",
-                   help="принудительно ВКЛЮЧИТЬ фильтр цены входа. В бою он сейчас "
-                        "выключен, и без этого флага прогон повторяет бой — "
-                        "флаг показывает, во что обошлось решение его снять")
+                   help="принудительно ВКЛЮЧИТЬ фильтр цены входа. Сейчас совпадает "
+                        "с боем; нужен, если фильтр снова выключат в /settings")
+    p.add_argument("--no-round-clock", action="store_true",
+                   help="вернуть КРИПТУ под недельное окно (как было до 7 августа 2026). "
+                        "Без флага крипта торгуется 24/7, включая выходные, и к пятнице "
+                        "не гасится — этим флагом меряется цена того решения")
     p.add_argument("--no-cache", action="store_true",
                    help="не использовать кеш истории в .backtest_cache/ — скачать заново")
     p.add_argument("--money", action="store_true",
@@ -1059,14 +1204,27 @@ def main() -> None:
     p.add_argument("--by-source", action="store_true",
                    help="дополнительно показать сравнение отдельно по источнику объёма "
                         "(биржа Kraken против Yahoo) — проверить, нужен ли разный порог")
-    p.add_argument("--sweep", choices=("stop", "vol", "liq", "body", "rr", "entry"), default="stop",
+    p.add_argument("--sweep",
+                   choices=("stop", "vol", "liq", "body", "rr", "entry", "dist", "tf", "d1"),
+                   default="stop",
                    help="что перебирать: stop — запас стопа (по умолчанию), "
                         "vol — порог аномального объёма (множитель против процентиля), "
                         "liq — зоны ликвидности как уровни для пробоя (выкл/середина/край), "
                         "body — фильтр «поглощение» (тело свечи пробоя ≤ доли размаха), "
                         "rr — минимальная прибыль/риск (1:1 … 1:3), "
-                        "entry — уточнение входа откатом к уровню вместо входа по закрытию")
+                        "entry — уточнение входа откатом к уровню вместо входа по закрытию, "
+                        "dist — дистанция входа до пробитого уровня (вход ОТ уровня, "
+                        "а не вдогонку за ушедшей ценой), "
+                        "tf — слой H4: таймфрейм тренд-фильтра (h1/h4/d1) и участие "
+                        "уровней H4 в отборе, "
+                        "d1 — дневка как контекст режима: мягкий гейт (контртренд "
+                        "только с подтверждением) против жёсткого запрета")
     args = p.parse_args()
+
+    # Круглосуточность крипты — общий выключатель в config; instruments.trades_round_clock
+    # читает его на каждый вызов, поэтому подмены здесь достаточно.
+    if args.no_round_clock:
+        config.CRYPTO_ROUND_CLOCK = False
 
     # Окно входа подменяем в config: trading_week читает его на каждый вызов.
     if args.entry_days:

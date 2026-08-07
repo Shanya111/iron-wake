@@ -875,12 +875,15 @@ _TREND_SHORT = {"up": "вверх ↑", "down": "вниз ↓", "sideways": "б�
 
 
 def _format_analysis(info: dict, df, trend: str, trend_d1: str, levels: list[dict],
-                     zones: list[dict], ob: dict | None = None) -> str:
+                     zones: list[dict], ob: dict | None = None,
+                     trend_h4: str | None = None,
+                     h4_levels: list[dict] | None = None) -> str:
     """Человеко-читаемый отчёт по числам анализа (без AI).
 
-    Главный таймфрейм — часовик (H1): по нему тренд, зоны ликвидности и рабочие
-    уровни (торговля внутри дня). Дневка (D1) остаётся фоном: крупные ориентиры
-    и та самая сверка, из-за которой часовой уровень получает ⭐.
+    Три слоя структуры сверху вниз: дневка (D1) — крупные ориентиры и фон,
+    четырёхчасовик (H4) — средний слой, часовик (H1) — рабочий таймфрейм, откуда
+    берётся вход. Слой H4 показывается всегда, даже когда он не участвует в отборе
+    сигналов (config.H4_LEVELS): видеть структуру полезно в любом случае.
     """
     last = float(df["close"].iloc[-1])
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
@@ -891,8 +894,10 @@ def _format_analysis(info: dict, df, trend: str, trend_d1: str, levels: list[dic
         f"📊 {info['name']} — анализ",
         f"Цена сейчас: {fmt(last, d)}",
         f"Тренд на часовике (H1): {_TREND_RU[trend]}",
-        f"Фон дневки (D1): {_TREND_SHORT[trend_d1]}",
     ]
+    if trend_h4 is not None:
+        lines.append(f"Средний слой (H4): {_TREND_SHORT[trend_h4]}")
+    lines.append(f"Фон дневки (D1): {_TREND_SHORT[trend_d1]}")
     # Часовик против дневки — обычная коррекция внутри старшего движения: тянуть
     # такую сделку далеко не стоит, поэтому предупреждаем отдельной строкой.
     if trend != "sideways" and trend_d1 != "sideways" and trend != trend_d1:
@@ -903,7 +908,14 @@ def _format_analysis(info: dict, df, trend: str, trend_d1: str, levels: list[dic
         _render_levels(h1, d, last, limit=8),
     ]
     if any(l.get("strength") == "strong" for l in h1):
-        lines.append("  ⭐ — сильный: часовой уровень совпал с дневным")
+        senior = "дневным или четырёхчасовым" if config.H4_LEVELS else "дневным"
+        lines.append(f"  ⭐ — сильный: часовой уровень совпал с {senior}")
+    if h4_levels:
+        lines += [
+            "",
+            "🟠 Четырёхчасовик (H4) — средний слой структуры:",
+            _render_levels(h4_levels, d, last, limit=6),
+        ]
     lines += [
         "",
         "🔵 Дневка (D1) — крупные ориентиры (фон):",
@@ -923,10 +935,12 @@ def _format_analysis(info: dict, df, trend: str, trend_d1: str, levels: list[dic
 
 
 def _analysis_prompt(info: dict, last: float, trend: str, trend_d1: str,
-                     levels: list[dict], zones: list[dict], ob: dict | None = None) -> str:
+                     levels: list[dict], zones: list[dict], ob: dict | None = None,
+                     trend_h4: str | None = None,
+                     h4_levels: list[dict] | None = None) -> str:
     """Компактная сводка чисел для AI-разбора (гибрид). Уровни разнесены по
     таймфреймам — чтобы AI в ответе уточнял, дневной уровень или часовой.
-    Рабочий тренд — часовой; дневной идёт отдельной строкой как фон."""
+    Рабочий тренд — часовой; H4 и дневка идут отдельными строками как контекст."""
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
     d1 = [fmt(l["price"], d) for l in levels
           if l.get("timeframe") == "D1" and l["type"] in ("support", "resistance")]
@@ -943,10 +957,16 @@ def _analysis_prompt(info: dict, last: float, trend: str, trend_d1: str,
         if ob.get("ask_wall"):
             dom += f", крупная продажа у {fmt(ob['ask_wall']['price'], d)}"
         dom += "\n"
+    h4_line = ""
+    if trend_h4 is not None:
+        prices = [fmt(l["price"], d) for l in (h4_levels or [])][:6]
+        h4_line = (f"Тренд H4 (средний слой): {trend_h4}\n"
+                   f"Уровни H4: {', '.join(prices) or 'нет'}\n")
     return (
         f"Инструмент: {info['name']}\n"
         f"Цена сейчас: {fmt(last, d)}\n"
         f"Тренд H1 (рабочий): {trend}\n"
+        f"{h4_line}"
         f"Тренд D1 (фон): {trend_d1}\n"
         f"Уровни дневки (D1): {', '.join(d1) or 'нет'}\n"
         f"Сильные уровни часовика (H1): {', '.join(h1_strong) or 'нет'}\n"
@@ -962,7 +982,10 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     try:
         # Свечи берём из источника инструмента: крипта/форекс — Kraken, золото/нефть — Yahoo.
         d1 = await engine.fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
-        h1 = await engine.fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+        # Полная выборка: из неё ресемплится H4. Рабочее окно (H1_LIMIT) берётся
+        # хвостом там, где считаются уровни и тренд.
+        h1_full = await engine.fetch_candles(code, config.H1_TIMEFRAME, config.H1_FETCH_LIMIT)
+        h1 = h1_full.tail(config.H1_LIMIT)
     except Exception:
         await waiting.delete()
         await message.answer("Не удалось получить данные сейчас, попробуй позже.")
@@ -972,7 +995,14 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     # по H1. Дневной тренд остаётся фоном — понять, помогает старший таймфрейм или мешает.
     trend = analyzer.get_trend(h1)
     trend_d1 = analyzer.get_trend(d1)
-    levels = engine.analyze_and_store(code, d1, h1)  # считает и сохраняет уровни в БД
+    # Средний слой H4 — ресемпл из тех же часовых свечей (сетевого запроса нет).
+    # Считаем здесь, а не берём из БД: в базу кладутся только ТОРГУЕМЫЕ уровни, а
+    # показывать структуру H4 надо и когда движок по ней не сигналит (H4_LEVELS=False).
+    h4 = analyzer.resample_h4(h1_full)
+    trend_h4 = analyzer.get_trend(h4)
+    h4_levels = analyzer.find_levels(h4, config.H4_PIVOT_WINDOW, "H4")
+    # analyze_and_store сам берёт рабочее окно хвостом — отдаём ему полную выборку.
+    levels = engine.analyze_and_store(code, d1, h1_full)  # считает и сохраняет в БД
     # Зоны ликвидности — порог общий (config.LIQUIDITY_MULT), настройкой он больше
     # не является: зоны видны только здесь, в отчёте, и на отбор сигналов не влияют.
     zones = analyzer.find_liquidity_zones(h1)
@@ -990,13 +1020,15 @@ async def _do_analyze(message: Message, code: str, user_id: int):
 
     await waiting.delete()
     # Цену берём из H1 — последняя часовая свеча свежее дневной.
-    await message.answer(_format_analysis(info, h1, trend, trend_d1, levels, zones, ob))
+    await message.answer(_format_analysis(info, h1, trend, trend_d1, levels, zones, ob,
+                                          trend_h4=trend_h4, h4_levels=h4_levels))
 
     # Гибрид: AI пишет человеческий разбор поверх чисел. Ошибка LLM не критична.
     try:
         last = float(h1["close"].iloc[-1])
         comment = await ask_openrouter(
-            _analysis_prompt(info, last, trend, trend_d1, levels, zones, ob),
+            _analysis_prompt(info, last, trend, trend_d1, levels, zones, ob,
+                             trend_h4=trend_h4, h4_levels=h4_levels),
             system_prompt=ANALYST_PROMPT,
         )
         # Подписываем, по какому инструменту разбор — сообщения в ленте отрываются

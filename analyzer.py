@@ -35,6 +35,27 @@ def get_trend(df: pd.DataFrame) -> str:
     return "sideways"
 
 
+def resample_h4(h1: pd.DataFrame) -> pd.DataFrame:
+    """Четырёхчасовые свечи из часовых — средний слой структуры между D1 и H1.
+
+    Ресемпл, а не отдельный запрос к бирже, по трём причинам:
+      • один код для обоих источников: у Yahoo (золото, нефть) 4h нет вовсе;
+      • бэктест берёт H4 из уже скачанного кеша H1, то есть варианты сравниваются
+        на ТОМ ЖЕ срезе данных — иначе разница вариантов смешается с разницей выборок;
+      • ноль дополнительных сетевых запросов в боевом цикле.
+
+    dropna обязателен: у золота и нефти рынок закрыт часть суток, и без него в
+    выходных дырах появятся пустые H4-бары, которые испортят и EMA, и фракталы.
+    """
+    if h1.empty:
+        return h1
+    out = h1.resample("4h").agg({
+        "open": "first", "high": "max", "low": "min",
+        "close": "last", "volume": "sum",
+    })
+    return out.dropna(subset=["open", "high", "low", "close"])
+
+
 def find_levels(df: pd.DataFrame, window: int, timeframe: str) -> list[dict]:
     """Локальные пики (resistance) и впадины (support) — фракталы шириной `window`.
 
@@ -173,22 +194,34 @@ def analyze_order_book(ob: dict, wall_mult: float | None = None) -> dict | None:
 
 
 def prioritize_levels(
-    global_levels: list[dict], local_levels: list[dict], tol: float | None = None
+    global_levels: list[dict], local_levels: list[dict], tol: float | None = None,
+    mid_levels: list[dict] | None = None,
 ) -> list[dict]:
-    """Совмещает глобальные (D1) и локальные (H1) уровни и проставляет силу.
+    """Совмещает глобальные (D1), средние (H4) и локальные (H1) уровни и ставит силу.
 
-    Локальный уровень H1, совпавший с глобальным D1 того же типа в пределах tol
+    Локальный уровень H1, совпавший со старшим уровнем того же типа в пределах tol
     (0.1%), помечается 'strong'; иначе 'weak'. Сами глобальные уровни добавляются
     как контекст и всегда 'strong'. Возвращает единый список уровней.
+
+    mid_levels (H4) — необязательный средний слой между дневкой и часом. Когда он
+    передан:
+      • уровень H1, совпавший с H4, тоже получает 'strong' — ⭐ означает «совпали
+        два таймфрейма», и H4 здесь работает так же, как D1;
+      • сами уровни H4 добавляются торгуемыми, но со силой 'weak': одиночный
+        четырёхчасовой уровень — это ещё один ориентир, а не крупный уровень,
+        и раздавать по нему ⭐ значило бы обесценить саму пометку.
+    mid_levels=None полностью воспроизводит прежнее поведение — это важно, чтобы
+    прогон «как было» совпадал с прежними числами до последней цифры.
     """
     if tol is None:
         tol = config.LEVEL_MATCH_TOL
+    senior = list(global_levels) + list(mid_levels or [])
     result: list[dict] = []
     for lvl in local_levels:
         strong = any(
             g["type"] == lvl["type"]
             and abs(g["price"] - lvl["price"]) <= lvl["price"] * tol
-            for g in global_levels
+            for g in senior
         )
         out = dict(lvl)
         out["strength"] = "strong" if strong else "weak"
@@ -196,5 +229,9 @@ def prioritize_levels(
     for g in global_levels:
         out = dict(g)
         out["strength"] = "strong"
+        result.append(out)
+    for m in mid_levels or []:
+        out = dict(m)
+        out["strength"] = "weak"
         result.append(out)
     return result

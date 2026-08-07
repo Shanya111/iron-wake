@@ -125,20 +125,22 @@ LEVELS = [{"price": 100.0, "type": "support", "strength": "strong",
            "is_liquidity": 0, "timeframe": "H1"}]
 # Фильтры отбора отключены намеренно: у фикстуры нарочно размашистая свеча пробоя
 # (сходили на 98 и вернулись), и боевые фильтры забраковали бы её раньше недельного
-# окна — по риску в ATR (цена входа) и по слишком большому телу («поглощение»).
+# окна — по риску в ATR (цена входа), по расстоянию закрытия до уровня (дистанция)
+# и по слишком большому телу («поглощение»).
 # Здесь проверяется ОКНО; у самих фильтров свои тесты в tests/test_engine.py.
-BASE = {"BREAK_PCT": 0.0005, "MIN_RR": 1.5,
-        "MAX_RISK_ATR": None, "MAX_BODY_RATIO": None}
+BASE = {"BREAK_PCT": 0.0005, "MIN_RR": 1.5, "MAX_RISK_ATR": None,
+        "MAX_ENTRY_DIST_ATR": None, "MAX_BODY_RATIO": None}
 
 
-def _detect_with_break_at(day: str, hour: int):
+def _detect_with_break_at(day: str, hour: int, round_clock: bool = False):
     """Собирает окно так, чтобы свеча пробоя (предпоследняя) пришлась на day/hour."""
     rows = _spring_rows()
     start = pd.Timestamp(f"{day} {hour:02d}:00", tz="UTC") - pd.Timedelta(hours=len(rows) - 2)
     idx = pd.date_range(start, periods=len(rows), freq="h", tz="UTC")
     df = pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=idx)
     assert str(df.index[-2].date()) == day and df.index[-2].hour == hour
-    return pattern_detector.detect_spring(df, LEVELS, "sideways", BASE)
+    return pattern_detector.detect_spring(
+        df, LEVELS, "sideways", {**BASE, "ROUND_CLOCK": round_clock})
 
 
 def test_detector_gives_signal_on_thursday():
@@ -158,6 +160,52 @@ def test_detector_silent_on_friday_afternoon():
 def test_detector_silent_on_weekend():
     assert _detect_with_break_at(SAT, 12) is None
     assert _detect_with_break_at(SUN, 12) is None
+
+
+# ── Крипта торгуется 24/7: окно к ней не применяется (7 августа 2026) ───────
+
+def test_round_clock_allows_weekend_entry():
+    """Суббота и воскресенье для крипты — обычные торговые дни."""
+    assert trading_week.is_entry_allowed(_ts(SAT, 12), round_clock=True)[0]
+    assert trading_week.is_entry_allowed(_ts(SUN, 12), round_clock=True)[0]
+    # Для всех остальных запрет на месте — это и есть смысл поинструментного признака.
+    assert not trading_week.is_entry_allowed(_ts(SAT, 12))[0]
+
+
+def test_round_clock_allows_friday_evening():
+    """Хвост недели крипту тоже не касается: гасить позицию к пятнице незачем."""
+    assert trading_week.is_entry_allowed(_ts(FRI, 20), round_clock=True)[0]
+    assert trading_week.is_entry_allowed(_ts(FRI, 20))[0] is False
+
+
+def test_detector_gives_crypto_signal_on_weekend():
+    """Сквозная проверка через боевой детектор: с ROUND_CLOCK сигнал в выходные есть,
+    без него — нет. Признак приходит снаружи (scheduler берёт его из реестра)."""
+    assert _detect_with_break_at(SAT, 12, round_clock=True) is not None
+    assert _detect_with_break_at(SUN, 12, round_clock=True) is not None
+    assert _detect_with_break_at(SAT, 12) is None
+
+
+def test_registry_marks_only_crypto_as_round_clock():
+    """Круглосуточны ровно крипто-пары. Форекс живёт на том же Kraken, но межбанк
+    в субботу закрыт — поэтому признак задан явным полем, а не выводом из биржи."""
+    import instruments
+    round_clock = {c for c in instruments.INSTRUMENTS if instruments.trades_round_clock(c)}
+    assert {"BTC", "ETH", "SOL", "TON", "LINK"} <= round_clock
+    assert not round_clock & {"EURUSD", "GBPUSD", "AUDUSD", "USDCAD", "GOLD", "BRENT"}
+    assert len(round_clock) == 14
+
+
+def test_round_clock_kill_switch():
+    """config.CRYPTO_ROUND_CLOCK=False возвращает крипту под общее окно — нужно
+    бэктесту (--no-round-clock), чтобы измерить цену решения."""
+    import instruments
+    assert instruments.trades_round_clock("BTC")
+    config.CRYPTO_ROUND_CLOCK = False
+    try:
+        assert not instruments.trades_round_clock("BTC")
+    finally:
+        config.CRYPTO_ROUND_CLOCK = True
 
 
 def test_week_filter_can_be_disabled_for_backtest():

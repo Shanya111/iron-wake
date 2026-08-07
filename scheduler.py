@@ -24,7 +24,8 @@ import database
 import llm
 import pattern_detector
 import trading_week
-from instruments import ccxt_symbol, data_source, fmt, infer_decimals, resolve
+from instruments import (ccxt_symbol, data_source, fmt, infer_decimals, resolve,
+                         trades_round_clock)
 
 
 def _yahoo_days(timeframe: str, limit: int) -> int:
@@ -57,6 +58,30 @@ def _subscribed_engine() -> list[str]:
     return [c for c in database.get_subscribed_instruments() if data_source(c)]
 
 
+async def trend_for(code: str, h1, h1_full=None) -> str:
+    """Тренд-ориентир для отбора сигналов — с таймфрейма config.TREND_TF.
+
+    h1 — рабочее окно (config.H1_LIMIT свечей), h1_full — полная выборка, из
+    которой ресемплится H4 (None → берём рабочее окно).
+
+    По умолчанию 'h1': сделка живёт внутри недели (вход пн–чт, выход к пятнице), и на
+    таком горизонте ориентир задаёт часовик — замером он обошёл дневку (+77.3R против
+    +10.6R). Тот же тренд показывает /analyze, то есть что видно в отчёте, то и
+    отбирает сигналы.
+
+    'h4' — средний слой, ресемпл из тех же часовых свечей (сетевого запроса нет).
+    'd1' — дневка, как было до перехода на недельный горизонт; только здесь и нужен
+    отдельный запрос дневных свечей, поэтому он делается лениво.
+    """
+    tf = config.TREND_TF
+    if tf == "h4":
+        return analyzer.get_trend(analyzer.resample_h4(h1_full if h1_full is not None else h1))
+    if tf == "d1":
+        d1 = await fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
+        return analyzer.get_trend(d1)
+    return analyzer.get_trend(h1)
+
+
 async def run_analysis(bot=None) -> None:
     """Контекстный анализ (раз в час): тренд H1/D1 + уровни D1/H1 + зоны ликвидности → БД."""
     codes = _subscribed_engine()
@@ -64,7 +89,7 @@ async def run_analysis(bot=None) -> None:
     for code in codes:
         try:
             d1 = await fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
-            h1 = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+            h1 = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_FETCH_LIMIT)
         except Exception as e:
             print(f"[run_analysis] {code}: ошибка данных: {e}")
             continue
@@ -72,10 +97,23 @@ async def run_analysis(bot=None) -> None:
 
 
 def analyze_and_store(code: str, d1, h1) -> list[dict]:
-    """Считает уровни/зоны по D1+H1, сохраняет в БД и возвращает их (для /analyze)."""
+    """Считает уровни/зоны по D1+H4+H1, сохраняет в БД и возвращает их (для /analyze).
+
+    h1 — полная выборка (config.H1_FETCH_LIMIT). Уровни и зоны считаются по РАБОЧЕМУ
+    окну (config.H1_LIMIT, хвост выборки) — ширина этого окна задаёт набор уровней и
+    менять её заодно со слоем H4 нельзя. Полная выборка нужна только для ресемпла H4.
+    """
+    work = h1.tail(config.H1_LIMIT)
     global_levels = analyzer.find_levels(d1, config.D1_PIVOT_WINDOW, "D1")
-    local_levels = analyzer.find_levels(h1, config.H1_PIVOT_WINDOW, "H1")
-    prioritized = analyzer.prioritize_levels(global_levels, local_levels)
+    local_levels = analyzer.find_levels(work, config.H1_PIVOT_WINDOW, "H1")
+    # Средний слой H4 — ресемпл из тех же часовых свечей, лишних запросов нет.
+    # В отбор сигналов он идёт только при H4_LEVELS; в /analyze показывается всегда,
+    # поэтому уровни считаем в любом случае и просто не отдаём их в prioritize.
+    mid_levels = analyzer.find_levels(
+        analyzer.resample_h4(h1), config.H4_PIVOT_WINDOW, "H4")
+    prioritized = analyzer.prioritize_levels(
+        global_levels, local_levels,
+        mid_levels=mid_levels if config.H4_LEVELS else None)
     zones = analyzer.find_liquidity_zones(d1)
     liquidity_rows = [
         {"price": z["price"], "type": "liquidity", "strength": "strong",
@@ -88,15 +126,17 @@ def analyze_and_store(code: str, d1, h1) -> list[dict]:
     # сама по себе, иначе она «пробивала» бы уровень, построенный по ней же.
     tradable_zones = []
     if config.LIQ_LEVELS != "off":
-        source = h1.iloc[:-config.LIQ_SKIP_LAST] if config.LIQ_SKIP_LAST else h1
+        source = work.iloc[:-config.LIQ_SKIP_LAST] if config.LIQ_SKIP_LAST else work
         tradable_zones = analyzer.liquidity_levels(
             analyzer.find_liquidity_zones(source), config.LIQ_LEVELS)
     database.save_levels(code, prioritized + tradable_zones + liquidity_rows)
     # Печатаем оба тренда: H1 — рабочий (по нему отбираются сигналы и строится
     # /analyze), D1 — фон. Когда сигналов нет, по логу сразу видно, тренд ли виноват.
     print(f"[analysis] {code}: тренд H1={analyzer.get_trend(h1)} "
-          f"(D1={analyzer.get_trend(d1)}), "
-          f"уровней={len(prioritized)}, зон ликвидности={len(zones)}, "
+          f"(H4={analyzer.get_trend(analyzer.resample_h4(h1))}, "
+          f"D1={analyzer.get_trend(d1)}), "
+          f"уровней={len(prioritized)}, из них H4={len(mid_levels) if config.H4_LEVELS else 0}, "
+          f"зон ликвидности={len(zones)}, "
           f"торгуемых зон H1={len(tradable_zones) // 2}")
     return prioritized
 
@@ -112,34 +152,59 @@ async def monitor_signals(bot) -> None:
     # Недельное окно проверяем дважды: здесь — по текущему времени, в детекторе —
     # по времени свечи. Без этой проверки сигнал по свече четверга 23:00 ушёл бы
     # подписчику в пятницу 00:05, и вход по факту оказался бы пятничным.
-    allowed, why = trading_week.is_entry_allowed(datetime.now(timezone.utc))
-    if not allowed:
-        print(f"[monitor_signals] вне недельного окна ({why}) — новых входов не даём")
-        return
+    #
+    # Проверка ПОИНСТРУМЕНТНАЯ, а не общая на цикл: крипта торгуется без выходных
+    # (trades_round_clock), и общий ранний выход глушил бы её вместе с форексом.
+    # Цена этого — на выходных цикл всё равно ходит на биржу за крипто-свечами;
+    # раньше он выходил сразу. Это осознанный размен, ради него всё и делалось.
+    now = datetime.now(timezone.utc)
     codes = _subscribed_engine()
+    if not any(trades_round_clock(c) for c in codes):
+        allowed, why = trading_week.is_entry_allowed(now)
+        if not allowed:
+            print(f"[monitor_signals] вне недельного окна ({why}) — новых входов не даём")
+            return
     for code in codes:
         subscribers = database.get_subscribers(code)
         if not subscribers:
             continue
+        round_clock = trades_round_clock(code)
+        allowed, why = trading_week.is_entry_allowed(now, round_clock=round_clock)
+        if not allowed:
+            continue
         try:
-            h1 = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+            # Тянем полную выборку (из неё ресемплится H4), а детектору и тренду
+            # отдаём РАБОЧЕЕ окно — его ширина задаёт набор уровней и меняться
+            # заодно со слоем H4 не должна.
+            h1_full = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_FETCH_LIMIT)
+            h1 = h1_full.tail(config.H1_LIMIT)
         except Exception as e:
             print(f"[monitor_signals] {code}: ошибка данных: {e}")
             continue
-        # Фильтр направления — по ЧАСОВОМУ тренду: сделка живёт внутри недели
-        # (вход пн–чт, выход к пятнице), и на таком горизонте ориентир задаёт H1,
-        # а не дневка. Тот же тренд показывает /analyze — что видно в отчёте, то
-        # и отбирает сигналы. Дневные свечи здесь больше не нужны (уровни D1
-        # приходят из БД, их считает run_analysis) — лишний запрос убран.
-        trend = analyzer.get_trend(h1)
+        # Фильтр направления — с таймфрейма config.TREND_TF (по умолчанию часовик,
+        # см. trend_for). Дневные свечи при этом обычно не запрашиваются: уровни D1
+        # приходят из БД, их считает run_analysis.
+        try:
+            trend = await trend_for(code, h1, h1_full)
+            # Дневной тренд нужен только мягкому гейту (config.D1_GATE). Пока он
+            # выключен, дневные свечи не запрашиваются вовсе — лишний запрос к
+            # источнику на каждый инструмент каждые 5 минут того не стоит.
+            higher_trend = None
+            if config.D1_GATE != "off" and config.TREND_TF != "d1":
+                d1 = await fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
+                higher_trend = analyzer.get_trend(d1)
+        except Exception as e:
+            print(f"[monitor_signals] {code}: ошибка тренда: {e}")
+            continue
         levels = database.get_levels(code)
         # Комментарий LLM считаем один раз на одинаковый сигнал в цикле (а не на каждого
         # подписчика): ключ — паттерн+направление+цель (цель зависит от личного R:R).
         comment_cache: dict[tuple, str | None] = {}
         for user_id in subscribers:
             settings = config.effective(database.get_user_settings(user_id))
+            settings["ROUND_CLOCK"] = round_clock
             for detector in (pattern_detector.detect_spring, pattern_detector.detect_upthrust):
-                signal = detector(h1, levels, trend, settings)
+                signal = detector(h1, levels, trend, settings, higher_trend)
                 if signal is None:
                     continue
                 # Дедуп персональный: тот же паттерн тому же пользователю не чаще,
@@ -170,7 +235,7 @@ async def track_signals(bot) -> None:
     candles: dict[str, object] = {}
     for code in {s["instrument"] for s in open_signals}:
         try:
-            candles[code] = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+            candles[code] = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_FETCH_LIMIT)
         except Exception as e:
             print(f"[track_signals] {code}: ошибка данных: {e}")
     for s in open_signals:
@@ -179,8 +244,11 @@ async def track_signals(bot) -> None:
             continue
         # week_close=True — через выходные сделку не тянем: не дошла до цели/стопа
         # к пятничному закрытию, гасим по рынку (см. trading_week и config).
+        # У крипты выходных нет, поэтому её сделки к пятнице НЕ гасим — они живут
+        # до цели, стопа или истечения SIGNAL_EXPIRE_HOURS.
         res = pattern_detector.evaluate_signal_detailed(
-            s, df, week_close=config.FORCE_CLOSE_AT_WEEK_END)
+            s, df, week_close=(config.FORCE_CLOSE_AT_WEEK_END
+                               and not trades_round_clock(s["instrument"])))
         outcome = res["status"]
         if outcome == "pending":
             continue
@@ -205,7 +273,7 @@ async def track_trades(bot) -> None:
     for code in {t["instrument"] for t in trades}:
         try:
             if ccxt_symbol(code):
-                candles[code] = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+                candles[code] = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_FETCH_LIMIT)
             else:
                 ticker = resolve(code)["ticker"]
                 candles[code] = await asyncio.to_thread(database.get_hourly_candles, ticker)
@@ -311,14 +379,16 @@ async def _signal_comment(code: str, signal: dict, trend: str) -> str | None:
         except Exception:
             dom = ""
     trend_ru = {"up": "восходящий", "down": "нисходящий", "sideways": "боковик"}[trend]
-    strength = "сильный (часовой совпал с дневным)" if signal["priority"] == "high" else "обычный"
+    senior = "дневным или четырёхчасовым" if config.H4_LEVELS else "дневным"
+    strength = (f"сильный (часовой совпал с {senior})"
+                if signal["priority"] == "high" else "обычный")
     pat = ("Spring — ложный пробой поддержки вниз с возвратом (лонг)"
            if signal["pattern"] == "spring"
            else "Upthrust — ложный пробой сопротивления вверх с возвратом (шорт)")
     summary = (
         f"Инструмент: {info['name']}\n"
         f"Паттерн: {pat}\n"
-        f"Тренд H1 (рабочий): {trend_ru}\n"
+        f"Тренд {config.TREND_TF.upper()} (рабочий): {trend_ru}\n"
         f"Сила пробитого уровня: {strength}\n"
         f"Вход {fmt(signal['entry_price'], d)}, стоп {fmt(signal['stop_loss'], d)}, "
         f"цель {fmt(signal['take_profit'], d)}.\n"

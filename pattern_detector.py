@@ -15,17 +15,24 @@ import trading_week
 
 
 def detect_spring(df: pd.DataFrame, levels: list[dict], trend: str,
-                  settings: dict | None = None) -> dict | None:
+                  settings: dict | None = None,
+                  higher_trend: str | None = None) -> dict | None:
     """Бычий Spring. Фильтр тренда: при нисходящем тренде ('down') не сигналим.
-    settings — персональные пороги подписчика (None → общие из config)."""
-    return _detect(df, levels, trend, side="long", settings=settings)
+    settings — персональные пороги подписчика (None → общие из config).
+    higher_trend — тренд старшего таймфрейма (дневки) для мягкого гейта D1_GATE;
+    None → гейт не работает, поведение ровно прежнее."""
+    return _detect(df, levels, trend, side="long", settings=settings,
+                   higher_trend=higher_trend)
 
 
 def detect_upthrust(df: pd.DataFrame, levels: list[dict], trend: str,
-                    settings: dict | None = None) -> dict | None:
+                    settings: dict | None = None,
+                    higher_trend: str | None = None) -> dict | None:
     """Медвежий Upthrust — зеркало Spring. При восходящем тренде ('up') не сигналим.
-    settings — персональные пороги подписчика (None → общие из config)."""
-    return _detect(df, levels, trend, side="short", settings=settings)
+    settings — персональные пороги подписчика (None → общие из config).
+    higher_trend — см. detect_spring."""
+    return _detect(df, levels, trend, side="short", settings=settings,
+                   higher_trend=higher_trend)
 
 
 def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
@@ -108,7 +115,8 @@ def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool,
 
 
 def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
-            settings: dict | None = None) -> dict | None:
+            settings: dict | None = None,
+            higher_trend: str | None = None) -> dict | None:
     # Действующие пороги: личные значения подписчика поверх общих (None → общие).
     s = settings or {}
     vol_mult = s.get("VOL_MULT", config.VOL_MULT)
@@ -132,13 +140,37 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     if side == "short" and trend == "up":
         return None
 
+    # Дневка как контекст режима рынка (config.D1_GATE). Дневной тренд приходит
+    # отдельно от рабочего: рабочий решает, бывает ли сигнал вообще, дневной —
+    # насколько строго его спрашивать. higher_trend=None → гейта нет (прежнее
+    # поведение), 'sideways' у дневки ограничением не считается.
+    d1_gate = s.get("D1_GATE", config.D1_GATE)
+    d1_confirm = s.get("D1_CONFIRM", config.D1_CONFIRM)
+    against_d1 = (
+        higher_trend is not None and d1_gate != "off"
+        and ((side == "long" and higher_trend == "down")
+             or (side == "short" and higher_trend == "up"))
+    )
+    if against_d1 and d1_gate == "hard":
+        return None
+    # Подтверждение повышенным R:R — это НЕ пост-фильтр, а поднятый порог: он двигает
+    # и запасную цель (MIN_RR × риск), а не только отсеивает сигналы. Разницу между
+    # «отобрать сделки с большим R:R» и «требовать больший R:R заранее» мы уже
+    # проходили на MIN_RR — результаты вышли противоположные (см. CLAUDE.md).
+    if against_d1 and d1_confirm == "rr":
+        min_rr = max(min_rr, s.get("D1_CONFIRM_RR", config.D1_CONFIRM_RR))
+
     pos = len(df) - 2  # последняя закрытая свеча
     # Недельное окно: в пятницу и на выходных входов не даём вообще, и не даём,
     # если до закрытия недели осталось меньше MIN_HOURS_BEFORE_CLOSE — сделка не
     # успеет отработать, а через выходные мы ничего не переносим (trading_week).
     # WEEK_FILTER=False отключает проверку — нужно бэктесту, чтобы сравнить с «как было».
+    # ROUND_CLOCK — инструмент торгуется без выходных (крипта): окно к нему не
+    # применяется. Признак приходит СНАРУЖИ (scheduler/backtest берут его из
+    # instruments.trades_round_clock), детектор реестр не читает.
     if s.get("WEEK_FILTER", True):
-        allowed, _ = trading_week.is_entry_allowed(df.index[pos])
+        allowed, _ = trading_week.is_entry_allowed(
+            df.index[pos], round_clock=s.get("ROUND_CLOCK", False))
         if not allowed:
             return None
     candle = df.iloc[pos]
@@ -147,6 +179,13 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     # Условие №3: аномальный объём на свече пробоя (множитель или процентиль).
     if not _volume_ok(df, pos, s, vol_mult):
         return None
+
+    # Подтверждение объёмом для сделки против дневки: тот же процентиль, но выше.
+    # От уровня не зависит, поэтому проверяем здесь, до перебора уровней.
+    if against_d1 and d1_confirm == "volume":
+        pctl = s.get("D1_CONFIRM_PCTL", config.D1_CONFIRM_PCTL)
+        if not _volume_ok(df, pos, {**s, "VOL_MODE": "pctl", "VOL_PCTL": pctl}, vol_mult):
+            return None
 
     # Фильтр «поглощение» (VSA): тело свечи маленькое относительно её размаха —
     # цена сходила далеко, а закрылась почти там же, откуда открылась. По методике
@@ -183,6 +222,11 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
 
     level_type = "support" if side == "long" else "resistance"
     relevant = [lvl for lvl in levels if lvl["type"] == level_type]
+    # Фильтр дистанции входа до уровня. В отличие от MAX_RISK_ATR (он про размах свечи
+    # и от уровня не зависит) этот порог зависит от КОНКРЕТНОГО уровня, поэтому
+    # проверяется внутри цикла: один и тот же бар может быть «у уровня» для ближнего
+    # и «вдогонку» для дальнего. См. пояснение в config.MAX_ENTRY_DIST_ATR.
+    max_entry_dist = s.get("MAX_ENTRY_DIST_ATR", config.MAX_ENTRY_DIST_ATR)
 
     for lvl in relevant:
         price = lvl["price"]
@@ -193,6 +237,14 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             broke = h > price * (1 + break_pct)    # пробили сопротивление вверх
             returned = c < price                   # закрылись обратно ниже
         if not (broke and returned):
+            continue
+        # Закрылись слишком далеко от уровня — вход вдогонку, а не от уровня.
+        # Другой уровень в списке может оказаться ближе, поэтому continue, не return.
+        if atr > 0 and max_entry_dist and abs(c - price) > atr * max_entry_dist:
+            continue
+        # Подтверждение силой уровня для сделки против дневки: против старшего
+        # тренда идём только от уровня, подтверждённого старшим таймфреймом.
+        if against_d1 and d1_confirm == "strong" and lvl.get("strength") != "strong":
             continue
 
         priority = "high" if lvl.get("strength") == "strong" else "normal"

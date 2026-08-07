@@ -135,10 +135,11 @@ def test_summary_counts_swept_and_ran():
 # Фикстуры ниже проверяют ДРУГУЮ логику — как варианты стопа доезжают до боевого
 # детектора. Свеча пробоя у них нарочно размашистая (сходили на 98 и вернулись),
 # чтобы паттерн был однозначен, а боевые фильтры отбора такой вход как раз бракуют:
-# цену входа — по риску в ATR, «поглощение» — по слишком большому телу. Поэтому оба
-# отключены явно; у самих фильтров свои тесты в tests/test_engine.py.
-BASE = {"BREAK_PCT": 0.0005, "MIN_RR": 1.5,
-        "MAX_RISK_ATR": None, "MAX_BODY_RATIO": None}
+# цену входа — по риску в ATR, дистанцию — по расстоянию закрытия до уровня,
+# «поглощение» — по слишком большому телу. Поэтому все три отключены явно; у самих
+# фильтров свои тесты в tests/test_engine.py.
+BASE = {"BREAK_PCT": 0.0005, "MIN_RR": 1.5, "MAX_RISK_ATR": None,
+        "MAX_ENTRY_DIST_ATR": None, "MAX_BODY_RATIO": None}
 
 
 def _spring_setup():
@@ -275,6 +276,62 @@ def test_atr_on_constant_range():
     rows = [(100, 101, 99, 100, 10) for _ in range(30)]
     atr = backtest._atr(_df(rows), period=14)
     assert round(float(atr.iloc[-1]), 6) == 2.0
+
+
+# ── Новые переборы: дистанция, слой H4, дневной гейт ────────────────────────
+
+def _base() -> dict:
+    return config.effective({})
+
+
+def test_dist_sweep_has_current_variant_and_grid():
+    """Перебор обязан содержать вариант «как сейчас» — иначе не с чем сравнивать."""
+    names = [v["name"] for v in backtest.build_variants("dist", _base())]
+    assert any("сейчас" in n for n in names)
+    assert len(names) == 1 + len(backtest.ENTRY_DISTS)
+
+
+def test_dist_sweep_patches_only_distance():
+    """Вариант меняет ровно один рычаг: иначе непонятно, что дало разницу."""
+    for v in backtest.build_variants("dist", _base()):
+        assert set(v["patch"](1.0)) <= {"MAX_ENTRY_DIST_ATR"}
+
+
+def test_tf_sweep_covers_all_timeframes():
+    """Три таймфрейма тренда плюс уровни H4 — и комбинации, потому что рычаги,
+    полезные по отдельности, вместе могут мешать друг другу."""
+    variants = backtest.build_variants("tf", _base())
+    assert {v["trend_tf"] for v in variants} == {"h1", "h4", "d1"}
+    assert {v["h4"] for v in variants} == {True, False}
+
+
+def test_d1_sweep_includes_hard_control():
+    """Жёсткий запрет контртренда обязан быть в переборе контролем: без него
+    не видно, отличается ли мягкий гейт от простого запрета."""
+    patches = [v["patch"](1.0) for v in backtest.build_variants("d1", _base())]
+    gates = {p.get("D1_GATE") for p in patches}
+    assert gates == {"off", "soft", "hard"}
+    assert {p.get("D1_CONFIRM") for p in patches if p.get("D1_GATE") == "soft"} == \
+        {"strong", "volume", "rr"}
+
+
+def test_d1_sweep_marks_variants_needing_daily_trend():
+    """Вариантам с гейтом нужен дневной тренд, даже когда рабочий ТФ часовой.
+    Флаг needs_d1 — то, по чему replay решает его посчитать."""
+    for v in backtest.build_variants("d1", _base()):
+        needs = v["patch"](1.0).get("D1_GATE") != "off"
+        assert bool(v.get("needs_d1")) == needs
+
+
+def test_levels_at_h4_adds_levels():
+    """Средний слой добавляет уровни, а без него набор ровно прежний."""
+    rows = [(100 + i % 5, 102 + i % 5, 98 + i % 5, 100 + i % 5, 100.0) for i in range(80)]
+    h1 = _df(rows)
+    d1 = _df([(100, 105, 95, 100, 1000.0) for _ in range(20)])
+    plain = backtest._levels_at(d1, h1, "off", h4_levels=False)
+    with_h4 = backtest._levels_at(d1, h1, "off", h4_levels=True)
+    assert len(with_h4) >= len(plain)
+    assert not any(l.get("timeframe") == "H4" for l in plain)
 
 
 if __name__ == "__main__":
