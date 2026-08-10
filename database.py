@@ -5,7 +5,6 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-import config
 from instruments import infer_decimals
 
 DB_PATH = Path(__file__).parent / "bot.db"
@@ -119,13 +118,6 @@ def init_db() -> None:
             conn.execute("ALTER TABLE signals ADD COLUMN user_id INTEGER")
         except sqlite3.OperationalError:
             pass  # колонка уже есть
-        # Цена выхода. Заполняется только у сигналов, погашенных на закрытии недели
-        # (status='closed_week'): у них нет ни цели, ни стопа, и итог в R считается
-        # по фактической цене выхода. У остальных — NULL (выход = цель или стоп).
-        try:
-            conn.execute("ALTER TABLE signals ADD COLUMN exit_price REAL")
-        except sqlite3.OperationalError:
-            pass  # колонка уже есть
         # Подписки пользователей на сигналы по инструменту.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -167,14 +159,6 @@ def init_db() -> None:
                 UNIQUE(user_id, key)
             )
         """)
-        # Чистим личные пороги, которых больше нет в /settings (например
-        # LIQUIDITY_MULT — он оказался про отображение зон, а не про сигналы).
-        # Иначе в таблице копятся строки, которые никто уже не читает.
-        placeholders = ",".join("?" for _ in config.TUNABLE)
-        conn.execute(
-            f"DELETE FROM user_settings WHERE key NOT IN ({placeholders})",
-            config.TUNABLE,
-        )
         conn.commit()
 
 
@@ -432,14 +416,10 @@ def get_open_signals() -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def update_signal_status(signal_id: int, status: str,
-                         exit_price: float | None = None) -> None:
-    """Меняет статус сигнала (pending → hit_tp | hit_sl | closed_week | expired).
-    exit_price задаётся только для 'closed_week' — сигнал погашен по рынку на
-    закрытии недели, и итог в R считается по этой цене."""
+def update_signal_status(signal_id: int, status: str) -> None:
+    """Меняет статус сигнала (pending → hit_tp | hit_sl | expired)."""
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("UPDATE signals SET status = ?, exit_price = ? WHERE id = ?",
-                     (status, exit_price, signal_id))
+        conn.execute("UPDATE signals SET status = ? WHERE id = ?", (status, signal_id))
         conn.commit()
 
 
@@ -464,7 +444,7 @@ def get_recent_signals(user_id: int, limit: int = 10) -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             SELECT instrument, pattern, direction, entry_price, stop_loss, take_profit,
-                   priority, status, exit_price, created_at
+                   priority, status, created_at
             FROM signals
             WHERE user_id = ? OR user_id IS NULL
             ORDER BY id DESC LIMIT ?
@@ -479,8 +459,7 @@ def get_signals_since(user_id: int, since: str | None = None) -> list[dict]:
     created_at хранится строкой ISO 8601 фиксированного формата, поэтому
     лексикографическое сравнение = хронологическое."""
     query = """
-        SELECT instrument, direction, entry_price, stop_loss, take_profit, status,
-               exit_price
+        SELECT instrument, direction, entry_price, stop_loss, take_profit, status
         FROM signals
         WHERE (user_id = ? OR user_id IS NULL)
     """

@@ -11,28 +11,20 @@ Upthrust — зеркало по сопротивлению (пробой вве
 import pandas as pd
 
 import config
-import trading_week
 
 
 def detect_spring(df: pd.DataFrame, levels: list[dict], trend: str,
-                  settings: dict | None = None,
-                  higher_trend: str | None = None) -> dict | None:
+                  settings: dict | None = None) -> dict | None:
     """Бычий Spring. Фильтр тренда: при нисходящем тренде ('down') не сигналим.
-    settings — персональные пороги подписчика (None → общие из config).
-    higher_trend — тренд старшего таймфрейма (дневки) для мягкого гейта D1_GATE;
-    None → гейт не работает, поведение ровно прежнее."""
-    return _detect(df, levels, trend, side="long", settings=settings,
-                   higher_trend=higher_trend)
+    settings — персональные пороги подписчика (None → общие из config)."""
+    return _detect(df, levels, trend, side="long", settings=settings)
 
 
 def detect_upthrust(df: pd.DataFrame, levels: list[dict], trend: str,
-                    settings: dict | None = None,
-                    higher_trend: str | None = None) -> dict | None:
+                    settings: dict | None = None) -> dict | None:
     """Медвежий Upthrust — зеркало Spring. При восходящем тренде ('up') не сигналим.
-    settings — персональные пороги подписчика (None → общие из config).
-    higher_trend — см. detect_spring."""
-    return _detect(df, levels, trend, side="short", settings=settings,
-                   higher_trend=higher_trend)
+    settings — персональные пороги подписчика (None → общие из config)."""
+    return _detect(df, levels, trend, side="short", settings=settings)
 
 
 def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
@@ -42,71 +34,11 @@ def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
     return float(window.mean()) if len(window) else 0.0
 
 
-def _volume_ok(df: pd.DataFrame, pos: int, s: dict, vol_mult: float) -> bool:
-    """Аномален ли объём свечи `pos`? Два способа, см. config.VOL_MODE.
-
-    «mult» — объём ≥ среднего за VOL_LOOKBACK свечей × vol_mult (как было всегда).
-    «pctl» — объём выше VOL_PCTL-го процентиля за последние VOL_WINDOW свечей, то
-    есть свеча входит в самые объёмные среди соседних. Порог получается свой у
-    каждого инструмента и подстраивается сам: у золота с Yahoo объём неполный, и
-    требование «в 1.5 раза выше среднего» там режет нормальные сетапы, а «выше
-    80% соседей» — нет, потому что сравнивается с такими же неполными данными.
-
-    Окно в обоих случаях кончается ПЕРЕД свечой pos — саму свечу в свою же норму
-    не включаем, иначе она задирала бы порог, который сама должна перепрыгнуть.
-    """
-    vol = float(df["volume"].iloc[pos])
-    if s.get("VOL_MODE", config.VOL_MODE) == "pctl":
-        window_n = int(s.get("VOL_WINDOW", config.VOL_WINDOW))
-        pctl = float(s.get("VOL_PCTL", config.get("VOL_PCTL")))
-        window = df["volume"].iloc[max(0, pos - window_n):pos]
-        # На совсем коротком окне процентиль — шум, а не мера. Ниже VOL_LOOKBACK
-        # свечей не считаем вовсе (детектор и так требует такую историю).
-        if len(window) < config.VOL_LOOKBACK:
-            return False
-        threshold = float(window.quantile(pctl / 100))
-        return threshold > 0 and vol > threshold
-
-    avg_vol = _avg_volume(df, pos)
-    return avg_vol > 0 and vol >= avg_vol * vol_mult
-
-
-def _atr(df: pd.DataFrame, pos: int, period: int) -> float:
-    """ATR (средний истинный диапазон) на свече `pos` — мера волатильности.
-
-    Истинный диапазон свечи — наибольшее из: её размах, расстояние от её максимума
-    до вчерашнего закрытия и от минимума до него же (последние два ловят гэпы).
-    ATR — среднее такого диапазона за `period` свечей.
-
-    Нужен стопу: запас за экстремум свечи пробоя задаётся в долях ATR, а не в
-    процентах от цены. По бэктесту типичный свип у биткоина 0.32% от цены, а у
-    золота 0.10% — одним процентом им обоим не угодить, в долях ATR они втрое ближе.
-    """
-    start = max(0, pos - period + 1)
-    window = df.iloc[start:pos + 1]
-    prev_close = df["close"].shift(1).iloc[start:pos + 1]
-    tr = pd.concat([
-        window["high"] - window["low"],
-        (window["high"] - prev_close).abs(),
-        (window["low"] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    return float(tr.mean())
-
-
-def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool,
-             use_liquidity: bool = False):
-    """Ближайший уровень нужного типа выше (above=True) или ниже ref_price.
-
-    use_liquidity=False — зоны ликвидности в выборе ЦЕЛИ не участвуют, даже если
-    работают уровнями для пробоя. Причина замерена: зон много, ближайшая цель
-    оказывается слишком близко, R:R не дотягивает до порога и сигнал отбрасывается.
-    В прогоне это срезало число сделок вдвое (306 → 156) — то есть «зоны как цели»
-    не добавляют сетапы, а убивают уже имеющиеся. См. «Зоны ликвидности» в CLAUDE.md.
-    """
+def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool):
+    """Ближайший уровень нужного типа выше (above=True) или ниже ref_price."""
     prices = [
         l["price"] for l in levels
         if l["type"] == level_type
-        and (use_liquidity or not l.get("is_liquidity"))
         and (l["price"] > ref_price if above else l["price"] < ref_price)
     ]
     if not prices:
@@ -115,22 +47,12 @@ def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool,
 
 
 def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
-            settings: dict | None = None,
-            higher_trend: str | None = None) -> dict | None:
+            settings: dict | None = None) -> dict | None:
     # Действующие пороги: личные значения подписчика поверх общих (None → общие).
     s = settings or {}
-    vol_mult = s.get("VOL_MULT", config.VOL_MULT)
+    vol_mult = s.get("VOL_MULT", config.get("VOL_MULT"))
     break_pct = s.get("BREAK_PCT", config.get("BREAK_PCT"))
     min_rr = s.get("MIN_RR", config.get("MIN_RR"))
-    liq_target = s.get("LIQ_AS_TARGET", config.LIQ_AS_TARGET)
-    # Запас стопа за экстремум свечи пробоя — см. config.STOP_MODE. По умолчанию
-    # он в долях ATR (подстраивается под волатильность), запасной вариант — процент
-    # от цены. Настройки могут переопределить: STOP_ABS — готовый запас числом,
-    # STOP_SPREAD — явный процент. Оба нужны бэктесту, чтобы гонять варианты стопа
-    # через боевой детектор; явное переопределение всегда главнее режима из config.
-    stop_spread = s.get("STOP_SPREAD", config.STOP_SPREAD)
-    stop_abs = s.get("STOP_ABS")
-    use_atr = stop_abs is None and "STOP_SPREAD" not in s and config.STOP_MODE == "atr"
 
     if len(df) < config.VOL_LOOKBACK + 3:
         return None
@@ -140,93 +62,18 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     if side == "short" and trend == "up":
         return None
 
-    # Дневка как контекст режима рынка (config.D1_GATE). Дневной тренд приходит
-    # отдельно от рабочего: рабочий решает, бывает ли сигнал вообще, дневной —
-    # насколько строго его спрашивать. higher_trend=None → гейта нет (прежнее
-    # поведение), 'sideways' у дневки ограничением не считается.
-    d1_gate = s.get("D1_GATE", config.D1_GATE)
-    d1_confirm = s.get("D1_CONFIRM", config.D1_CONFIRM)
-    against_d1 = (
-        higher_trend is not None and d1_gate != "off"
-        and ((side == "long" and higher_trend == "down")
-             or (side == "short" and higher_trend == "up"))
-    )
-    if against_d1 and d1_gate == "hard":
-        return None
-    # Подтверждение повышенным R:R — это НЕ пост-фильтр, а поднятый порог: он двигает
-    # и запасную цель (MIN_RR × риск), а не только отсеивает сигналы. Разницу между
-    # «отобрать сделки с большим R:R» и «требовать больший R:R заранее» мы уже
-    # проходили на MIN_RR — результаты вышли противоположные (см. CLAUDE.md).
-    if against_d1 and d1_confirm == "rr":
-        min_rr = max(min_rr, s.get("D1_CONFIRM_RR", config.D1_CONFIRM_RR))
-
     pos = len(df) - 2  # последняя закрытая свеча
-    # Недельное окно: в пятницу и на выходных входов не даём вообще, и не даём,
-    # если до закрытия недели осталось меньше MIN_HOURS_BEFORE_CLOSE — сделка не
-    # успеет отработать, а через выходные мы ничего не переносим (trading_week).
-    # WEEK_FILTER=False отключает проверку — нужно бэктесту, чтобы сравнить с «как было».
-    # ROUND_CLOCK — инструмент торгуется без выходных (крипта): окно к нему не
-    # применяется. Признак приходит СНАРУЖИ (scheduler/backtest берут его из
-    # instruments.trades_round_clock), детектор реестр не читает.
-    if s.get("WEEK_FILTER", True):
-        allowed, _ = trading_week.is_entry_allowed(
-            df.index[pos], round_clock=s.get("ROUND_CLOCK", False))
-        if not allowed:
-            return None
     candle = df.iloc[pos]
     h, l, c = float(candle["high"]), float(candle["low"]), float(candle["close"])
+    vol = float(candle["volume"])
 
-    # Условие №3: аномальный объём на свече пробоя (множитель или процентиль).
-    if not _volume_ok(df, pos, s, vol_mult):
+    # Условие №3: аномальный объём на свече пробоя.
+    avg_vol = _avg_volume(df, pos)
+    if avg_vol <= 0 or vol < avg_vol * vol_mult:
         return None
-
-    # Подтверждение объёмом для сделки против дневки: тот же процентиль, но выше.
-    # От уровня не зависит, поэтому проверяем здесь, до перебора уровней.
-    if against_d1 and d1_confirm == "volume":
-        pctl = s.get("D1_CONFIRM_PCTL", config.D1_CONFIRM_PCTL)
-        if not _volume_ok(df, pos, {**s, "VOL_MODE": "pctl", "VOL_PCTL": pctl}, vol_mult):
-            return None
-
-    # Фильтр «поглощение» (VSA): тело свечи маленькое относительно её размаха —
-    # цена сходила далеко, а закрылась почти там же, откуда открылась. По методике
-    # это и есть признак, что крупный игрок принял весь объём. None — фильтр выключен.
-    max_body = s.get("MAX_BODY_RATIO", config.MAX_BODY_RATIO)
-    if max_body is not None:
-        span = h - l
-        if span <= 0:
-            return None
-        if abs(c - float(candle["open"])) / span > max_body:
-            return None
-
-    # ATR считаем только здесь, когда свеча уже прошла фильтр объёма — на каждом
-    # баре подряд это была бы лишняя работа.
-    atr = _atr(df, pos, config.STOP_ATR_PERIOD)
-    # Запас стопа в долях ATR (если включён режим "atr"). Не на чем посчитать
-    # (плоские свечи, короткая история) — молча падаем на процент.
-    if use_atr and atr > 0:
-        stop_abs = atr * config.STOP_ATR_MULT
-
-    # Фильтр цены входа: риск (закрытие → экстремум свечи пробоя + запас) не должен
-    # превышать MAX_RISK_ATR × ATR. Смысл не статистический, а механический: если
-    # свеча пробоя аномально большая, вход по её закрытию оказывается далеко от
-    # уровня — в конце размашистого бара. Пружина торгуется ОТ уровня, а не вдогонку,
-    # и такие «догоняющие» входы в бэктесте суммарно теряют (−15.4R на 63 сделках,
-    # минус на обеих половинах истории). Риск от уровня не зависит (вход — закрытие,
-    # стоп — экстремум той же свечи), поэтому считаем один раз до перебора уровней.
-    max_risk_atr = s.get("MAX_RISK_ATR", config.MAX_RISK_ATR)
-    if atr > 0 and max_risk_atr:
-        buffer = stop_abs if stop_abs is not None else (l if side == "long" else h) * stop_spread
-        risk_now = (c - l + buffer) if side == "long" else (h - c + buffer)
-        if risk_now > atr * max_risk_atr:
-            return None
 
     level_type = "support" if side == "long" else "resistance"
     relevant = [lvl for lvl in levels if lvl["type"] == level_type]
-    # Фильтр дистанции входа до уровня. В отличие от MAX_RISK_ATR (он про размах свечи
-    # и от уровня не зависит) этот порог зависит от КОНКРЕТНОГО уровня, поэтому
-    # проверяется внутри цикла: один и тот же бар может быть «у уровня» для ближнего
-    # и «вдогонку» для дальнего. См. пояснение в config.MAX_ENTRY_DIST_ATR.
-    max_entry_dist = s.get("MAX_ENTRY_DIST_ATR", config.MAX_ENTRY_DIST_ATR)
 
     for lvl in relevant:
         price = lvl["price"]
@@ -238,14 +85,6 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             returned = c < price                   # закрылись обратно ниже
         if not (broke and returned):
             continue
-        # Закрылись слишком далеко от уровня — вход вдогонку, а не от уровня.
-        # Другой уровень в списке может оказаться ближе, поэтому continue, не return.
-        if atr > 0 and max_entry_dist and abs(c - price) > atr * max_entry_dist:
-            continue
-        # Подтверждение силой уровня для сделки против дневки: против старшего
-        # тренда идём только от уровня, подтверждённого старшим таймфреймом.
-        if against_d1 and d1_confirm == "strong" and lvl.get("strength") != "strong":
-            continue
 
         priority = "high" if lvl.get("strength") == "strong" else "normal"
         # Минимальный R:R (прибыль/риск). Цель — ближайший противоположный уровень,
@@ -253,10 +92,9 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
         # невыгодна, пропускаем. Нет уровня впереди → ставим цель ровно на MIN_RR×риск.
         if side == "long":
             entry = c
-            stop = l - (stop_abs if stop_abs is not None else l * stop_spread)
+            stop = l * (1 - config.STOP_SPREAD)
             risk = entry - stop
-            target = _nearest(levels, "resistance", entry, above=True,
-                              use_liquidity=liq_target)
+            target = _nearest(levels, "resistance", entry, above=True)
             if target is None:
                 tp = entry + risk * min_rr
             elif (target - entry) >= risk * min_rr:
@@ -265,10 +103,9 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
                 continue
         else:
             entry = c
-            stop = h + (stop_abs if stop_abs is not None else h * stop_spread)
+            stop = h * (1 + config.STOP_SPREAD)
             risk = stop - entry
-            target = _nearest(levels, "support", entry, above=False,
-                              use_liquidity=liq_target)
+            target = _nearest(levels, "support", entry, above=False)
             if target is None:
                 tp = entry - risk * min_rr
             elif (entry - target) >= risk * min_rr:
@@ -289,123 +126,44 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     return None
 
 
-def pullback_entry(signal: dict, future: pd.DataFrame, frac: float | None = None,
-                   wait_bars: int | None = None,
-                   optimistic: bool = False) -> dict | None:
-    """Уточнение входа откатом к пробитому уровню.
-
-    Сигнал ищется как обычно, но вместо входа по закрытию свечи пробоя ставим
-    отложенную заявку ближе к уровню: `frac` — какую долю пути от закрытия к уровню
-    ждём (0.5 — полпути, 1.0 — сам уровень). Стоп и цель НЕ меняются, поэтому вход
-    ближе к стопу даёт больший R:R при том же исходе по ценам.
-
-    Возвращает сигнал с новым входом или **None**, если откат не случился — это и
-    есть цена приёма: пропущенные сделки. Причём пропускаются в первую очередь самые
-    сильные движения (что сразу пошло к цели, то не откатывалось).
-
-    Порядок событий внутри часовой свечи неизвестен, поэтому есть две границы:
-      • optimistic=False (по умолчанию) — если свеча накрыла и нашу цену, и цель,
-        считаем, что цель была раньше, и вход ПРОПУЩЕН (осторожно);
-      • optimistic=True — считаем, что заявка успела исполниться.
-    Если вывод одинаков на обеих границах, он не зависит от того, чего мы не видим.
-    """
-    frac = config.ENTRY_PULLBACK if frac is None else frac
-    wait_bars = config.ENTRY_WAIT_BARS if wait_bars is None else wait_bars
-    if not frac:
-        return signal
-
-    long = signal["direction"] == "long"
-    entry, stop, tp = signal["entry_price"], signal["stop_loss"], signal["take_profit"]
-    level = signal["level_price"]
-    limit = entry - frac * (entry - level) if long else entry + frac * (level - entry)
-    # Заявка не должна оказаться за стопом — иначе риска не остаётся вовсе.
-    if (limit <= stop) if long else (limit >= stop):
-        return None
-
-    for ts, c in future.iloc[:wait_bars].iterrows():
-        hi, lo = float(c["high"]), float(c["low"])
-        hit_limit = lo <= limit if long else hi >= limit
-        hit_tp = hi >= tp if long else lo <= tp
-        hit_stop = lo <= stop if long else hi >= stop
-        if hit_tp and not (hit_limit and optimistic):
-            return None          # ушла к цели без нас — сделка пропущена
-        if not hit_limit:
-            continue
-        # Заявка исполнилась. Стоп лежит дальше нашей цены (для лонга ниже неё),
-        # поэтому если свеча дошла и до него, порядок однозначен: сначала вход,
-        # потом стоп — сделка открылась и тут же закрылась в минус.
-        return {**signal, "entry_price": limit, "bar_time": str(ts),
-                "stopped_at_fill": bool(hit_stop)}
-    return None                  # за отведённое время откат не случился
-
-
-def evaluate_signal(signal: dict, df: pd.DataFrame, week_close: bool = False) -> str:
-    """Исход открытого сигнала одной строкой (см. evaluate_signal_detailed)."""
-    return evaluate_signal_detailed(signal, df, week_close)["status"]
-
-
-def evaluate_signal_detailed(signal: dict, df: pd.DataFrame,
-                             week_close: bool = False) -> dict:
+def evaluate_signal(signal: dict, df: pd.DataFrame) -> str:
     """Исход открытого сигнала по свечам, появившимся ПОСЛЕ свечи пробоя.
 
     Вход в сделку — это закрытие свечи пробоя (signal['bar_time']), поэтому смотрим
-    только свечи строго после неё. Возвращает {status, exit_price, exit_time}, где
-    status:
-      • 'hit_tp'      — цена дошла до цели (плюс);
-      • 'hit_sl'      — цена дошла до стопа (минус);
-      • 'closed_week' — не дошла никуда до закрытия недели и погашена по рынку
-                        (только при week_close=True; цена выхода — в exit_price);
-      • 'expired'     — за SIGNAL_EXPIRE_HOURS не дошла никуда (исход неизвестен);
-      • 'pending'     — пока рано, ждём дальше.
-
-    week_close=True включает недельное окно: за пятничное закрытие сделку не
-    тянем, гасим по последней свече перед ним (см. trading_week). Журнал сделок
-    вызывает с week_close=False — там сделки закрывает сам пользователь.
+    только свечи строго после неё. Возвращает:
+      • 'hit_tp'  — цена дошла до цели (плюс);
+      • 'hit_sl'  — цена дошла до стопа (минус);
+      • 'expired' — за SIGNAL_EXPIRE_HOURS не дошла никуда (исход неизвестен);
+      • 'pending' — пока рано, ждём дальше.
 
     Внутри одной свечи порядок касаний неизвестен, поэтому при двусмысленности
     (свеча накрыла и стоп, и цель) считаем консервативно — сначала стоп.
     Если у сигнала нет якоря bar_time (старый сигнал до 2-й волны) — не трогаем
     его ('pending'): без точки отсчёта исход не определить честно.
     """
-    def result(status, price=None, ts=None):
-        return {"status": status, "exit_price": price, "exit_time": ts}
-
     bar_time = signal.get("bar_time")
     if not bar_time:
-        return result("pending")
+        return "pending"
     after = df[df.index > pd.Timestamp(bar_time)]
     if after.empty:
-        return result("pending")
-
-    deadline = trading_week.week_close_after(bar_time) if week_close else None
-    if deadline is not None:
-        after = after[after.index <= deadline]  # за закрытие недели не заглядываем
-        if after.empty:
-            return result("pending")
+        return "pending"
 
     stop, tp = signal["stop_loss"], signal["take_profit"]
     long = signal["direction"] == "long"
-    for ts, c in after.iterrows():
+    for _, c in after.iterrows():
         hi, lo = float(c["high"]), float(c["low"])
         if long:
             if lo <= stop:
-                return result("hit_sl", stop, ts)
+                return "hit_sl"
             if hi >= tp:
-                return result("hit_tp", tp, ts)
+                return "hit_tp"
         else:
             if hi >= stop:
-                return result("hit_sl", stop, ts)
+                return "hit_sl"
             if lo <= tp:
-                return result("hit_tp", tp, ts)
+                return "hit_tp"
 
-    # С недельным окном горизонт сигнала задаёт закрытие недели: `after` обрезан
-    # дедлайном, а от понедельника до пятничного закрытия максимум 117ч — меньше
-    # SIGNAL_EXPIRE_HOURS (120ч). То есть сигнал понедельника доживает до пятницы
-    # и гасится по рынку, а не истекает на середине недели. 'expired' остаётся
-    # для вызовов без окна (журнал сделок) и на случай дыр в данных.
     age_hours = (after.index[-1] - pd.Timestamp(bar_time)).total_seconds() / 3600
     if age_hours >= config.SIGNAL_EXPIRE_HOURS:
-        return result("expired")
-    if deadline is not None and df.index.max() >= deadline:
-        return result("closed_week", float(after["close"].iloc[-1]), after.index[-1])
-    return result("pending")
+        return "expired"
+    return "pending"

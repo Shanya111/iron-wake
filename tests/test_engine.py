@@ -18,13 +18,7 @@ import pattern_detector  # noqa: E402
 
 
 def _df(rows: list[tuple]) -> pd.DataFrame:
-    """rows: список (open, high, low, close, volume). Индекс — почасовой UTC.
-
-    Дата начала выбрана не случайно: 2024-01-01 — понедельник, поэтому свечи
-    попадают в недельное окно торговли (входы только пн–чт, см. trading_week).
-    Сдвинешь дату на пятницу/выходные — детектор перестанет выдавать сигналы и
-    тесты паттернов упадут. Проверка окна — в tests/test_trading_week.py.
-    """
+    """rows: список (open, high, low, close, volume). Индекс — почасовой UTC."""
     idx = pd.date_range("2024-01-01", periods=len(rows), freq="h", tz="UTC")
     return pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=idx)
 
@@ -81,21 +75,6 @@ def test_find_liquidity_zones():
 
 # ── Spring / Upthrust ────────────────────────────────────────────────────────
 
-# Синтетические свечи пробоя нарочно с большим фитилём, а закрытие стоит примерно в
-# 0.6 ATR от уровня — так паттерн однозначен. В бою такой вход отсекают ОБА фильтра
-# цены входа: «вдогонку» (риск ≤ MAX_RISK_ATR×ATR) бракует размашистую свечу, а
-# «дистанция» (≤ MAX_ENTRY_DIST_ATR×ATR) — вход далеко от уровня. Тесты ниже проверяют
-# ДРУГУЮ логику (тренд, объём, R:R, стоп, недельное окно, дневной гейт), поэтому оба
-# фильтра им отключаем явно — у каждого свои тесты с подходящей фикстурой.
-NO_ENTRY_FILTERS = {"MAX_RISK_ATR": None, "MAX_ENTRY_DIST_ATR": None}
-
-# Фильтр «поглощение» в бою сейчас ВЫКЛЮЧЕН (config.MAX_BODY_RATIO=None), поэтому
-# фикстурам он не мешает. Но они его и так проходят — у свечи пробоя тело 0.1 при
-# размахе 0.8–1.7, то есть 0.06–0.13 размаха. Это не случайность: так выглядит
-# пружина по VSA. Если фильтр когда-нибудь вернут в бой, фикстуры останутся
-# рабочими; у самого фильтра свои тесты ниже, они задают порог явно.
-
-
 def _spring_df() -> pd.DataFrame:
     rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
     # Последняя ЗАКРЫТАЯ свеча (индекс -2 = 23): пробой поддержки 100 вниз,
@@ -111,7 +90,7 @@ def test_detect_spring():
         {"price": 100.0, "type": "support", "strength": "strong"},
         {"price": 110.0, "type": "resistance", "strength": "weak"},
     ]
-    sig = pattern_detector.detect_spring(df, levels, trend="up", settings=NO_ENTRY_FILTERS)
+    sig = pattern_detector.detect_spring(df, levels, trend="up")
     assert sig is not None
     assert sig["direction"] == "long"
     assert sig["priority"] == "high"               # пробитый уровень сильный
@@ -123,77 +102,14 @@ def test_detect_spring():
 def test_spring_filtered_by_downtrend():
     df = _spring_df()
     levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
-    assert pattern_detector.detect_spring(df, levels, trend="down", settings=NO_ENTRY_FILTERS) is None
+    assert pattern_detector.detect_spring(df, levels, trend="down") is None
 
 
 def test_spring_needs_abnormal_volume():
     df = _spring_df()
     df.iloc[23, df.columns.get_loc("volume")] = 100.0   # объём как у соседей — не Spring
     levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
-    assert pattern_detector.detect_spring(df, levels, trend="up", settings=NO_ENTRY_FILTERS) is None
-
-
-# ── Фильтр цены входа (риск ≤ MAX_RISK_ATR × ATR) ───────────────────────────
-
-def _tight_spring_df() -> pd.DataFrame:
-    """Аккуратная пружина: свеча пробоя не крупнее соседних, вход рядом с уровнем.
-    Риск (закрытие → минимум + запас) ≈ 0.70 при ATR ≈ 0.80, то есть внутри 1×ATR."""
-    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
-    rows[23] = (100.4, 100.7, 99.9, 100.5, 300.0)   # сходили под 100 и вернулись
-    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)   # формирующаяся
-    return _df(rows)
-
-
-_SUPPORT_AND_TARGET = [
-    {"price": 100.0, "type": "support", "strength": "strong"},
-    {"price": 110.0, "type": "resistance", "strength": "weak"},
-]
-
-
-def test_entry_filter_allows_tight_spring():
-    """Вход рядом с уровнем проходит фильтр — это и есть рабочий сетап.
-
-    Фильтр дистанции отключён: фикстура закрывается в 0.63 ATR от уровня, а этот
-    тест про ДРУГОЙ порог (риск свечи). У дистанции свои тесты ниже."""
-    settings = {"MAX_ENTRY_DIST_ATR": None}
-    sig = pattern_detector.detect_spring(
-        _tight_spring_df(), _SUPPORT_AND_TARGET, trend="up", settings=settings)
-    assert sig is not None
-    risk = sig["entry_price"] - sig["stop_loss"]
-    atr = pattern_detector._atr(_tight_spring_df(), 23, config.STOP_ATR_PERIOD)
-    assert risk <= atr * config.MAX_RISK_ATR
-
-
-def test_entry_filter_rejects_oversized_break_candle():
-    """Свеча пробоя вдвое размашистее соседних → вход далеко от уровня, бракуем.
-    Именно эти сделки убыточны по бэктесту (см. config.MAX_RISK_ATR)."""
-    df = _spring_df()          # у него риск ≈ 1.85×ATR
-    atr = pattern_detector._atr(df, 23, config.STOP_ATR_PERIOD)
-    risk = 100.5 - 99.0 + 99.0 * config.STOP_SPREAD
-    assert risk > atr * config.MAX_RISK_ATR, "фикстура должна быть за порогом"
-    assert pattern_detector.detect_spring(df, _SUPPORT_AND_TARGET, trend="up") is None
-
-
-def test_entry_filter_can_be_disabled():
-    """MAX_RISK_ATR=None снимает фильтр — нужно бэктесту (--no-risk-filter) и тестам
-    другой логики, которые пользуются нарочно размашистыми фикстурами."""
-    df = _spring_df()
-    assert pattern_detector.detect_spring(
-        df, _SUPPORT_AND_TARGET, trend="up", settings=NO_ENTRY_FILTERS) is not None
-
-
-def test_entry_filter_mirrors_for_upthrust():
-    """Шорт считает риск вверх от закрытия до максимума — зеркально лонгу."""
-    rows = [(99.5, 99.8, 99.0, 99.4, 100.0) for _ in range(25)]
-    rows[23] = (99.6, 102.0, 99.5, 99.5, 300.0)    # огромный вынос вверх → вход далеко
-    rows[24] = (99.5, 99.7, 99.2, 99.4, 50.0)
-    levels = [{"price": 100.0, "type": "resistance", "strength": "strong"},
-              {"price": 90.0, "type": "support", "strength": "weak"}]
-    # Дистанцию отключаем: проверяем именно порог риска, а закрытие тут в 0.5 от уровня.
-    assert pattern_detector.detect_upthrust(
-        _df(rows), levels, trend="down", settings={"MAX_ENTRY_DIST_ATR": None}) is None
-    assert pattern_detector.detect_upthrust(
-        _df(rows), levels, trend="down", settings=NO_ENTRY_FILTERS) is not None
+    assert pattern_detector.detect_spring(df, levels, trend="up") is None
 
 
 def test_spring_filtered_by_bad_rr():
@@ -204,318 +120,18 @@ def test_spring_filtered_by_bad_rr():
         {"price": 100.0, "type": "support", "strength": "strong"},
         {"price": 101.5, "type": "resistance", "strength": "weak"},
     ]
-    assert pattern_detector.detect_spring(df, levels, trend="up", settings=NO_ENTRY_FILTERS) is None
+    assert pattern_detector.detect_spring(df, levels, trend="up") is None
 
 
 def test_spring_fallback_target_min_rr():
     # Сопротивления впереди нет → цель ставится ровно на MIN_RR × риск.
     df = _spring_df()
     levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
-    sig = pattern_detector.detect_spring(df, levels, trend="up", settings=NO_ENTRY_FILTERS)
+    sig = pattern_detector.detect_spring(df, levels, trend="up")
     assert sig is not None
     risk = sig["entry_price"] - sig["stop_loss"]
     expected_tp = sig["entry_price"] + risk * config.get("MIN_RR")
     assert abs(sig["take_profit"] - expected_tp) < 1e-9
-
-
-# ── Уточнение входа откатом к уровню ────────────────────────────────────────
-
-_PB_SIGNAL = {"direction": "long", "level_price": 100.0, "entry_price": 101.0,
-              "stop_loss": 99.0, "take_profit": 105.0, "bar_time": "2024-01-01 00:00:00+00:00"}
-
-
-def _future(rows: list[tuple]) -> pd.DataFrame:
-    """Свечи ПОСЛЕ сигнала: (high, low). Индекс начинается через час после bar_time."""
-    idx = pd.date_range("2024-01-01 01:00", periods=len(rows), freq="h", tz="UTC")
-    return pd.DataFrame([(h, l, h, l, 100) for h, l in rows],
-                        columns=["high", "low", "open", "close", "volume"], index=idx)
-
-
-def test_pullback_disabled_returns_signal_unchanged():
-    same = pattern_detector.pullback_entry(_PB_SIGNAL, _future([(101.5, 100.8)]), frac=0)
-    assert same is _PB_SIGNAL
-
-
-def test_pullback_fills_at_limit_price():
-    # frac=0.5 → заявка на полпути от 101.0 к уровню 100.0, то есть 100.5.
-    got = pattern_detector.pullback_entry(
-        _PB_SIGNAL, _future([(101.2, 100.4)]), frac=0.5, wait_bars=4)
-    assert got is not None
-    assert abs(got["entry_price"] - 100.5) < 1e-9
-    assert got["stop_loss"] == 99.0 and got["take_profit"] == 105.0   # не трогаем
-
-
-def test_pullback_improves_rr():
-    """Смысл затеи: вход ближе к стопу при той же цели — больше прибыли на риск."""
-    got = pattern_detector.pullback_entry(
-        _PB_SIGNAL, _future([(101.2, 100.4)]), frac=0.5, wait_bars=4)
-    was = (105.0 - 101.0) / (101.0 - 99.0)          # 2.0
-    now = (105.0 - got["entry_price"]) / (got["entry_price"] - 99.0)
-    assert now > was
-
-
-def test_pullback_missed_when_price_runs_away():
-    """Цена ушла к цели, не откатившись → сделки не было. Это и есть цена приёма."""
-    assert pattern_detector.pullback_entry(
-        _PB_SIGNAL, _future([(105.5, 101.0)]), frac=0.5, wait_bars=4) is None
-
-
-def test_pullback_missed_when_wait_runs_out():
-    rows = [(101.2, 100.9)] * 6          # откат до 100.5 так и не случился
-    assert pattern_detector.pullback_entry(
-        _PB_SIGNAL, _future(rows), frac=0.5, wait_bars=4) is None
-
-
-def test_pullback_ambiguous_bar_conservative_vs_optimistic():
-    """Свеча накрыла и заявку, и цель — порядок внутри часа неизвестен.
-    Осторожно: вход пропущен. Оптимистично: заявка успела исполниться."""
-    bar = _future([(105.5, 100.4)])
-    assert pattern_detector.pullback_entry(_PB_SIGNAL, bar, frac=0.5, wait_bars=4) is None
-    got = pattern_detector.pullback_entry(_PB_SIGNAL, bar, frac=0.5, wait_bars=4,
-                                          optimistic=True)
-    assert got is not None and abs(got["entry_price"] - 100.5) < 1e-9
-
-
-def test_pullback_marks_stop_hit_on_fill_bar():
-    """Свеча дошла и до заявки, и до стопа. Стоп ниже заявки, значит порядок
-    однозначен: сначала вход, потом стоп — сделка открылась и закрылась в минус."""
-    got = pattern_detector.pullback_entry(
-        _PB_SIGNAL, _future([(101.0, 98.5)]), frac=0.5, wait_bars=4)
-    assert got is not None and got["stopped_at_fill"] is True
-
-
-def test_pullback_rejects_limit_beyond_stop():
-    """Заявка за стопом — риска не остаётся, такую сделку не берём."""
-    signal = {**_PB_SIGNAL, "level_price": 98.0}    # уровень ниже стопа
-    assert pattern_detector.pullback_entry(
-        signal, _future([(101.0, 97.0)]), frac=1.0, wait_bars=4) is None
-
-
-def test_pullback_mirrors_for_short():
-    short = {"direction": "short", "level_price": 100.0, "entry_price": 99.0,
-             "stop_loss": 101.0, "take_profit": 95.0,
-             "bar_time": "2024-01-01 00:00:00+00:00"}
-    got = pattern_detector.pullback_entry(
-        short, _future([(99.6, 98.8)]), frac=0.5, wait_bars=4)
-    assert got is not None
-    assert abs(got["entry_price"] - 99.5) < 1e-9    # полпути вверх к уровню 100
-
-
-# ── Пресеты /settings (частота сигналов, вход вдогонку) ─────────────────────
-
-def test_sensitivity_presets_round_trip():
-    """Каждый пресет узнаётся обратно по действующим порогам — иначе меню
-    показывало бы «средне» на любом положении кнопок."""
-    for name, (_, values) in config.SENSITIVITY.items():
-        assert config.sensitivity_of(config.effective(values)) == name
-
-
-def test_sensitivity_presets_stay_in_measured_range():
-    """Кнопки двигают порог объёма только внутри диапазона, который прошёл
-    проверку на устойчивость (P60–P80). За его границами замер разваливается."""
-    for _, values in config.SENSITIVITY.values():
-        assert 60 <= values["VOL_PCTL"] <= 80
-
-
-def test_sensitivity_unknown_combo_returns_none():
-    """Ручные пороги не совпадают ни с одним пресетом → None, а не «ближайший».
-    Иначе меню поставило бы галочку на положении, в котором пользователя нет."""
-    assert config.sensitivity_of({"VOL_PCTL": 70, "BREAK_PCT": 0.0004}) is None
-    assert config.sensitivity_of({"VOL_PCTL": 42, "BREAK_PCT": 0.0005}) is None
-
-
-def test_chase_filter_toggles_both_ways():
-    """Кнопка «Не входить вдогонку» работает в обе стороны: вкл пишет
-    config.MAX_RISK_ATR, выкл пишет 0 (в колонку REAL нельзя положить None)."""
-    df = _spring_df()          # у него риск ≈ 1.85×ATR, это вход вдогонку
-    # Дистанцию отключаем: она не настраивается кнопкой и здесь только мешала бы
-    # увидеть, что переключается именно «вдогонку».
-    off_dist = {"MAX_ENTRY_DIST_ATR": None}
-    assert pattern_detector.detect_spring(
-        df, _SUPPORT_AND_TARGET, trend="up",
-        settings={**config.effective({"MAX_RISK_ATR": config.MAX_RISK_ATR}), **off_dist}) is None
-    assert pattern_detector.detect_spring(
-        df, _SUPPORT_AND_TARGET, trend="up",
-        settings={**config.effective({"MAX_RISK_ATR": 0}), **off_dist}) is not None
-
-
-def test_chase_filter_on_by_default():
-    """В бою фильтр ВКЛЮЧЁН (возвращён 7 августа 2026 после расширения набора до 20
-    инструментов): размашистый вход вдогонку не проходит без нажатия кнопок. Тест
-    сторожит именно решение — если дефолт снова перевернут, он упадёт и напомнит
-    поправить /settings и документацию.
-
-    Фикстура `_spring_df` нарисована с нарочно большим фитилём (так паттерн
-    однозначен), поэтому под включённым фильтром сигнала быть не должно — а под
-    выключенным он есть, это проверяет соседний тест выше."""
-    assert config.effective()["MAX_RISK_ATR"] == 1.0
-    assert pattern_detector.detect_spring(
-        _spring_df(), _SUPPORT_AND_TARGET, trend="up",
-        settings=config.effective()) is None
-
-
-# ── Фильтр «поглощение» (тело свечи пробоя мало относительно размаха) ───────
-
-def _body_df(open_price: float) -> pd.DataFrame:
-    """Пружина с размахом 1.7 (99.0…100.7); тело задаётся ценой открытия."""
-    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
-    rows[23] = (open_price, 100.7, 99.0, 100.5, 300.0)
-    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)
-    return _df(rows)
-
-
-_BODY_LEVELS = [{"price": 100.0, "type": "support", "strength": "strong"},
-                {"price": 110.0, "type": "resistance", "strength": "weak"}]
-
-
-def test_absorption_passes_small_body():
-    # open 100.4, close 100.5 → тело 0.1 при размахе 1.7 ≈ 0.06 размаха.
-    sig = pattern_detector.detect_spring(
-        _body_df(100.4), _BODY_LEVELS, trend="up",
-        settings={"MAX_BODY_RATIO": 0.3, **NO_ENTRY_FILTERS})
-    assert sig is not None
-
-
-def test_absorption_rejects_large_body():
-    # open 99.2, close 100.5 → тело 1.3 при размахе 1.7 ≈ 0.76 размаха.
-    sig = pattern_detector.detect_spring(
-        _body_df(99.2), _BODY_LEVELS, trend="up",
-        settings={"MAX_BODY_RATIO": 0.3, **NO_ENTRY_FILTERS})
-    assert sig is None
-
-
-def test_absorption_off_by_default():
-    """None отключает фильтр — свеча с большим телом проходит."""
-    sig = pattern_detector.detect_spring(
-        _body_df(99.2), _BODY_LEVELS, trend="up",
-        settings={"MAX_BODY_RATIO": None, **NO_ENTRY_FILTERS})
-    assert sig is not None
-
-
-# ── Зоны ликвидности как уровни для пробоя ──────────────────────────────────
-
-def _zone_df() -> pd.DataFrame:
-    """Одна объёмная свеча (размах 99…101) среди спокойных — будущая зона."""
-    rows = [(100.0, 100.3, 99.8, 100.1, 100.0) for _ in range(10)]
-    rows[4] = (100.0, 101.0, 99.0, 100.5, 900.0)
-    return _df(rows)
-
-
-def test_liquidity_levels_mid_uses_candle_middle():
-    zones = analyzer.find_liquidity_zones(_zone_df())
-    levels = analyzer.liquidity_levels(zones, "mid")
-    assert {l["price"] for l in levels} == {100.0}          # (101 + 99) / 2
-    assert {l["type"] for l in levels} == {"support", "resistance"}
-
-
-def test_liquidity_levels_edge_uses_candle_bounds():
-    zones = analyzer.find_liquidity_zones(_zone_df())
-    levels = analyzer.liquidity_levels(zones, "edge")
-    by_type = {l["type"]: l["price"] for l in levels}
-    assert by_type["support"] == 99.0        # низ объёмной свечи
-    assert by_type["resistance"] == 101.0    # её верх
-
-
-def test_liquidity_levels_are_weak():
-    """Сигнал по зоне — обычного приоритета: ⭐ остаётся уровням с подтверждением D1."""
-    levels = analyzer.liquidity_levels(analyzer.find_liquidity_zones(_zone_df()), "mid")
-    assert all(l["strength"] == "weak" and l["is_liquidity"] == 1 for l in levels)
-
-
-def test_liquidity_zone_becomes_tradable_level():
-    """Главное, ради чего всё затевалось: по зоне детектор ловит пробой.
-
-    Уровней-пивотов тут нет вовсе — ровно та ситуация, когда /analyze пишет
-    «сильных часовых уровней нет, ориентируйся на зоны ликвидности».
-    """
-    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
-    rows[5] = (100.4, 100.6, 99.9, 100.5, 900.0)   # объёмная свеча → зона на 100.25
-    rows[23] = (100.4, 100.7, 99.9, 100.5, 300.0)  # пробой зоны вниз и возврат
-    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)
-    df = _df(rows)
-    zones = analyzer.find_liquidity_zones(df.iloc[:-config.LIQ_SKIP_LAST])
-    levels = analyzer.liquidity_levels(zones, "mid")
-    assert levels, "объёмная свеча должна дать зону"
-    sig = pattern_detector.detect_spring(df, levels, trend="up", settings=NO_ENTRY_FILTERS)
-    assert sig is not None
-    assert sig["priority"] == "normal"      # зона не даёт ⭐
-
-
-def test_liquidity_zone_cannot_break_itself():
-    """Ловушка самоссылки: свеча пробоя объёмная по построению, и её собственная
-    середина не должна становиться уровнем, который она же «пробивает».
-
-    Здесь других объёмных свечей нет вовсе — значит после исключения последних
-    LIQ_SKIP_LAST свечей зон не остаётся, и сигналу взяться неоткуда.
-    """
-    df = _spring_df()          # объёмная только свеча 23 — она же свеча пробоя
-    source = df.iloc[:-config.LIQ_SKIP_LAST]
-    assert not analyzer.find_liquidity_zones(source), "свеча пробоя не должна давать зону"
-
-
-# ── Порог аномального объёма: множитель против процентиля ───────────────────
-
-def _pctl_settings(pctl: float, window: int = 20) -> dict:
-    """Пороги для режима «объём выше P-го процентиля за N свечей»."""
-    return {"VOL_MODE": "pctl", "VOL_PCTL": pctl, "VOL_WINDOW": window,
-            **NO_ENTRY_FILTERS}
-
-
-def test_volume_percentile_accepts_top_bar():
-    # Свеча пробоя — самая объёмная из окна (300 против 100 у соседей),
-    # то есть заведомо выше любого процентиля → сигнал есть.
-    df = _spring_df()
-    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
-    assert pattern_detector.detect_spring(
-        df, levels, trend="up", settings=_pctl_settings(90)) is not None
-
-
-def test_volume_percentile_rejects_ordinary_bar():
-    # Объём как у соседей → в верхние проценты не попадает → не Spring.
-    df = _spring_df()
-    df.iloc[23, df.columns.get_loc("volume")] = 100.0
-    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
-    assert pattern_detector.detect_spring(
-        df, levels, trend="up", settings=_pctl_settings(90)) is None
-
-
-def test_volume_percentile_is_relative_not_absolute():
-    """Смысл процентиля: порог свой у каждого инструмента.
-
-    Здесь объём свечи пробоя (150) НИЖЕ среднего соседей (200), то есть множитель
-    ×1.5 её забракует. Но соседи разношёрстные, и 150 всё равно выше 70% из них —
-    процентиль пропустит. Ровно этого и ждём от «относительного» порога: он
-    сравнивает свечу с её же окружением, а не с общим числом.
-    """
-    rows = [(100.5, 101.0, 100.2, 100.6, 100.0 if i % 4 else 600.0) for i in range(25)]
-    rows[23] = (100.4, 100.7, 99.0, 100.5, 150.0)
-    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)
-    df = _df(rows)
-    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
-    # Множитель: 150 < среднее(≈225) × 1.5 → сигнала нет.
-    assert pattern_detector.detect_spring(
-        df, levels, trend="up",
-        settings={"VOL_MODE": "mult", "VOL_MULT": 1.5, **NO_ENTRY_FILTERS}) is None
-    # Процентиль P70: 150 выше 70% соседей (их большинство — по 100) → сигнал есть.
-    assert pattern_detector.detect_spring(
-        df, levels, trend="up", settings=_pctl_settings(70)) is not None
-
-
-def test_volume_percentile_window_excludes_own_bar():
-    """Свеча не входит в собственную норму — иначе задирала бы порог, который
-    сама должна перепрыгнуть. Проверяем на окне, где она единственная крупная."""
-    df = _spring_df()
-    window = df["volume"].iloc[3:23]           # 20 свечей ПЕРЕД свечой пробоя
-    assert float(window.max()) == 100.0, "в окне не должно быть свечи пробоя"
-    assert pattern_detector._volume_ok(
-        df, 23, {"VOL_MODE": "pctl", "VOL_PCTL": 95, "VOL_WINDOW": 20}, 1.5)
-
-
-def test_volume_percentile_needs_enough_history():
-    # Окна короче VOL_LOOKBACK не хватает даже на осмысленный процентиль.
-    df = _spring_df()
-    assert not pattern_detector._volume_ok(
-        df, 5, {"VOL_MODE": "pctl", "VOL_PCTL": 70, "VOL_WINDOW": 20}, 1.5)
 
 
 def _upthrust_df() -> pd.DataFrame:
@@ -532,7 +148,7 @@ def test_detect_upthrust():
         {"price": 100.0, "type": "resistance", "strength": "strong"},
         {"price": 90.0, "type": "support", "strength": "weak"},
     ]
-    sig = pattern_detector.detect_upthrust(df, levels, trend="down", settings=NO_ENTRY_FILTERS)
+    sig = pattern_detector.detect_upthrust(df, levels, trend="down")
     assert sig is not None
     assert sig["direction"] == "short"
     assert abs(sig["entry_price"] - 99.5) < 1e-9
@@ -543,7 +159,7 @@ def test_detect_upthrust():
 def test_upthrust_filtered_by_uptrend():
     df = _upthrust_df()
     levels = [{"price": 100.0, "type": "resistance", "strength": "strong"}]
-    assert pattern_detector.detect_upthrust(df, levels, trend="up", settings=NO_ENTRY_FILTERS) is None
+    assert pattern_detector.detect_upthrust(df, levels, trend="up") is None
 
 
 # ── Трекинг исхода сигналов (evaluate_signal) ────────────────────────────────
@@ -583,19 +199,9 @@ def test_evaluate_pending():
 
 
 def test_evaluate_expired():
-    # Без недельного окна (журнал сделок) горизонт задаёт SIGNAL_EXPIRE_HOURS.
-    rows = [(100.5, 101, 100, 100.5, 100)
-            for _ in range(config.SIGNAL_EXPIRE_HOURS + 2)]
+    rows = [(100.5, 101, 100, 100.5, 100) for _ in range(50)]  # 49ч ≥ 48ч порога
     df = _df(rows)
     assert pattern_detector.evaluate_signal(_long_signal(df), df) == "expired"
-
-
-def test_evaluate_not_expired_within_week():
-    # Сделка внутри недели (меньше горизонта) ещё не истекла — ждём дальше.
-    rows = [(100.5, 101, 100, 100.5, 100)
-            for _ in range(config.SIGNAL_EXPIRE_HOURS - 10)]
-    df = _df(rows)
-    assert pattern_detector.evaluate_signal(_long_signal(df), df) == "pending"
 
 
 def test_evaluate_short_hit_tp():
@@ -664,231 +270,6 @@ def test_orderbook_kraken_three_element_entries():
     s = analyzer.analyze_order_book(ob)
     assert s is not None
     assert s["pressure"] == "buyers"
-
-
-# ── Слой H4 (ресемпл из часовых свечей) ─────────────────────────────────────
-
-def test_resample_h4_aggregates_four_hours():
-    """Четыре часовые свечи схлопываются в одну: open первой, close последней,
-    high/low — крайние по всем четырём, объём суммируется."""
-    rows = [(10.0, 12.0, 9.0, 11.0, 100.0), (11.0, 15.0, 10.5, 14.0, 100.0),
-            (14.0, 14.5, 8.0, 9.0, 100.0), (9.0, 10.0, 8.5, 9.5, 100.0)]
-    h4 = analyzer.resample_h4(_df(rows))
-    assert len(h4) == 1
-    bar = h4.iloc[0]
-    assert float(bar["open"]) == 10.0 and float(bar["close"]) == 9.5
-    assert float(bar["high"]) == 15.0 and float(bar["low"]) == 8.0
-    assert float(bar["volume"]) == 400.0
-
-
-def test_resample_h4_drops_gaps():
-    """У золота и нефти рынок закрыт часть суток. Дыра в часовых свечах не должна
-    порождать пустой H4-бар: он испортил бы и EMA, и поиск фракталов."""
-    idx = pd.date_range("2024-01-01", periods=24, freq="h", tz="UTC").delete([4, 5, 6, 7])
-    df = pd.DataFrame({"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5,
-                       "volume": 10.0}, index=idx)
-    h4 = analyzer.resample_h4(df)
-    assert len(h4) == 5              # шестой интервал вырезан целиком
-    assert not h4.isna().any().any()
-
-
-def test_resample_h4_empty_input():
-    assert analyzer.resample_h4(_df([])).empty
-
-
-def test_working_window_separate_from_fetch_window():
-    """Рабочее окно H1 (уровни, тренд, детектор) и размер выборки — РАЗНЫЕ вещи.
-
-    Выборку подняли ради H4, и соблазн был поднять заодно рабочее окно. Нельзя:
-    ширина рабочего окна задаёт набор уровней, а значит цели и весь набор сигналов —
-    это отдельный рычаг, и менять его можно только замером. Тест сторожит именно
-    это разделение: если H1_LIMIT поедет вслед за выборкой, прогон «как было»
-    перестанет воспроизводить прежние числа, и никто не поймёт почему."""
-    assert config.H1_LIMIT == 120
-    assert config.H1_FETCH_LIMIT > config.H1_LIMIT
-    # Выборки должно хватать на EMA20 по H4 плюс фракталы с обеих сторон.
-    assert config.H1_FETCH_LIMIT // 4 >= config.EMA_PERIOD + config.H4_PIVOT_WINDOW * 2
-
-
-def test_h4_levels_confirm_strength():
-    """Часовой уровень, совпавший с четырёхчасовым, получает ⭐ наравне с дневным."""
-    local = [{"price": 100.0, "type": "support", "strength": "weak",
-              "is_liquidity": 0, "timeframe": "H1"}]
-    mid = [{"price": 100.02, "type": "support", "strength": "weak",
-            "is_liquidity": 0, "timeframe": "H4"}]
-    out = analyzer.prioritize_levels([], local, mid_levels=mid)
-    h1 = [l for l in out if l["timeframe"] == "H1"][0]
-    assert h1["strength"] == "strong"
-    # Сам уровень H4 добавлен торгуемым, но слабым: ⭐ означает «совпали два
-    # таймфрейма», раздавать её одиночным H4 значило бы обесценить пометку.
-    h4 = [l for l in out if l["timeframe"] == "H4"][0]
-    assert h4["strength"] == "weak"
-
-
-def test_prioritize_without_h4_unchanged():
-    """mid_levels=None воспроизводит прежнее поведение до последней детали —
-    от этого зависит, совпадёт ли прогон «как было» с прежними числами."""
-    local = [{"price": 100.0, "type": "support", "strength": "weak",
-              "is_liquidity": 0, "timeframe": "H1"}]
-    glob = [{"price": 100.02, "type": "support", "strength": "weak",
-             "is_liquidity": 0, "timeframe": "D1"}]
-    assert analyzer.prioritize_levels(glob, local) == \
-        analyzer.prioritize_levels(glob, local, mid_levels=None)
-
-
-# ── Фильтр дистанции входа до уровня ────────────────────────────────────────
-
-def _dist_atr(df, level: float) -> float:
-    """Насколько далеко закрытие свечи пробоя от уровня, в долях ATR."""
-    atr = pattern_detector._atr(df, 23, config.STOP_ATR_PERIOD)
-    return abs(float(df["close"].iloc[23]) - level) / atr
-
-
-def test_entry_distance_on_by_default():
-    """В бою фильтр ВКЛЮЧЁН на 0.5 ATR (принят замером 7 августа 2026: R на сделку
-    растёт монотонно по мере ужесточения порога на восьми значениях подряд).
-
-    Фикстура закрывается в 0.63 ATR от уровня, то есть за порогом, — значит под
-    боевыми настройками сигнала быть не должно. Тест сторожит и сам дефолт, и то,
-    что фильтр реально применяется без явных settings."""
-    assert config.MAX_ENTRY_DIST_ATR == 0.5
-    assert _dist_atr(_tight_spring_df(), 100.0) > config.MAX_ENTRY_DIST_ATR
-    assert pattern_detector.detect_spring(
-        _tight_spring_df(), _SUPPORT_AND_TARGET, trend="up") is None
-
-
-def test_entry_distance_allows_entry_near_level():
-    df = _tight_spring_df()
-    assert _dist_atr(df, 100.0) < 1.0
-    assert pattern_detector.detect_spring(
-        df, _SUPPORT_AND_TARGET, trend="up",
-        settings={"MAX_ENTRY_DIST_ATR": 1.0}) is not None
-
-
-def test_entry_distance_rejects_entry_far_from_level():
-    df = _tight_spring_df()
-    assert _dist_atr(df, 100.0) > 0.25
-    assert pattern_detector.detect_spring(
-        df, _SUPPORT_AND_TARGET, trend="up",
-        settings={"MAX_ENTRY_DIST_ATR": 0.25}) is None
-
-
-def test_entry_distance_is_not_the_chase_filter():
-    """Ключевой тест: два фильтра меряют РАЗНОЕ и на одной свече расходятся.
-
-    У размашистой пружины риск 1.85×ATR (фильтр «вдогонку» её бракует), но
-    закрытие стоит всего в 0.58×ATR от уровня — по VSA это и есть пружина:
-    сняли ликвидность глубоким фитилём и вернулись на уровень. Фильтр дистанции
-    такой вход пропускает. Если этот тест упадёт, значит один из них выродился
-    в копию другого."""
-    df = _spring_df()
-    atr = pattern_detector._atr(df, 23, config.STOP_ATR_PERIOD)
-    risk = 100.5 - 99.0 + 99.0 * config.STOP_SPREAD
-    assert risk / atr > 1.0          # «вдогонку» бракует
-    assert _dist_atr(df, 100.0) < 1.0  # дистанция — пропускает
-    assert pattern_detector.detect_spring(
-        df, _SUPPORT_AND_TARGET, trend="up",
-        settings={"MAX_RISK_ATR": None, "MAX_ENTRY_DIST_ATR": 1.0}) is not None
-
-
-def test_entry_distance_mirrors_for_upthrust():
-    """Шорт меряет расстояние от закрытия вверх до сопротивления — зеркально."""
-    rows = [(99.5, 99.8, 99.0, 99.4, 100.0) for _ in range(25)]
-    rows[23] = (99.6, 100.9, 99.5, 98.5, 300.0)   # закрылись далеко ПОД уровнем
-    rows[24] = (98.5, 98.7, 98.2, 98.4, 50.0)
-    df = _df(rows)
-    levels = [{"price": 100.0, "type": "resistance", "strength": "strong"},
-              {"price": 90.0, "type": "support", "strength": "weak"}]
-    base = {"MAX_RISK_ATR": None}
-    assert pattern_detector.detect_upthrust(
-        df, levels, trend="down", settings={**base, "MAX_ENTRY_DIST_ATR": 0.5}) is None
-    assert pattern_detector.detect_upthrust(
-        df, levels, trend="down", settings={**base, "MAX_ENTRY_DIST_ATR": 5.0}) is not None
-
-
-# ── Дневка как контекст режима (мягкий гейт) ────────────────────────────────
-
-_WEAK_SUPPORT_AND_TARGET = [
-    {"price": 100.0, "type": "support", "strength": "weak"},
-    {"price": 110.0, "type": "resistance", "strength": "weak"},
-]
-
-# Фикстура закрывается в 0.63 ATR от уровня, то есть за боевым порогом дистанции.
-# Эти тесты проверяют ДНЕВНОЙ ГЕЙТ, поэтому фильтры цены входа им отключены —
-# иначе они молча проверяли бы не то, что написано в их названиях.
-_SOFT_STRONG = {**NO_ENTRY_FILTERS, "D1_GATE": "soft", "D1_CONFIRM": "strong"}
-
-
-def test_d1_gate_off_by_default():
-    """В бою дневного гейта нет — прежний замер сравнивал не эту конфигурацию,
-    и до собственного прогона включать её нельзя."""
-    assert config.D1_GATE == "off"
-    assert pattern_detector.detect_spring(
-        _tight_spring_df(), _WEAK_SUPPORT_AND_TARGET, trend="up",
-        settings=NO_ENTRY_FILTERS, higher_trend="down") is not None
-
-
-def test_d1_soft_gate_rejects_countertrend_without_confirmation():
-    """Часовик вверх, дневка вниз, уровень обычный → контртренд без подтверждения."""
-    assert pattern_detector.detect_spring(
-        _tight_spring_df(), _WEAK_SUPPORT_AND_TARGET, trend="up",
-        settings=_SOFT_STRONG, higher_trend="down") is None
-
-
-def test_d1_soft_gate_allows_countertrend_from_strong_level():
-    """Тот же контртренд, но от подтверждённого старшим ТФ уровня — проходит."""
-    assert pattern_detector.detect_spring(
-        _tight_spring_df(), _SUPPORT_AND_TARGET, trend="up",
-        settings=_SOFT_STRONG, higher_trend="down") is not None
-
-
-def test_d1_soft_gate_ignores_trend_aligned_signal():
-    """По тренду дневки подтверждение не требуется — гейт бьёт только контртренд."""
-    assert pattern_detector.detect_spring(
-        _tight_spring_df(), _WEAK_SUPPORT_AND_TARGET, trend="up",
-        settings=_SOFT_STRONG, higher_trend="up") is not None
-
-
-def test_d1_gate_sideways_is_not_countertrend():
-    """Боковик на дневке направления не задаёт, значит и ограничивать нечего."""
-    assert pattern_detector.detect_spring(
-        _tight_spring_df(), _WEAK_SUPPORT_AND_TARGET, trend="up",
-        settings=_SOFT_STRONG, higher_trend="sideways") is not None
-
-
-def test_d1_gate_needs_higher_trend():
-    """Без дневного тренда гейт молчит: детектор, вызванный по-старому, ведёт
-    себя ровно как раньше."""
-    assert pattern_detector.detect_spring(
-        _tight_spring_df(), _WEAK_SUPPORT_AND_TARGET, trend="up",
-        settings=_SOFT_STRONG, higher_trend=None) is not None
-
-
-def test_d1_hard_gate_blocks_countertrend_entirely():
-    """Жёсткий режим — то, как дневка работала до 4 августа: подтверждение не
-    спасает. Он нужен в переборе контролем, иначе мягкий не с чем сравнить."""
-    assert pattern_detector.detect_spring(
-        _tight_spring_df(), _SUPPORT_AND_TARGET, trend="up",
-        settings={**NO_ENTRY_FILTERS, "D1_GATE": "hard"}, higher_trend="down") is None
-
-
-def test_d1_soft_gate_rr_moves_the_target():
-    """Подтверждение по R:R — это поднятый порог, а не пост-фильтр: он двигает и
-    запасную цель (MIN_RR × риск). Разницу между «отобрать сделки с большим R:R»
-    и «требовать больший R:R заранее» мы уже проходили на MIN_RR, и результаты
-    вышли противоположные — поэтому механика проверяется явно."""
-    levels = [{"price": 100.0, "type": "support", "strength": "weak"}]  # цели впереди нет
-    df = _tight_spring_df()
-    plain = pattern_detector.detect_spring(df, levels, trend="up",
-                                           settings=NO_ENTRY_FILTERS, higher_trend="down")
-    gated = pattern_detector.detect_spring(
-        df, levels, trend="up",
-        settings={**NO_ENTRY_FILTERS, "D1_GATE": "soft", "D1_CONFIRM": "rr"},
-        higher_trend="down")
-    assert plain is not None and gated is not None
-    risk = plain["entry_price"] - plain["stop_loss"]
-    assert round((plain["take_profit"] - plain["entry_price"]) / risk, 6) == config.get("MIN_RR")
-    assert round((gated["take_profit"] - gated["entry_price"]) / risk, 6) == config.D1_CONFIRM_RR
 
 
 if __name__ == "__main__":

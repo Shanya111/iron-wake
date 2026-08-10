@@ -10,8 +10,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import (TelegramBadRequest, TelegramForbiddenError,
-                                TelegramRetryAfter)
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
@@ -29,7 +28,6 @@ import config
 import data_fetcher
 import database
 import scheduler as engine
-import trading_week
 from llm import ANALYST_PROMPT, ask_openrouter, classify_intent
 from instruments import (
     INSTRUMENTS,
@@ -132,16 +130,14 @@ def confirm_keyboard() -> InlineKeyboardMarkup:
 
 
 def pairs_keyboard() -> InlineKeyboardMarkup:
-    """Список инструментов кнопками (по 3 в ряд) + своя пара + отмена.
-    Три, а не два: инструментов стало 20, и по два в ряд список превращается
-    в простыню на десять экранов. Названия для этого держим короткими.
+    """Список инструментов кнопками (по 2 в ряд) + своя пара + отмена.
     Цены здесь НЕ запрашиваем — только названия, чтобы не дёргать Yahoo зря."""
     codes = list(INSTRUMENTS.keys())
     rows = []
-    for i in range(0, len(codes), 3):
+    for i in range(0, len(codes), 2):
         rows.append([
             InlineKeyboardButton(text=INSTRUMENTS[c]["name"], callback_data=f"alertpair_{c}")
-            for c in codes[i:i + 3]
+            for c in codes[i:i + 2]
         ])
     rows.append([InlineKeyboardButton(text="✏️ Своя пара", callback_data="alertpair_custom")])
     rows.append([InlineKeyboardButton(text="Отмена", callback_data="alertpair_cancel")])
@@ -420,7 +416,7 @@ HELP_TEXT = (
     "/signals — последние сигналы\n"
     "/stats — статистика сигналов (винрейт, итог в R) за 30 дней / всё время\n"
     "/trades — журнал сделок (статус цель/стоп, закрытие)\n"
-    "/settings — настройки сигналов под себя (частота, прибыль/риск, вход вдогонку)\n"
+    "/settings — пороги движка сигналов под себя (объём, пробой, R:R)\n"
     "/cancel — отменить текущий сценарий\n\n"
     "Можно просто писать словами — я пойму:\n"
     "• «алерт золото 2400» — поставлю алерт\n"
@@ -782,25 +778,18 @@ async def cb_close_trade(call: CallbackQuery):
 # ── Торговый движок: анализ, подписки, сигналы, настройки ───────────────────────
 
 def engine_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKeyboardMarkup:
-    """Кнопки инструментов движка (по 3 в ряд). prefix — начало callback_data.
-    Если передан subscribed — отмечает галочкой подписанные и добавляет снизу
-    массовые кнопки: инструментов 16, и подписываться на каждый отдельным тычком
-    — это 16 нажатий, чего никто делать не станет."""
+    """Кнопки инструментов движка — крипта + форекс (по 2 в ряд). prefix — начало
+    callback_data. Если передан subscribed — отмечает галочкой подписанные (для /subscribe)."""
     codes = engine_codes()
     rows = []
-    for i in range(0, len(codes), 3):
+    for i in range(0, len(codes), 2):
         row = []
-        for c in codes[i:i + 3]:
+        for c in codes[i:i + 2]:
             mark = "✅ " if subscribed and c in subscribed else ""
             row.append(InlineKeyboardButton(
                 text=f"{mark}{INSTRUMENTS[c]['name']}", callback_data=f"{prefix}{c}"
             ))
         rows.append(row)
-    if subscribed is not None:
-        rows.append([
-            InlineKeyboardButton(text="✅ Подписаться на всё", callback_data=f"{prefix}__all"),
-            InlineKeyboardButton(text="🚫 Отписаться от всего", callback_data=f"{prefix}__none"),
-        ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -866,81 +855,50 @@ def _render_levels(items: list[dict], d: int, last: float, limit: int) -> str:
     return "\n".join(rows)
 
 
-_TREND_RU = {
-    "up": "восходящий ↑ (цена растёт)",
-    "down": "нисходящий ↓ (цена падает)",
-    "sideways": "боковик → (без чёткого направления)",
-}
-_TREND_SHORT = {"up": "вверх ↑", "down": "вниз ↓", "sideways": "боковик →"}
-
-
-def _format_analysis(info: dict, df, trend: str, trend_d1: str, levels: list[dict],
-                     zones: list[dict], ob: dict | None = None,
-                     trend_h4: str | None = None,
-                     h4_levels: list[dict] | None = None) -> str:
-    """Человеко-читаемый отчёт по числам анализа (без AI).
-
-    Три слоя структуры сверху вниз: дневка (D1) — крупные ориентиры и фон,
-    четырёхчасовик (H4) — средний слой, часовик (H1) — рабочий таймфрейм, откуда
-    берётся вход. Слой H4 показывается всегда, даже когда он не участвует в отборе
-    сигналов (config.H4_LEVELS): видеть структуру полезно в любом случае.
-    """
+def _format_analysis(info: dict, df, trend: str, levels: list[dict], zones: list[dict],
+                     ob: dict | None = None) -> str:
+    """Человеко-читаемый отчёт по числам анализа (без AI). Уровни сгруппированы по
+    таймфреймам (дневка/часовик) с эмодзи — чтобы было видно, что старшее, что ближнее."""
     last = float(df["close"].iloc[-1])
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
+    trend_ru = {
+        "up": "восходящий ↑ (цена растёт)",
+        "down": "нисходящий ↓ (цена падает)",
+        "sideways": "боковик → (без чёткого направления)",
+    }[trend]
     d1 = [l for l in levels if l.get("timeframe") == "D1" and l["type"] in ("support", "resistance")]
     h1 = [l for l in levels if l.get("timeframe") == "H1" and l["type"] in ("support", "resistance")]
 
     lines = [
         f"📊 {info['name']} — анализ",
         f"Цена сейчас: {fmt(last, d)}",
-        f"Тренд на часовике (H1): {_TREND_RU[trend]}",
-    ]
-    if trend_h4 is not None:
-        lines.append(f"Средний слой (H4): {_TREND_SHORT[trend_h4]}")
-    lines.append(f"Фон дневки (D1): {_TREND_SHORT[trend_d1]}")
-    # Часовик против дневки — обычная коррекция внутри старшего движения: тянуть
-    # такую сделку далеко не стоит, поэтому предупреждаем отдельной строкой.
-    if trend != "sideways" and trend_d1 != "sideways" and trend != trend_d1:
-        lines.append("  ⚠️ часовик идёт против дневки — похоже на коррекцию, цели короче")
-    lines += [
+        f"Тренд на дневке (D1): {trend_ru}",
         "",
-        "🟡 Часовик (H1) — рабочие уровни (отсюда вход):",
+        "🔵 Дневка (D1) — крупные уровни (главные ориентиры):",
+        _render_levels(d1, d, last, limit=6),
+        "",
+        "🟡 Часовик (H1) — ближние уровни (для входа):",
         _render_levels(h1, d, last, limit=8),
     ]
     if any(l.get("strength") == "strong" for l in h1):
-        senior = "дневным или четырёхчасовым" if config.H4_LEVELS else "дневным"
-        lines.append(f"  ⭐ — сильный: часовой уровень совпал с {senior}")
-    if h4_levels:
-        lines += [
-            "",
-            "🟠 Четырёхчасовик (H4) — средний слой структуры:",
-            _render_levels(h4_levels, d, last, limit=6),
-        ]
-    lines += [
-        "",
-        "🔵 Дневка (D1) — крупные ориентиры (фон):",
-        _render_levels(d1, d, last, limit=6),
-    ]
+        lines.append("  ⭐ — сильный: часовой уровень совпал с дневным")
     if zones:
         near = sorted(zones, key=lambda z: abs(z["price"] - last))[:6]
         zlines = []
         for z in sorted(near, key=lambda x: x["price"], reverse=True):
             tag = " (рядом с ценой)" if abs(z["price"] - last) <= last * 0.01 else ""
             zlines.append(f"  💰 {fmt(z['price'], d)}{tag}")
-        lines += ["", "💰 Зоны ликвидности часовика (крупные объёмы — магнит для цены):",
+        lines += ["", "💰 Зоны ликвидности (где стояли крупные объёмы — магнит для цены):",
                   "\n".join(zlines)]
     if ob:
         lines += _format_orderbook(ob, d)
     return "\n".join(lines)
 
 
-def _analysis_prompt(info: dict, last: float, trend: str, trend_d1: str,
-                     levels: list[dict], zones: list[dict], ob: dict | None = None,
-                     trend_h4: str | None = None,
-                     h4_levels: list[dict] | None = None) -> str:
+def _analysis_prompt(info: dict, last: float, trend: str, levels: list[dict],
+                     zones: list[dict], ob: dict | None = None) -> str:
     """Компактная сводка чисел для AI-разбора (гибрид). Уровни разнесены по
-    таймфреймам — чтобы AI в ответе уточнял, дневной уровень или часовой.
-    Рабочий тренд — часовой; H4 и дневка идут отдельными строками как контекст."""
+    таймфреймам — чтобы AI в ответе уточнял, дневной уровень или часовой."""
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
     d1 = [fmt(l["price"], d) for l in levels
           if l.get("timeframe") == "D1" and l["type"] in ("support", "resistance")]
@@ -957,20 +915,13 @@ def _analysis_prompt(info: dict, last: float, trend: str, trend_d1: str,
         if ob.get("ask_wall"):
             dom += f", крупная продажа у {fmt(ob['ask_wall']['price'], d)}"
         dom += "\n"
-    h4_line = ""
-    if trend_h4 is not None:
-        prices = [fmt(l["price"], d) for l in (h4_levels or [])][:6]
-        h4_line = (f"Тренд H4 (средний слой): {trend_h4}\n"
-                   f"Уровни H4: {', '.join(prices) or 'нет'}\n")
     return (
         f"Инструмент: {info['name']}\n"
         f"Цена сейчас: {fmt(last, d)}\n"
-        f"Тренд H1 (рабочий): {trend}\n"
-        f"{h4_line}"
-        f"Тренд D1 (фон): {trend_d1}\n"
+        f"Тренд D1: {trend}\n"
         f"Уровни дневки (D1): {', '.join(d1) or 'нет'}\n"
         f"Сильные уровни часовика (H1): {', '.join(h1_strong) or 'нет'}\n"
-        f"Зоны ликвидности H1: {', '.join(zone_prices) or 'нет'}\n"
+        f"Зоны ликвидности: {', '.join(zone_prices) or 'нет'}\n"
         f"{dom}"
         "Дай короткий разбор."
     )
@@ -982,30 +933,18 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     try:
         # Свечи берём из источника инструмента: крипта/форекс — Kraken, золото/нефть — Yahoo.
         d1 = await engine.fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
-        # Полная выборка: из неё ресемплится H4. Рабочее окно (H1_LIMIT) берётся
-        # хвостом там, где считаются уровни и тренд.
-        h1_full = await engine.fetch_candles(code, config.H1_TIMEFRAME, config.H1_FETCH_LIMIT)
-        h1 = h1_full.tail(config.H1_LIMIT)
+        h1 = await engine.fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
     except Exception:
         await waiting.delete()
         await message.answer("Не удалось получить данные сейчас, попробуй позже.")
         return
 
-    # Рабочий таймфрейм отчёта — часовик (торговля внутри дня): тренд и зоны считаем
-    # по H1. Дневной тренд остаётся фоном — понять, помогает старший таймфрейм или мешает.
-    trend = analyzer.get_trend(h1)
-    trend_d1 = analyzer.get_trend(d1)
-    # Средний слой H4 — ресемпл из тех же часовых свечей (сетевого запроса нет).
-    # Считаем здесь, а не берём из БД: в базу кладутся только ТОРГУЕМЫЕ уровни, а
-    # показывать структуру H4 надо и когда движок по ней не сигналит (H4_LEVELS=False).
-    h4 = analyzer.resample_h4(h1_full)
-    trend_h4 = analyzer.get_trend(h4)
-    h4_levels = analyzer.find_levels(h4, config.H4_PIVOT_WINDOW, "H4")
-    # analyze_and_store сам берёт рабочее окно хвостом — отдаём ему полную выборку.
-    levels = engine.analyze_and_store(code, d1, h1_full)  # считает и сохраняет в БД
-    # Зоны ликвидности — порог общий (config.LIQUIDITY_MULT), настройкой он больше
-    # не является: зоны видны только здесь, в отчёте, и на отбор сигналов не влияют.
-    zones = analyzer.find_liquidity_zones(h1)
+    trend = analyzer.get_trend(d1)
+    levels = engine.analyze_and_store(code, d1, h1)  # считает и сохраняет уровни в БД
+    # Зоны ликвидности — под личный порог пользователя (LIQUIDITY_MULT): кто-то хочет
+    # видеть только самые жирные всплески объёма, кто-то — больше зон. На сигналы не влияет.
+    liq_mult = config.effective(database.get_user_settings(user_id))["LIQUIDITY_MULT"]
+    zones = analyzer.find_liquidity_zones(d1, liq_mult)
 
     # Стакан (DOM) есть только у биржевых инструментов (Kraken). У золота/нефти (Yahoo)
     # стакана нет → пропускаем; анализ это переживает (ob=None обрабатывается ниже).
@@ -1019,17 +958,13 @@ async def _do_analyze(message: Message, code: str, user_id: int):
             ob = None
 
     await waiting.delete()
-    # Цену берём из H1 — последняя часовая свеча свежее дневной.
-    await message.answer(_format_analysis(info, h1, trend, trend_d1, levels, zones, ob,
-                                          trend_h4=trend_h4, h4_levels=h4_levels))
+    await message.answer(_format_analysis(info, d1, trend, levels, zones, ob))
 
     # Гибрид: AI пишет человеческий разбор поверх чисел. Ошибка LLM не критична.
     try:
-        last = float(h1["close"].iloc[-1])
+        last = float(d1["close"].iloc[-1])
         comment = await ask_openrouter(
-            _analysis_prompt(info, last, trend, trend_d1, levels, zones, ob,
-                             trend_h4=trend_h4, h4_levels=h4_levels),
-            system_prompt=ANALYST_PROMPT,
+            _analysis_prompt(info, last, trend, levels, zones, ob), system_prompt=ANALYST_PROMPT
         )
         # Подписываем, по какому инструменту разбор — сообщения в ленте отрываются
         # от заголовка, и без имени непонятно, о чём речь.
@@ -1071,32 +1006,6 @@ async def cmd_subscribe(message: Message):
 @dp.callback_query(F.data.startswith("subtoggle_"))
 async def cb_subtoggle(call: CallbackQuery):
     code = call.data.removeprefix("subtoggle_")
-
-    # Массовые кнопки. Коды инструментов — заглавные буквы, поэтому «__all»/«__none»
-    # с ними не столкнутся ни при каком расширении реестра.
-    if code in ("__all", "__none"):
-        subs = set(database.get_user_subscriptions(call.from_user.id))
-        if code == "__all":
-            for c in engine_codes():
-                if c not in subs:
-                    database.add_subscription(call.from_user.id, c)
-            subs = set(engine_codes())
-            await call.answer("Подписал на все инструменты")
-        else:
-            for c in subs:
-                database.remove_subscription(call.from_user.id, c)
-            subs = set()
-            await call.answer("Отписал от всех")
-        # Повторное нажатие той же кнопки клавиатуру не меняет, а Telegram на
-        # правку «в то же самое» отвечает ошибкой. Для пользователя это не ошибка:
-        # он нажал «подписаться на всё», уже будучи подписанным на всё.
-        try:
-            await call.message.edit_reply_markup(
-                reply_markup=engine_keyboard("subtoggle_", subs))
-        except TelegramBadRequest:
-            pass
-        return
-
     if code not in engine_codes():
         await call.answer()
         return
@@ -1124,7 +1033,6 @@ async def cmd_signals(message: Message):
         "hit_tp": "✅ цель",
         "hit_sl": "🛑 стоп",
         "expired": "⌛ истёк",
-        "closed_week": "🔚 закрыт по неделе",
     }
     lines = []
     for s in signals:
@@ -1136,12 +1044,6 @@ async def cmd_signals(message: Message):
         label = status_label.get(s["status"], s["status"])
         risk = abs(s["entry_price"] - s["stop_loss"])
         rr = abs(s["take_profit"] - s["entry_price"]) / risk if risk else 0
-        # У закрытого по неделе выхода нет ни цели, ни стопа — показываем фактический
-        # результат в R, иначе строка выглядит как незакрытая сделка.
-        if s["status"] == "closed_week" and s.get("exit_price") is not None:
-            r = trading_week.realized_r(s["direction"], s["entry_price"],
-                                        s["stop_loss"], s["exit_price"])
-            label = f"{label} {fmt(s['exit_price'], d)} ({r:+.2f}R)"
         lines.append(
             f"{arrow}{star} {info['name']} {pat} — вход {fmt(s['entry_price'], d)}, "
             f"стоп {fmt(s['stop_loss'], d)}, цель {fmt(s['take_profit'], d)} "
@@ -1156,13 +1058,8 @@ def compute_signal_stats(rows: list[dict]) -> dict:
     """Считает агрегаты по списку сигналов. Денег не храним → меряем в R
     (риск на сделку = 1R): цель дала +R:R, стоп = −1R. pending/expired в
     винрейт и профит-фактор не входят (исход не определён). Разбивка по
-    инструментам — только по закрытым.
-
-    Закрытые по неделе (`closed_week`, погашены по рынку перед выходными) считаются
-    по фактической цене выхода: их R может быть любым от −1 до +R:R. В винрейт они
-    входят по знаку — плюсовой выход считаем удачей, минусовой нет; в профит-фактор
-    попадают той же величиной, что и в итог."""
-    tp = sl = pending = expired = week = 0
+    инструментам — только по закрытым (цель/стоп)."""
+    tp = sl = pending = expired = 0
     gross_profit = 0.0            # сумма плюсов в R (по факт. R:R достигших цели)
     gross_loss = 0.0             # сумма минусов в R (каждый стоп = 1R)
     by_instrument: dict[str, dict] = {}
@@ -1175,7 +1072,7 @@ def compute_signal_stats(rows: list[dict]) -> dict:
         if status == "expired":
             expired += 1
             continue
-        # закрытые: hit_tp / hit_sl / closed_week
+        # закрытые: hit_tp / hit_sl
         risk = abs(s["entry_price"] - s["stop_loss"])
         rr = abs(s["take_profit"] - s["entry_price"]) / risk if risk else 0.0
         inst = by_instrument.setdefault(
@@ -1191,26 +1088,11 @@ def compute_signal_stats(rows: list[dict]) -> dict:
             gross_loss += 1.0
             inst["sl"] += 1
             inst["net"] -= 1.0
-        elif status == "closed_week":
-            week += 1
-            if s.get("exit_price") is None:
-                continue  # цены выхода нет — посчитать результат нечем
-            r = trading_week.realized_r(s["direction"], s["entry_price"],
-                                        s["stop_loss"], s["exit_price"])
-            inst["net"] += r
-            if r >= 0:
-                tp += 1
-                gross_profit += r
-                inst["tp"] += 1
-            else:
-                sl += 1
-                gross_loss += -r
-                inst["sl"] += 1
 
     decided = tp + sl
     return {
         "total": len(rows),
-        "tp": tp, "sl": sl, "pending": pending, "expired": expired, "week": week,
+        "tp": tp, "sl": sl, "pending": pending, "expired": expired,
         "decided": decided,
         "winrate": (tp / decided) if decided else None,
         "net_r": gross_profit - gross_loss,
@@ -1250,9 +1132,7 @@ def render_stats(user_id: int, period: str) -> tuple[str, InlineKeyboardMarkup]:
         f"📊 Статистика сигналов — {head}\n",
         f"Всего: {st['total']}",
         f"✅ Цель: {st['tp']}   🛑 Стоп: {st['sl']}   "
-        f"⏳ Ждём: {st['pending']}   ⌛ Истекло: {st['expired']}"
-        + (f"\n🔚 Закрыто по неделе: {st['week']} (учтены по цене выхода)"
-           if st.get("week") else ""),
+        f"⏳ Ждём: {st['pending']}   ⌛ Истекло: {st['expired']}",
         "",
     ]
 
@@ -1299,71 +1179,58 @@ async def cb_stats(call: CallbackQuery):
 
 
 def settings_text(user_id: int, is_admin: bool) -> str:
-    """Меню настроек человеческим языком: три решения вместо четырёх сырых чисел.
-
-    Владелец бота — трейдер, а не программист: «процентиль объёма 70» ему ничего не
-    говорит, а «сигналы средней частоты» — говорит. Поэтому пороги спрятаны за
-    понятные названия, а под каждым написано, что он меняет на практике.
-    """
     # Пороги персональные: подписчик крутит их под себя, поверх общих значений.
     # Админ правит ОБЩИЙ дефолт (для всех, кто не настроил своё) — у него личных нет.
     overrides = {} if is_admin else database.get_user_settings(user_id)
     eff = config.effective(overrides)
-    sens = config.sensitivity_of(eff)
-    # None — действующие пороги не совпадают ни с одним пресетом (настраивали
-    # вручную до появления кнопок). Пишем честно, а не выбираем ближайшее.
-    sens_name = (config.SENSITIVITY[sens][0] if sens
-                 else "своё значение — нажми кнопку, чтобы перейти на измеренное")
-    personal = " (личное)" if overrides else ""
-    chase = "включено" if eff["MAX_RISK_ATR"] else "выключено"
+
+    def mark(key: str) -> str:
+        return " (личное)" if key in overrides else ""
 
     if is_admin:
-        footer = ("Это общие настройки — для всех, кто не менял их под себя.\n"
-                  "Кнопки применяются сразу ко всем.")
+        footer = (
+            "Это общие пороги по умолчанию — для всех, кто не настроил своё.\n"
+            "Меняй кнопками ниже (применится сразу ко всем «по умолчанию»):"
+        )
     else:
-        footer = ("Это твои личные настройки сигналов.\n"
-                  "«Сбросить» вернёт общие.")
+        footer = (
+            "Это твои личные пороги — крути сигналы (и зоны в /analyze) под себя кнопками.\n"
+            "«Сбросить» вернёт общие значения. Метка «(личное)» = твоё переопределение."
+        )
     return (
-        f"⚙️ Настройки сигналов{personal}\n\n"
-        f"🎚 Частота сигналов: {sens_name}\n"
-        "   Насколько редким должен быть всплеск объёма, чтобы считаться сигналом.\n"
-        "   Реже — сигналов меньше, но отобраны строже.\n\n"
-        f"🎯 Прибыль к риску: 1:{eff['MIN_RR']:g}\n"
-        "   Сколько бот хочет заработать на каждый доллар риска. Выше — сигналы\n"
-        "   реже, зато каждый крупнее.\n\n"
-        f"🚫 Не входить вдогонку: {chase}\n"
-        "   Пропускать сигналы, где цена уже далеко ушла от уровня. Пружина\n"
-        "   торгуется ОТ уровня; входы вдогонку по замеру убыточны.\n\n"
+        "⚙️ Настройки движка сигналов:\n"
+        f"• Аномальный объём: × {eff['VOL_MULT']:g}{mark('VOL_MULT')}\n"
+        f"• Глубина ложного пробоя: {eff['BREAK_PCT'] * 100:.3g}%{mark('BREAK_PCT')}\n"
+        f"• Объём зоны ликвидности (для /analyze): × {eff['LIQUIDITY_MULT']:g}{mark('LIQUIDITY_MULT')}\n"
+        f"• Мин. прибыль/риск (R:R): 1:{eff['MIN_RR']:g}{mark('MIN_RR')}\n\n"
         + footer
     )
 
 
-def settings_keyboard(user_id: int, is_admin: bool) -> InlineKeyboardMarkup:
-    """Три решения — три ряда кнопок. Текущее положение помечено галочкой."""
-    eff = config.effective({} if is_admin else database.get_user_settings(user_id))
-    sens = config.sensitivity_of(eff)
-    chase_on = bool(eff["MAX_RISK_ATR"])
-
-    def tick(active: bool, text: str) -> str:
-        return f"✅ {text}" if active else text
-
+def settings_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
     rows = [
-        [InlineKeyboardButton(text=tick(sens == key, label),
-                              callback_data=f"set:SENS:{key}")
-         for key, (label, _) in config.SENSITIVITY.items()],
-        # Оптимум (1:2) стоит В СЕРЕДИНЕ ряда, а не с краю: по замеру он выигрывает
-        # и у более мягких порогов, и у более жёстких, поэтому кнопки идут по обе
-        # стороны от него. 1:3 из меню убран — он измеренно худший из проверенных
-        # (1 420$ против 1 751$ на счёте, см. «Прибыль/риск» в CLAUDE.md).
-        [InlineKeyboardButton(text=tick(abs(eff["MIN_RR"] - value) < 1e-9, f"1:{value:g}"),
-                              callback_data=f"set:MIN_RR:{value}")
-         for value in (1.5, 2.0, 2.5)],
-        [InlineKeyboardButton(
-            text=("🚫 Не входить вдогонку: вкл" if chase_on
-                  else "🚫 Не входить вдогонку: выкл"),
-            callback_data=f"set:CHASE:{'off' if chase_on else 'on'}")],
+        [
+            InlineKeyboardButton(text="Объём ×1.3", callback_data="set:VOL_MULT:1.3"),
+            InlineKeyboardButton(text="×1.5", callback_data="set:VOL_MULT:1.5"),
+            InlineKeyboardButton(text="×2.0", callback_data="set:VOL_MULT:2.0"),
+        ],
+        [
+            InlineKeyboardButton(text="Пробой 0.03%", callback_data="set:BREAK_PCT:0.0003"),
+            InlineKeyboardButton(text="0.05%", callback_data="set:BREAK_PCT:0.0005"),
+            InlineKeyboardButton(text="0.1%", callback_data="set:BREAK_PCT:0.001"),
+        ],
+        [
+            InlineKeyboardButton(text="R:R 1:2", callback_data="set:MIN_RR:2.0"),
+            InlineKeyboardButton(text="1:2.5", callback_data="set:MIN_RR:2.5"),
+            InlineKeyboardButton(text="1:3", callback_data="set:MIN_RR:3.0"),
+        ],
+        [
+            InlineKeyboardButton(text="Ликвидн. ×1.3", callback_data="set:LIQUIDITY_MULT:1.3"),
+            InlineKeyboardButton(text="×1.5", callback_data="set:LIQUIDITY_MULT:1.5"),
+            InlineKeyboardButton(text="×2.0", callback_data="set:LIQUIDITY_MULT:2.0"),
+        ],
     ]
-    # Подписчику — сброс личных настроек к общим. Админу нечего сбрасывать (он и есть общие).
+    # Подписчику — сброс личных порогов к общим. Админу нечего сбрасывать (он и есть общие).
     if not is_admin:
         rows.append([InlineKeyboardButton(text="↩️ Сбросить к общим", callback_data="set:reset")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1375,71 +1242,41 @@ async def cmd_settings(message: Message):
     is_admin = ADMIN_ID is None or message.from_user.id == ADMIN_ID
     await message.answer(
         settings_text(message.from_user.id, is_admin),
-        reply_markup=settings_keyboard(message.from_user.id, is_admin),
+        reply_markup=settings_keyboard(is_admin),
     )
-
-
-def _apply_settings(user_id: int, is_admin: bool, values: dict) -> None:
-    """Записать пороги: админу — в общий дефолт, подписчику — в личные."""
-    for key, value in values.items():
-        if is_admin:
-            config.set_value(key, value)                    # общий дефолт для всех
-        else:
-            database.set_user_setting(user_id, key, value)  # личный порог
 
 
 @dp.callback_query(F.data.startswith("set:"))
 async def cb_settings(call: CallbackQuery):
     is_admin = ADMIN_ID is None or call.from_user.id == ADMIN_ID
-    user_id = call.from_user.id          # call.message.from_user — это бот, не человек
     parts = call.data.split(":")
 
-    async def redraw(note: str) -> None:
-        await call.answer(note)
-        await call.message.edit_text(
-            settings_text(user_id, is_admin),
-            reply_markup=settings_keyboard(user_id, is_admin),
-        )
-
-    # Сброс личных настроек подписчика к общим.
+    # Сброс личных порогов подписчика к общим.
     if len(parts) == 2 and parts[1] == "reset":
-        database.reset_user_settings(user_id)
-        await redraw("Сброшено к общим")
+        database.reset_user_settings(call.from_user.id)
+        await call.answer("Сброшено к общим")
+        await call.message.edit_text(
+            settings_text(call.from_user.id, is_admin), reply_markup=settings_keyboard(is_admin)
+        )
         return
 
     try:
-        _, key, raw = parts
-    except ValueError:
-        await call.answer("Не понял настройку")
-        return
-
-    # Частота сигналов — пресет: одно нажатие задаёт сразу несколько порогов.
-    if key == "SENS":
-        preset = config.SENSITIVITY.get(raw)
-        if preset is None:
-            await call.answer("Не понял настройку")
-            return
-        _apply_settings(user_id, is_admin, preset[1])
-        await redraw(f"Частота: {preset[0]}")
-        return
-
-    # «Не входить вдогонку» — переключатель. 0 отключает фильтр (см. config).
-    if key == "CHASE":
-        _apply_settings(user_id, is_admin,
-                        {"MAX_RISK_ATR": config.MAX_RISK_ATR if raw == "on" else 0})
-        await redraw("Готово")
-        return
-
-    try:
-        value = float(raw)
+        _, key, value = parts
+        value = float(value)
         if key not in config.TUNABLE:
             raise KeyError(key)
     except (ValueError, KeyError):
         await call.answer("Не понял настройку")
         return
 
-    _apply_settings(user_id, is_admin, {key: value})
-    await redraw("Готово")
+    if is_admin:
+        config.set_value(key, value)                       # общий дефолт для всех
+    else:
+        database.set_user_setting(call.from_user.id, key, value)  # личный порог
+    await call.answer("Готово")
+    await call.message.edit_text(
+        settings_text(call.from_user.id, is_admin), reply_markup=settings_keyboard(is_admin)
+    )
 
 
 # ── Telegram Payments ─────────────────────────────────────────────────────────

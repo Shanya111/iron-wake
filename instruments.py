@@ -5,8 +5,6 @@
 и в database.py (получение котировок).
 """
 
-import config
-
 # Код пары → отображаемое имя, тикер Yahoo Finance, число знаков после запятой.
 # Тикеры проверены на живых данных (все отдают минутные свечи для логики касания).
 #
@@ -37,54 +35,13 @@ INSTRUMENTS = {
     "BRENT":  {"name": "Нефть Brent",   "ticker": "BZ=F",         "decimals": 2,
                "source": "yahoo"},
     "BTC":    {"name": "Bitcoin",       "ticker": "BTC-USD",      "decimals": 2,
-               "ccxt": {"symbol": "BTC/USD", "exchange": "kraken"}, "round_clock": True},
+               "ccxt": {"symbol": "BTC/USD", "exchange": "kraken"}},
     "SOL":    {"name": "Solana",        "ticker": "SOL-USD",      "decimals": 2,
-               "ccxt": {"symbol": "SOL/USD", "exchange": "kraken"}, "round_clock": True},
+               "ccxt": {"symbol": "SOL/USD", "exchange": "kraken"}},
     "ETH":    {"name": "Ethereum",      "ticker": "ETH-USD",      "decimals": 2,
-               "ccxt": {"symbol": "ETH/USD", "exchange": "kraken"}, "round_clock": True},
+               "ccxt": {"symbol": "ETH/USD", "exchange": "kraken"}},
     "TON":    {"name": "Toncoin (TON)", "ticker": "TON11419-USD", "decimals": 4,
-               "ccxt": {"symbol": "TON/USD", "exchange": "kraken"}, "round_clock": True},
-    # ── Расширение крипто-набора (6 августа 2026) ───────────────────────────────
-    # Зачем: владельцу нужно больше сигналов, а ослаблять фильтры отбора нельзя —
-    # каждое ослабление измерено и каждое уводит счёт вниз (см. «Возврат к частым
-    # сигналам» в CLAUDE.md). Единственный честный способ — расширить поле поиска:
-    # больше инструментов при той же планке качества.
-    #
-    # Отбор пар — по ДВУМ условиям сразу, оба обязательны:
-    #   1. пара есть на Kraken (боевой источник свечей и стакана);
-    #   2. пара есть на Bitfinex с годовой почасовой историей — иначе её нечем
-    #      проверить, а брать инструмент в бой непроверенным мы не будем.
-    # Отсеялись по второму условию: ATOM, OP, INJ, TIA (на Bitfinex их нет).
-    #
-    # Порог ликвидности — оборот Kraken не ниже TON (~1.1 млн $/сутки), самой тонкой
-    # из уже принятых пар. Это не вкусовщина: на USD/JPY мы уже обожглись — там
-    # мёртвая ликвидность давала застрявшую цену и плоские свечи, а VSA по плоским
-    # свечам не работает вовсе. Не прошли порог: TRX (0.70), NEAR (0.50), BCH (0.37),
-    # DOT (0.28), POL (0.28), ALGO (0.28), FIL (0.28), ARB (0.12), SEI (0.11),
-    # ETC (0.04), APT (0.03) — все в млн $/сутки.
-    #
-    # Тикеры Yahoo проверены на живых данных. У UNI и SUI обычные имена заняты
-    # акциями, поэтому числовой суффикс — как у TON.
-    "XRP":    {"name": "XRP",           "ticker": "XRP-USD",      "decimals": 4,
-               "ccxt": {"symbol": "XRP/USD", "exchange": "kraken"}, "round_clock": True},
-    "ADA":    {"name": "Cardano",       "ticker": "ADA-USD",      "decimals": 4,
-               "ccxt": {"symbol": "ADA/USD", "exchange": "kraken"}, "round_clock": True},
-    "XLM":    {"name": "Stellar",       "ticker": "XLM-USD",      "decimals": 4,
-               "ccxt": {"symbol": "XLM/USD", "exchange": "kraken"}, "round_clock": True},
-    "AVAX":   {"name": "Avalanche",     "ticker": "AVAX-USD",     "decimals": 2,
-               "ccxt": {"symbol": "AVAX/USD", "exchange": "kraken"}, "round_clock": True},
-    "SUI":    {"name": "Sui",           "ticker": "SUI20947-USD", "decimals": 4,
-               "ccxt": {"symbol": "SUI/USD", "exchange": "kraken"}, "round_clock": True},
-    "UNI":    {"name": "Uniswap",       "ticker": "UNI7083-USD",  "decimals": 4,
-               "ccxt": {"symbol": "UNI/USD", "exchange": "kraken"}, "round_clock": True},
-    "LTC":    {"name": "Litecoin",      "ticker": "LTC-USD",      "decimals": 2,
-               "ccxt": {"symbol": "LTC/USD", "exchange": "kraken"}, "round_clock": True},
-    "AAVE":   {"name": "Aave",          "ticker": "AAVE-USD",     "decimals": 2,
-               "ccxt": {"symbol": "AAVE/USD", "exchange": "kraken"}, "round_clock": True},
-    "DOGE":   {"name": "Dogecoin",      "ticker": "DOGE-USD",     "decimals": 5,
-               "ccxt": {"symbol": "DOGE/USD", "exchange": "kraken"}, "round_clock": True},
-    "LINK":   {"name": "Chainlink",     "ticker": "LINK-USD",     "decimals": 2,
-               "ccxt": {"symbol": "LINK/USD", "exchange": "kraken"}, "round_clock": True},
+               "ccxt": {"symbol": "TON/USD", "exchange": "kraken"}},
 }
 
 
@@ -121,24 +78,6 @@ def engine_codes() -> list[str]:
     Крипта/форекс — биржевой объём Kraken (ccxt). Золото/нефть — почасовой объём
     Yahoo (source='yahoo'). Своя пара и инструменты без объёма в движок не входят."""
     return [code for code in INSTRUMENTS if data_source(code)]
-
-
-def trades_round_clock(code: str) -> bool:
-    """Торгуется ли инструмент круглосуточно и без выходных (крипта).
-
-    Почему это ОТДЕЛЬНЫЙ признак, а не вывод из data_source: источник 'ccxt' у
-    крипты и у форекса ОДИН И ТОТ ЖЕ (обе группы живут на Kraken), но выходные у
-    них разные. У EUR/USD межбанк в субботу закрыт, и котировка Kraken этого не
-    меняет — в понедельник цена всё равно откроется гэпом. Поэтому круглосуточность
-    помечена явным полем "round_clock" у крипто-пар, а не угадывается по бирже.
-
-    Общий выключатель — config.CRYPTO_ROUND_CLOCK: False возвращает всех под
-    недельное окно (как было до 7 августа 2026).
-    """
-    if not config.CRYPTO_ROUND_CLOCK:
-        return False
-    info = INSTRUMENTS.get(code)
-    return bool(info and info.get("round_clock"))
 
 
 def data_source(code: str) -> str | None:
