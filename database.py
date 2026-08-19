@@ -130,7 +130,7 @@ def init_db() -> None:
             )
         """)
         # Персональные пороги движка: подписчик переопределяет общие значения под себя.
-        # key — из config.TUNABLE (VOL_MULT / BREAK_PCT / MIN_RR …), value — число.
+        # key — из config.TUNABLE (MAX_ENTRY_DIST_ATR / MAX_RISK_ATR), value — число.
         # Чего тут нет — берётся из общих настроек (settings.json / дефолтов).
         conn.execute("""
             CREATE TABLE IF NOT EXISTS user_settings (

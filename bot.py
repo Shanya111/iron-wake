@@ -9,7 +9,11 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
+from aiogram.exceptions import (
+    TelegramBadRequest,
+    TelegramForbiddenError,
+    TelegramRetryAfter,
+)
 from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
@@ -26,6 +30,7 @@ import analyzer
 import config
 import data_fetcher
 import database
+import pattern_detector
 import scheduler as engine
 from llm import ANALYST_PROMPT, ask_openrouter, classify_intent
 from instruments import (
@@ -643,63 +648,117 @@ def _format_orderbook(ob: dict, d: int) -> list[str]:
     return lines
 
 
-def _render_levels(items: list[dict], d: int, last: float, limit: int) -> str:
-    """Уровни строками: эмодзи + слово + цена, сверху вниз (дороже — выше, как на графике).
-    Берём `limit` ближайших к цене (они важнее), близкие сливаем (чтобы «160.14, 160.14,
-    160.13» не засоряли список), ⭐ — сильный уровень."""
-    if not items:
-        return "  —"
-    kept: list[dict] = []
-    for l in sorted(items, key=lambda x: abs(x["price"] - last)):
-        dup = next((k for k in kept if k["type"] == l["type"]
-                    and abs(k["price"] - l["price"]) <= l["price"] * 0.0015), None)
-        if dup is None:
-            kept.append(dict(l))
-            if len(kept) >= limit:
-                break
-        elif l.get("strength") == "strong":
-            dup["strength"] = "strong"  # сильный уровень важнее — поднимаем приоритет
-    rows = []
-    for l in sorted(kept, key=lambda x: x["price"], reverse=True):
-        emoji = "🟥" if l["type"] == "resistance" else "🟩"
-        word = "сопротивление" if l["type"] == "resistance" else "поддержка"
-        star = " ⭐" if l.get("strength") == "strong" else ""
-        rows.append(f"  {emoji} {word} {fmt(l['price'], d)}{star}")
-    return "\n".join(rows)
+def _level_row(lvl: dict, d: int, above: bool) -> str:
+    """Строка уровня в отчёте: цена, сила, таймфрейм и расстояние в ATR."""
+    emoji = "🟥" if above else "🟩"
+    word = "сопротивление" if above else "поддержка"
+    star = " ⭐" if lvl["strength"] == "strong" else ""
+    tf = {"D1": "дневной", "H1": "часовой"}.get(lvl.get("timeframe", ""), "")
+    tf = f" ({tf})" if tf else ""
+    side = "выше" if above else "ниже"
+    dist = (f"{lvl['dist_atr']:.2f} ATR" if lvl.get("dist_atr") is not None
+            else fmt(lvl["dist"], d))
+    return (f"  {emoji} {word} {fmt(lvl['price'], d)}{star}{tf} — {side} на {dist} "
+            f"({lvl['dist_pct'] * 100:.2f}%)")
 
 
-def _format_analysis(info: dict, df, trend: str, levels: list[dict], zones: list[dict],
-                     ob: dict | None = None) -> str:
-    """Человеко-читаемый отчёт по числам анализа (без AI). Уровни сгруппированы по
-    таймфреймам (дневка/часовик) с эмодзи — чтобы было видно, что старшее, что ближнее."""
-    last = float(df["close"].iloc[-1])
-    d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
+SIDE_WORD = {"long": "🟢 лонг", "short": "🔴 шорт"}
+
+
+def _format_engine_view(info: dict, ex: dict, zones: list[dict],
+                        ob: dict | None, signals: dict) -> str:
+    """Отчёт /analyze: те же пять условий, по которым движок принимает решение.
+
+    Смысл не в описании рынка вообще, а в ответе на вопрос «что здесь происходит
+    глазами движка и чего не хватает до сигнала». Порядок пунктов совпадает с
+    порядком проверок в pattern_detector (тренд → уровни → объём → пробой → R:R).
+    """
+    c = ex["close"]
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(c)
     trend_ru = {
-        "up": "восходящий ↑ (цена растёт)",
-        "down": "нисходящий ↓ (цена падает)",
-        "sideways": "боковик → (без чёткого направления)",
-    }[trend]
-    d1 = [l for l in levels if l.get("timeframe") == "D1" and l["type"] in ("support", "resistance")]
-    h1 = [l for l in levels if l.get("timeframe") == "H1" and l["type"] in ("support", "resistance")]
+        "up": "восходящий ↑ — движок берёт только ЛОНГИ",
+        "down": "нисходящий ↓ — движок берёт только ШОРТЫ",
+        "sideways": "боковик → — движок берёт обе стороны",
+    }[ex["trend"]]
+    # Стороны, которые тренд вообще разрешает: по ним и разбираем пробой и R:R.
+    live = [s for s in ("long", "short") if ex["sides"][s]["trend_ok"]]
 
     lines = [
-        f"📊 {info['name']} — анализ",
-        f"Цена сейчас: {fmt(last, d)}",
-        f"Тренд на дневке (D1): {trend_ru}",
+        f"📊 {info['name']} — что видит движок",
+        f"Цена (закрытие часовой свечи {ex['bar_time'][:16]} UTC): {fmt(c, d)}",
+        f"Средний размах свечи (ATR): {fmt(ex['atr'], d)} — это {ex['atr_pct'] * 100:.2f}% цены",
         "",
-        "🔵 Дневка (D1) — крупные уровни (главные ориентиры):",
-        _render_levels(d1, d, last, limit=6),
+        f"1. Тренд дневки: {trend_ru}",
         "",
-        "🟡 Часовик (H1) — ближние уровни (для входа):",
-        _render_levels(h1, d, last, limit=8),
+        "2. Ближайшие уровни (расстояние — в ATR, единой мерке для всех инструментов):",
     ]
-    if any(l.get("strength") == "strong" for l in h1):
-        lines.append("  ⭐ — сильный: часовой уровень совпал с дневным")
+    rows = [_level_row(l, d, above=True) for l in reversed(ex["resistances"])]
+    rows += [_level_row(l, d, above=False) for l in ex["supports"]]
+    lines += rows or ["  — уровней рядом нет"]
+
+    mark = "✅" if ex["sides"][live[0]]["vol_ok"] else "❌"
+    lines += [
+        "",
+        f"3. Объём последней закрытой свечи: {ex['vol_ratio']:.1f}× среднего "
+        f"(нужно ×{ex['vol_mult']:g}) {mark}",
+        "",
+        "4. Ложный пробой (прокол уровня с возвратом обратно):",
+    ]
+    for side in live:
+        s = ex["sides"][side]
+        br = s["broken_level"]
+        if br:
+            star = " ⭐" if br["strength"] == "strong" else ""
+            what = (f"ЕСТЬ — проколот уровень {fmt(br['price'], d)}{star}, "
+                    "закрылись обратно ✅")
+        else:
+            # Первый блокер, не считая тренда, объёма и R:R, — это причина по пробою.
+            reasons = [b for b in s["blockers"]
+                       if not b.startswith(("тренд", "объём", "до ближайшей"))]
+            what = (reasons[0] if reasons else "нет") + " ❌"
+        lines.append(f"  {SIDE_WORD[side]}: {what}")
+
+    lines += ["", "5. Профит/риск, если бы входили прямо сейчас:"]
+    for side in live:
+        s = ex["sides"][side]
+        if s["rr"] is None:
+            lines.append(f"  {SIDE_WORD[side]}: не посчитать (свеча без размаха)")
+            continue
+        ok = "✅" if s["rr"] >= config.MIN_RR else "❌"
+        tgt = (f"цель {fmt(s['target'], d)}" if s["target"] is not None
+               else f"цели впереди нет — ставится на {config.MIN_RR:g} риска")
+        lines.append(
+            f"  {SIDE_WORD[side]}: 1:{s['rr']:.1f} (нужно 1:{config.MIN_RR:g}) {ok} — "
+            f"риск {fmt(s['risk'], d)} ({s['risk_atr']:.2f} ATR), {tgt}")
+
+    # Итог: что мешает — по каждой разрешённой трендом стороне.
+    lines += ["", "🎯 Итог:"]
+    fired = False
+    for side in live:
+        sig = signals.get(side)
+        if sig:
+            fired = True
+            lines.append(
+                f"  {SIDE_WORD[side]}: СИГНАЛ ЕСТЬ — заявка {fmt(sig['entry_price'], d)}, "
+                f"стоп {fmt(sig['stop_loss'], d)}, цель {fmt(sig['take_profit'], d)}")
+        else:
+            blockers = ex["sides"][side]["blockers"] or ["условия сложились"]
+            lines.append(f"  {SIDE_WORD[side]}: сигнала нет. Не хватает:")
+            lines += [f"     • {b}" for b in blockers]
+    if not fired:
+        lines.append("  Ждём: сигнал родится на той свече, которая закроет все пункты выше.")
+
+    f = ex["filters"]
+    fl = ["вход у уровня " + (f"≤ {f['MAX_ENTRY_DIST_ATR']:g} ATR"
+                              if f["MAX_ENTRY_DIST_ATR"] else "выкл"),
+          "вдогонку " + (f"≤ {f['MAX_RISK_ATR']:g} ATR" if f["MAX_RISK_ATR"] else "выкл")]
+    lines += ["", f"⚙️ Твои фильтры отбора: {', '.join(fl)} (меняются в /settings)"]
+
     if zones:
-        near = sorted(zones, key=lambda z: abs(z["price"] - last))[:6]
+        near = sorted(zones, key=lambda z: abs(z["price"] - c))[:6]
         zlines = []
         for z in sorted(near, key=lambda x: x["price"], reverse=True):
-            tag = " (рядом с ценой)" if abs(z["price"] - last) <= last * 0.01 else ""
+            tag = " (рядом с ценой)" if abs(z["price"] - c) <= c * 0.01 else ""
             zlines.append(f"  💰 {fmt(z['price'], d)}{tag}")
         lines += ["", "💰 Зоны ликвидности (где стояли крупные объёмы — магнит для цены):",
                   "\n".join(zlines)]
@@ -708,17 +767,47 @@ def _format_analysis(info: dict, df, trend: str, levels: list[dict], zones: list
     return "\n".join(lines)
 
 
-def _analysis_prompt(info: dict, last: float, trend: str, levels: list[dict],
-                     zones: list[dict], ob: dict | None = None) -> str:
-    """Компактная сводка чисел для AI-разбора (гибрид). Уровни разнесены по
-    таймфреймам — чтобы AI в ответе уточнял, дневной уровень или часовой."""
-    d = info["decimals"] if info["decimals"] is not None else infer_decimals(last)
-    d1 = [fmt(l["price"], d) for l in levels
-          if l.get("timeframe") == "D1" and l["type"] in ("support", "resistance")]
-    h1_strong = [fmt(l["price"], d) for l in levels
-                 if l.get("timeframe") == "H1" and l.get("strength") == "strong"]
-    zone_prices = [fmt(z["price"], d) for z in zones[:6]]
-    dom = ""
+def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
+                     ob: dict | None, signals: dict) -> str:
+    """Компактная сводка РАСКЛАДА ДВИЖКА для AI-разбора (а не сырых чисел рынка).
+
+    Модели даём ровно то, что решает движок, — тогда и комментарий получается про
+    сетап, а не пересказ цифр, которые пользователь уже прочитал выше.
+    """
+    c = ex["close"]
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(c)
+    live = [s for s in ("long", "short") if ex["sides"][s]["trend_ok"]]
+
+    def lvls(items, word):
+        if not items:
+            return f"{word}: нет"
+        parts = [f"{fmt(l['price'], d)} ({l['dist_atr']:.2f} ATR"
+                 f"{', сильный' if l['strength'] == 'strong' else ''})" for l in items]
+        return f"{word}: " + ", ".join(parts)
+
+    out = [
+        f"Инструмент: {info['name']}",
+        f"Цена (закрытие H1): {fmt(c, d)}; ATR {fmt(ex['atr'], d)} "
+        f"({ex['atr_pct'] * 100:.2f}% цены)",
+        f"Тренд D1: {ex['trend']} (разрешает: {', '.join(live)})",
+        lvls(ex["resistances"], "Сопротивления сверху"),
+        lvls(ex["supports"], "Поддержки снизу"),
+        f"Объём последней закрытой свечи: {ex['vol_ratio']:.1f}× среднего, "
+        f"порог ×{ex['vol_mult']:g}",
+    ]
+    for side in live:
+        s = ex["sides"][side]
+        if signals.get(side):
+            out.append(f"{side}: СИГНАЛ ЕСТЬ (ложный пробой подтверждён)")
+        else:
+            out.append(f"{side}: сигнала нет, мешает — " + "; ".join(s["blockers"]))
+        if s["rr"] is not None:
+            out.append(f"{side}: профит/риск при входе сейчас 1:{s['rr']:.1f} "
+                       f"(порог 1:{config.MIN_RR:g})")
+    if zones:
+        out.append("Зоны ликвидности: " + ", ".join(
+            fmt(z["price"], d)
+            for z in sorted(zones, key=lambda z: abs(z["price"] - c))[:5]))
     if ob:
         pressure_ru = {"buyers": "перевес покупателей", "sellers": "перевес продавцов",
                        "balance": "баланс сил"}
@@ -727,17 +816,9 @@ def _analysis_prompt(info: dict, last: float, trend: str, levels: list[dict],
             dom += f", крупная покупка у {fmt(ob['bid_wall']['price'], d)}"
         if ob.get("ask_wall"):
             dom += f", крупная продажа у {fmt(ob['ask_wall']['price'], d)}"
-        dom += "\n"
-    return (
-        f"Инструмент: {info['name']}\n"
-        f"Цена сейчас: {fmt(last, d)}\n"
-        f"Тренд D1: {trend}\n"
-        f"Уровни дневки (D1): {', '.join(d1) or 'нет'}\n"
-        f"Сильные уровни часовика (H1): {', '.join(h1_strong) or 'нет'}\n"
-        f"Зоны ликвидности: {', '.join(zone_prices) or 'нет'}\n"
-        f"{dom}"
-        "Дай короткий разбор."
-    )
+        out.append(dom)
+    out.append("Прокомментируй расклад.")
+    return "\n".join(out)
 
 
 async def _do_analyze(message: Message, code: str, user_id: int):
@@ -754,10 +835,21 @@ async def _do_analyze(message: Message, code: str, user_id: int):
 
     trend = analyzer.get_trend(d1)
     levels = engine.analyze_and_store(code, d1, h1)  # считает и сохраняет уровни в БД
-    # Зоны ликвидности — под личный порог пользователя (LIQUIDITY_MULT): кто-то хочет
-    # видеть только самые жирные всплески объёма, кто-то — больше зон. На сигналы не влияет.
-    liq_mult = config.effective(database.get_user_settings(user_id))["LIQUIDITY_MULT"]
-    zones = analyzer.find_liquidity_zones(d1, liq_mult)
+    zones = analyzer.find_liquidity_zones(d1)
+
+    # Разбор — по ЛИЧНЫМ фильтрам пользователя: он должен видеть свой отбор, а не чужой.
+    settings = config.effective(database.get_user_settings(user_id))
+    ex = pattern_detector.explain(h1, levels, trend, settings)
+    if not ex.get("enough_history"):
+        await waiting.delete()
+        await message.answer("Слишком мало часовых свечей для разбора, попробуй позже.")
+        return
+    # Сам детектор гоняем тоже: если сигнал есть, показываем ЕГО числа, а не свои
+    # пересчёты. Заодно это страховка от расхождения explain() и _detect.
+    signals = {
+        "long": pattern_detector.detect_spring(h1, levels, trend, settings),
+        "short": pattern_detector.detect_upthrust(h1, levels, trend, settings),
+    }
 
     # Стакан (DOM) есть у всех инструментов движка (BingX), включая золото и нефть —
     # на Yahoo его не было вовсе. Ошибка стакана анализ не валит (ob=None ниже).
@@ -771,13 +863,12 @@ async def _do_analyze(message: Message, code: str, user_id: int):
             ob = None
 
     await waiting.delete()
-    await message.answer(_format_analysis(info, d1, trend, levels, zones, ob))
+    await message.answer(_format_engine_view(info, ex, zones, ob, signals))
 
-    # Гибрид: AI пишет человеческий разбор поверх чисел. Ошибка LLM не критична.
+    # Гибрид: AI комментирует РАСКЛАД, а не пересказывает числа. Ошибка LLM не критична.
     try:
-        last = float(d1["close"].iloc[-1])
         comment = await ask_openrouter(
-            _analysis_prompt(info, last, trend, levels, zones, ob), system_prompt=ANALYST_PROMPT
+            _analysis_prompt(info, ex, zones, ob, signals), system_prompt=ANALYST_PROMPT
         )
         # Подписываем, по какому инструменту разбор — сообщения в ленте отрываются
         # от заголовка, и без имени непонятно, о чём речь.
@@ -1013,8 +1104,44 @@ async def cb_stats(call: CallbackQuery):
     await call.answer()
 
 
+# Кнопки фильтров строгости отбора: (значение, подпись). 0 — фильтр выключен.
+# Сетка не выдумана: это те пороги, что реально прогонялись на 833 днях истории
+# (замер 19 августа 2026, таблица — в config._DEFAULTS и в тексте /settings).
+ENTRY_DIST_CHOICES = ((0.0, "выкл"), (0.05, "0.05"), (0.075, "0.075"),
+                      (0.1, "0.1"), (0.15, "0.15"))
+RISK_ATR_CHOICES = ((0.0, "выкл"), (0.5, "0.5"), (0.75, "0.75"), (1.0, "1.0"))
+
+# Таблица замера — показываем её прямо в меню. Крутить фильтр вслепую бессмысленно:
+# каждый порог уже прогнан, и видно, чем именно платишь за качество.
+SETTINGS_TABLE = (
+    "📊 Что это даёт (замер 19.08.2026: 14 инструментов BingX, 833 дня часовых свечей).\n"
+    "В скобках — итог на свежей половине истории, которую подбор порогов не видел:\n"
+    "• оба выключены — 88 сигналов/мес, −0.044 R на сделку (−198.6 R)\n"
+    "• вход ≤ 0.05 ATR — 17/мес, +0.121 R (+23.7 R)\n"
+    "• вход ≤ 0.075 ATR — 25/мес, +0.139 R (+9.2 R)\n"
+    "• вход ≤ 0.1 ATR — 31/мес, +0.094 R (−4.7 R)\n"
+    "• вход ≤ 0.15 ATR — 41/мес, +0.055 R (−32.3 R)\n"
+    "• риск ≤ 0.5 ATR — 28/мес, +0.084 R (+11.5 R)\n"
+    "• риск ≤ 0.75 ATR — 53/мес, +0.051 R (−60.8 R)\n"
+    "• риск ≤ 1.0 ATR — 69/мес, +0.006 R (−128.2 R)\n\n"
+    "Правило простое: строже порог → лучше средняя сделка и во столько же раз меньше "
+    "сигналов. Включаешь впервые — бери «вход ≤ 0.075»: лучшая средняя сделка во всём замере.\n\n"
+    "⚠️ Честно: ПРИБЫЛЬНЫМ движок это не делает. Плюс на свежей половине есть, но на "
+    "калибровочной половине эти пороги все в минусе, и по всей истории целиком — тоже. "
+    "Фильтры про «реже и качественнее», а не про заработок.\n"
+    "⚠️ Оба сразу — пока не измерено. Порознь мерили, вместе нет, поэтому чисел про "
+    "сочетание тут нет.\n\n"
+)
+
+
+def _filter_line(eff: dict, key: str, unit: str) -> str:
+    """«выключен» или «≤ 0.075 ATR» — текущее значение фильтра человеческим видом."""
+    value = eff.get(key) or 0
+    return "выключен" if not value else f"≤ {value:g} {unit}"
+
+
 def settings_text(user_id: int, is_admin: bool) -> str:
-    # Пороги персональные: подписчик крутит их под себя, поверх общих значений.
+    # Фильтры персональные: подписчик крутит их под себя, поверх общих значений.
     # Админ правит ОБЩИЙ дефолт (для всех, кто не настроил своё) — у него личных нет.
     overrides = {} if is_admin else database.get_user_settings(user_id)
     eff = config.effective(overrides)
@@ -1024,46 +1151,47 @@ def settings_text(user_id: int, is_admin: bool) -> str:
 
     if is_admin:
         footer = (
-            "Это общие пороги по умолчанию — для всех, кто не настроил своё.\n"
+            "Это общий дефолт — для всех, кто не настроил своё.\n"
             "Меняй кнопками ниже (применится сразу ко всем «по умолчанию»):"
         )
     else:
         footer = (
-            "Это твои личные пороги — крути сигналы (и зоны в /analyze) под себя кнопками.\n"
-            "«Сбросить» вернёт общие значения. Метка «(личное)» = твоё переопределение."
+            "Это твои личные фильтры. «Сбросить» вернёт общие значения, "
+            "метка «(личное)» = твоё переопределение."
         )
     return (
-        "⚙️ Настройки движка сигналов:\n"
-        f"• Аномальный объём: × {eff['VOL_MULT']:g}{mark('VOL_MULT')}\n"
-        f"• Глубина ложного пробоя: {eff['BREAK_PCT'] * 100:.3g}%{mark('BREAK_PCT')}\n"
-        f"• Объём зоны ликвидности (для /analyze): × {eff['LIQUIDITY_MULT']:g}{mark('LIQUIDITY_MULT')}\n"
-        f"• Мин. прибыль/риск (R:R): 1:{eff['MIN_RR']:g}{mark('MIN_RR')}\n\n"
+        "⚙️ Строгость отбора сигналов\n\n"
+        "Два фильтра, каждый включается сам по себе. Оба про одно: не входить вдогонку "
+        "за ушедшим движением. Пружина торгуется ОТ уровня — сняли ликвидность фитилём "
+        "и вернулись; вход в конце размашистой свечи это уже погоня.\n\n"
+        f"📏 Вход у уровня: {_filter_line(eff, 'MAX_ENTRY_DIST_ATR', 'ATR')}"
+        f"{mark('MAX_ENTRY_DIST_ATR')}\n"
+        "   Не берём сигнал, если свеча пробоя закрылась далеко от пробитого уровня.\n"
+        f"🏃 Не входить вдогонку: {_filter_line(eff, 'MAX_RISK_ATR', 'ATR')}"
+        f"{mark('MAX_RISK_ATR')}\n"
+        "   Не берём сигнал, если сам риск сделки (вход → стоп) великоват.\n\n"
+        "ATR — средний размах свечи. Меряем в нём, потому что «0.1% от цены» у биткоина "
+        "и у золота значит разное, а «0.1 ATR» — одно и то же.\n\n"
+        + SETTINGS_TABLE
         + footer
     )
 
 
-def settings_keyboard(is_admin: bool) -> InlineKeyboardMarkup:
+def settings_keyboard(user_id: int, is_admin: bool) -> InlineKeyboardMarkup:
+    """Кнопки значений обоих фильтров. Галочка — текущее значение (своё или общее)."""
+    eff = config.effective({} if is_admin else database.get_user_settings(user_id))
+
+    def btn(key: str, value: float, label: str) -> InlineKeyboardButton:
+        mark = "✅ " if abs(eff.get(key, 0) - value) < 1e-9 else ""
+        return InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"set:{key}:{value:g}")
+
+    ed, ra = "MAX_ENTRY_DIST_ATR", "MAX_RISK_ATR"
     rows = [
-        [
-            InlineKeyboardButton(text="Объём ×1.3", callback_data="set:VOL_MULT:1.3"),
-            InlineKeyboardButton(text="×1.5", callback_data="set:VOL_MULT:1.5"),
-            InlineKeyboardButton(text="×2.0", callback_data="set:VOL_MULT:2.0"),
-        ],
-        [
-            InlineKeyboardButton(text="Пробой 0.03%", callback_data="set:BREAK_PCT:0.0003"),
-            InlineKeyboardButton(text="0.05%", callback_data="set:BREAK_PCT:0.0005"),
-            InlineKeyboardButton(text="0.1%", callback_data="set:BREAK_PCT:0.001"),
-        ],
-        [
-            InlineKeyboardButton(text="R:R 1:2", callback_data="set:MIN_RR:2.0"),
-            InlineKeyboardButton(text="1:2.5", callback_data="set:MIN_RR:2.5"),
-            InlineKeyboardButton(text="1:3", callback_data="set:MIN_RR:3.0"),
-        ],
-        [
-            InlineKeyboardButton(text="Ликвидн. ×1.3", callback_data="set:LIQUIDITY_MULT:1.3"),
-            InlineKeyboardButton(text="×1.5", callback_data="set:LIQUIDITY_MULT:1.5"),
-            InlineKeyboardButton(text="×2.0", callback_data="set:LIQUIDITY_MULT:2.0"),
-        ],
+        [btn(ed, v, ("📏 " if i == 0 else "") + label)
+         for i, (v, label) in enumerate(ENTRY_DIST_CHOICES[:3])],
+        [btn(ed, v, label) for v, label in ENTRY_DIST_CHOICES[3:]],
+        [btn(ra, v, ("🏃 " if i == 0 else "") + label)
+         for i, (v, label) in enumerate(RISK_ATR_CHOICES)],
     ]
     # Подписчику — сброс личных порогов к общим. Админу нечего сбрасывать (он и есть общие).
     if not is_admin:
@@ -1077,7 +1205,7 @@ async def cmd_settings(message: Message):
     is_admin = ADMIN_ID is None or message.from_user.id == ADMIN_ID
     await message.answer(
         settings_text(message.from_user.id, is_admin),
-        reply_markup=settings_keyboard(is_admin),
+        reply_markup=settings_keyboard(message.from_user.id, is_admin),
     )
 
 
@@ -1086,13 +1214,23 @@ async def cb_settings(call: CallbackQuery):
     is_admin = ADMIN_ID is None or call.from_user.id == ADMIN_ID
     parts = call.data.split(":")
 
-    # Сброс личных порогов подписчика к общим.
+    async def refresh() -> None:
+        """Перерисовать меню. Нажатие на уже выбранное значение даёт тот же текст и
+        ту же клавиатуру — Telegram на это отвечает ошибкой «не изменено», и она тут
+        не значит ничего плохого."""
+        try:
+            await call.message.edit_text(
+                settings_text(call.from_user.id, is_admin),
+                reply_markup=settings_keyboard(call.from_user.id, is_admin),
+            )
+        except TelegramBadRequest:
+            pass
+
+    # Сброс личных фильтров подписчика к общим.
     if len(parts) == 2 and parts[1] == "reset":
         database.reset_user_settings(call.from_user.id)
         await call.answer("Сброшено к общим")
-        await call.message.edit_text(
-            settings_text(call.from_user.id, is_admin), reply_markup=settings_keyboard(is_admin)
-        )
+        await refresh()
         return
 
     try:
@@ -1108,10 +1246,8 @@ async def cb_settings(call: CallbackQuery):
         config.set_value(key, value)                       # общий дефолт для всех
     else:
         database.set_user_setting(call.from_user.id, key, value)  # личный порог
-    await call.answer("Готово")
-    await call.message.edit_text(
-        settings_text(call.from_user.id, is_admin), reply_markup=settings_keyboard(is_admin)
-    )
+    await call.answer("Фильтр выключен" if not value else f"Порог {value:g} ATR")
+    await refresh()
 
 
 # ── Telegram Payments ─────────────────────────────────────────────────────────

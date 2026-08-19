@@ -136,7 +136,7 @@ def test_spring_fallback_target_min_rr():
     # Запасная цель считается ОТ ЗАКРЫТИЯ свечи, а не от цены заявки: так набор
     # сигналов не зависит от ENTRY_PULLBACK (см. пояснение в pattern_detector).
     risk = sig["signal_price"] - sig["stop_loss"]
-    expected_tp = sig["signal_price"] + risk * config.get("MIN_RR")
+    expected_tp = sig["signal_price"] + risk * config.MIN_RR
     assert abs(sig["take_profit"] - expected_tp) < 1e-9
 
 
@@ -358,6 +358,134 @@ def test_outcome_counted_from_fill_not_breakout():
     s = _limit_signal()
     s["fill_time"] = "2024-01-01 01:00:00+00:00"
     assert pattern_detector.evaluate_signal(s, df) == "hit_tp"
+
+
+# ── ATR и фильтры строгости отбора (MAX_ENTRY_DIST_ATR / MAX_RISK_ATR) ────────
+
+def test_atr_on_flat_candles():
+    # Все свечи с размахом 2 и без гэпов → ATR ровно 2.
+    rows = [(100, 101, 99, 100, 10) for _ in range(20)]
+    assert abs(pattern_detector._atr(_df(rows), 19, period=14) - 2.0) < 1e-9
+
+
+def test_atr_counts_gaps():
+    # Гэп вверх: собственный размах свечи 1.0, но от прошлого закрытия (100) её
+    # максимум ушёл на 5.5 — истинный диапазон берёт наибольшее из трёх, то есть 5.5.
+    rows = [(100, 100.5, 99.5, 100, 10), (105, 105.5, 104.5, 105, 10)]
+    assert abs(pattern_detector._atr(_df(rows), 1, period=1) - 5.5) < 1e-9
+
+
+def test_entry_dist_filter_blocks_far_close():
+    # Закрытие 100.5 при уровне 100.0 — это 0.58 ATR. Порог 0.05 ATR сигнал снимает.
+    df = _spring_df()
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"},
+              {"price": 110.0, "type": "resistance", "strength": "weak"}]
+    blocked = pattern_detector.detect_spring(
+        df, levels, trend="up", settings={"MAX_ENTRY_DIST_ATR": 0.05})
+    assert blocked is None
+    # Тот же сетап с широким порогом проходит — значит режет именно фильтр.
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up", settings={"MAX_ENTRY_DIST_ATR": 1.0}) is not None
+
+
+def test_entry_dist_filter_tries_next_level():
+    # Первый уровень в списке — дальний (его фильтр отбраковывает), второй — ближний.
+    # Проверяем, что детектор идёт дальше по списку (continue), а не выходит (return).
+    df = _spring_df()
+    levels = [
+        {"price": 99.4, "type": "support", "strength": "weak"},    # дальше: 1.1 от закрытия
+        {"price": 100.0, "type": "support", "strength": "strong"},  # ближе: 0.5
+        {"price": 110.0, "type": "resistance", "strength": "weak"},
+    ]
+    sig = pattern_detector.detect_spring(
+        df, levels, trend="up", settings={"MAX_ENTRY_DIST_ATR": 0.7})
+    assert sig is not None
+    assert abs(sig["level_price"] - 100.0) < 1e-9   # взят ближний, дальний пропущен
+
+
+def test_risk_filter_blocks_wide_candle():
+    # Риск сделки на этой свече 1.85 ATR. Порог 0.5 ATR её снимает, 3.0 — пропускает.
+    df = _spring_df()
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"},
+              {"price": 110.0, "type": "resistance", "strength": "weak"}]
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up", settings={"MAX_RISK_ATR": 0.5}) is None
+    assert pattern_detector.detect_spring(
+        df, levels, trend="up", settings={"MAX_RISK_ATR": 3.0}) is not None
+
+
+def test_filters_off_by_default():
+    # Ноль = выключено: набор сигналов ровно тот же, что и без настроек вовсе.
+    df = _spring_df()
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"},
+              {"price": 110.0, "type": "resistance", "strength": "weak"}]
+    plain = pattern_detector.detect_spring(df, levels, trend="up")
+    zeroed = pattern_detector.detect_spring(
+        df, levels, trend="up", settings={"MAX_ENTRY_DIST_ATR": 0, "MAX_RISK_ATR": 0})
+    assert plain is not None and zeroed is not None
+    assert plain["entry_price"] == zeroed["entry_price"]
+
+
+# ── Разбор для /analyze (explain) ────────────────────────────────────────────
+
+_EX_LEVELS = [
+    {"price": 100.0, "type": "support", "strength": "strong", "timeframe": "D1"},
+    {"price": 110.0, "type": "resistance", "strength": "weak", "timeframe": "H1"},
+]
+
+
+def test_explain_sees_ready_signal():
+    ex = pattern_detector.explain(_spring_df(), _EX_LEVELS, trend="up")
+    assert ex["enough_history"]
+    assert ex["sides"]["long"]["ready"]
+    assert ex["sides"]["long"]["blockers"] == []
+    assert abs(ex["sides"]["long"]["broken_level"]["price"] - 100.0) < 1e-9
+    assert ex["vol_ratio"] > config.VOL_MULT
+
+
+def test_explain_names_missing_volume():
+    df = _spring_df()
+    df.iloc[23, df.columns.get_loc("volume")] = 100.0   # объём как у соседей
+    ex = pattern_detector.explain(df, _EX_LEVELS, trend="up")
+    assert not ex["sides"]["long"]["ready"]
+    assert any("объём" in b for b in ex["sides"]["long"]["blockers"])
+
+
+def test_explain_names_trend_block():
+    ex = pattern_detector.explain(_spring_df(), _EX_LEVELS, trend="down")
+    assert not ex["sides"]["long"]["trend_ok"]
+    assert any("тренд" in b for b in ex["sides"]["long"]["blockers"])
+
+
+def test_explain_names_active_filter():
+    ex = pattern_detector.explain(_spring_df(), _EX_LEVELS, trend="up",
+                                  settings={"MAX_ENTRY_DIST_ATR": 0.05})
+    assert not ex["sides"]["long"]["ready"]
+    assert any("вход у уровня" in b for b in ex["sides"]["long"]["blockers"])
+
+
+def test_explain_agrees_with_detector():
+    # Главное свойство разбора: он не должен расходиться с самим детектором.
+    # Гоняем оба на одних данных при разных фильтрах и сверяем вердикт.
+    df = _spring_df()
+    for settings in ({}, {"MAX_ENTRY_DIST_ATR": 0.05}, {"MAX_RISK_ATR": 0.5},
+                     {"MAX_ENTRY_DIST_ATR": 1.0, "MAX_RISK_ATR": 3.0}):
+        ex = pattern_detector.explain(df, _EX_LEVELS, "up", settings)
+        sig = pattern_detector.detect_spring(df, _EX_LEVELS, "up", settings)
+        assert ex["sides"]["long"]["ready"] == (sig is not None), settings
+
+
+def test_explain_measures_distance_in_atr():
+    ex = pattern_detector.explain(_spring_df(), _EX_LEVELS, trend="up")
+    support = ex["supports"][0]
+    assert abs(support["price"] - 100.0) < 1e-9
+    # Расстояние в ATR — это то же расстояние, делённое на ATR, без магии.
+    assert abs(support["dist_atr"] - support["dist"] / ex["atr"]) < 1e-9
+
+
+def test_explain_short_history_is_flagged():
+    rows = [(100, 101, 99, 100, 10) for _ in range(5)]
+    assert pattern_detector.explain(_df(rows), _EX_LEVELS, "up")["enough_history"] is False
 
 
 if __name__ == "__main__":

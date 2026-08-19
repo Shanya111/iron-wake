@@ -50,6 +50,29 @@ def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
     return float(window.mean()) if len(window) else 0.0
 
 
+def _atr(df: pd.DataFrame, pos: int, period: int | None = None) -> float:
+    """ATR (средний истинный диапазон) на свече `pos` — мера волатильности.
+
+    Истинный диапазон свечи — наибольшее из трёх: её собственный размах, расстояние
+    от её максимума до предыдущего закрытия и от минимума до него же (последние два
+    ловят гэпы). ATR — среднее такого диапазона за `period` свечей.
+
+    Зачем он вообще: пороги вроде «вход не дальше 0.1% от уровня» у биткоина и у
+    золота означают совершенно разное, потому что у них разная волатильность. В долях
+    ATR один и тот же порог значит одно и то же на любом инструменте.
+    """
+    period = config.ATR_PERIOD if period is None else period
+    start = max(0, pos - period + 1)
+    window = df.iloc[start:pos + 1]
+    prev_close = df["close"].shift(1).iloc[start:pos + 1]
+    tr = pd.concat([
+        window["high"] - window["low"],
+        (window["high"] - prev_close).abs(),
+        (window["low"] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return float(tr.mean())
+
+
 def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool):
     """Ближайший уровень нужного типа выше (above=True) или ниже ref_price."""
     prices = [
@@ -86,11 +109,15 @@ def limit_price(side: str, close: float, level: float, stop: float,
 
 def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             settings: dict | None = None) -> dict | None:
-    # Действующие пороги: личные значения подписчика поверх общих (None → общие).
+    # Пороги отбора (объём, глубина пробоя, R:R) — обычные константы: с 20 августа
+    # 2026 пользователь их не крутит. Из settings приходят только два ATR-фильтра
+    # строгости отбора — личные значения подписчика поверх общих (см. config._DEFAULTS).
     s = settings or {}
-    vol_mult = s.get("VOL_MULT", config.get("VOL_MULT"))
-    break_pct = s.get("BREAK_PCT", config.get("BREAK_PCT"))
-    min_rr = s.get("MIN_RR", config.get("MIN_RR"))
+    vol_mult = config.VOL_MULT
+    break_pct = config.BREAK_PCT
+    min_rr = config.MIN_RR
+    max_entry_dist = s.get("MAX_ENTRY_DIST_ATR", config.get("MAX_ENTRY_DIST_ATR"))
+    max_risk_atr = s.get("MAX_RISK_ATR", config.get("MAX_RISK_ATR"))
 
     if len(df) < config.VOL_LOOKBACK + 3:
         return None
@@ -110,6 +137,21 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     if avg_vol <= 0 or vol < avg_vol * vol_mult:
         return None
 
+    # ATR считаем ЗДЕСЬ, а не выше: свеча уже прошла фильтр объёма, и таких свечей
+    # единицы. Считать ATR на каждом баре подряд — лишняя работа.
+    atr = _atr(df, pos) if (max_entry_dist or max_risk_atr) else 0.0
+
+    # Фильтр «не входить вдогонку»: риск сделки (закрытие → экстремум свечи пробоя +
+    # запас стопа) не больше max_risk_atr × ATR. Свеча пробоя может быть аномально
+    # большой — тогда вход по её закрытию оказывается в конце размашистого бара, а
+    # пружина торгуется ОТ уровня, а не вдогонку. Риск от УРОВНЯ не зависит (вход —
+    # закрытие, стоп — экстремум той же свечи), поэтому считаем один раз до перебора.
+    if atr > 0 and max_risk_atr:
+        buffer = (l if side == "long" else h) * config.STOP_SPREAD
+        risk_now = (c - l + buffer) if side == "long" else (h - c + buffer)
+        if risk_now > atr * max_risk_atr:
+            return None
+
     level_type = "support" if side == "long" else "resistance"
     relevant = [lvl for lvl in levels if lvl["type"] == level_type]
 
@@ -122,6 +164,14 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             broke = h > price * (1 + break_pct)    # пробили сопротивление вверх
             returned = c < price                   # закрылись обратно ниже
         if not (broke and returned):
+            continue
+        # Фильтр «вход у уровня»: закрылись слишком далеко от уровня — это вход
+        # вдогонку, а не от уровня. Здесь именно continue, а не return: расстояние
+        # у каждого уровня своё, и следующий в списке может оказаться ближе.
+        # Считаем от ЗАКРЫТИЯ свечи (c), а не от цены лимитной заявки — по той же
+        # причине, что и MIN_RR ниже: набор сигналов не должен зависеть от того,
+        # куда мы поставили заявку.
+        if atr > 0 and max_entry_dist and abs(c - price) > atr * max_entry_dist:
             continue
 
         priority = "high" if lvl.get("strength") == "strong" else "normal"
@@ -170,6 +220,152 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             "bar_time": str(df.index[pos]),
         }
     return None
+
+
+def explain(df: pd.DataFrame, levels: list[dict], trend: str,
+            settings: dict | None = None) -> dict:
+    """Что движок видит на последней закрытой свече и чего ему не хватает до сигнала.
+
+    Это «рентген» детектора для команды /analyze: те же пять условий, в том же
+    порядке, по тем же числам — но вместо «сигнал / не сигнал» возвращается разбор,
+    на каком именно условии всё встало. Сетевых запросов нет, состояние не меняется.
+
+    Держать разбор рядом с _detect обязательно: разъедутся — и /analyze начнёт врать
+    про то, чего движок на самом деле ждёт. Любая правка условий в _detect должна
+    отражаться здесь.
+
+    Возвращает dict; ключ 'sides' содержит по разбору на лонг и на шорт.
+    """
+    s = settings or {}
+    max_entry_dist = s.get("MAX_ENTRY_DIST_ATR", config.get("MAX_ENTRY_DIST_ATR"))
+    max_risk_atr = s.get("MAX_RISK_ATR", config.get("MAX_RISK_ATR"))
+
+    if len(df) < config.VOL_LOOKBACK + 3:
+        return {"enough_history": False}
+
+    pos = len(df) - 2  # последняя ЗАКРЫТАЯ свеча — по ней и работает детектор
+    candle = df.iloc[pos]
+    h, l, c = float(candle["high"]), float(candle["low"]), float(candle["close"])
+    vol = float(candle["volume"])
+    avg_vol = _avg_volume(df, pos)
+    vol_ratio = (vol / avg_vol) if avg_vol > 0 else 0.0
+    atr = _atr(df, pos)
+
+    def near(level_type: str, above: bool) -> list[dict]:
+        """Ближайшие уровни нужного типа с расстоянием от закрытия — в ATR и в %."""
+        items = [lvl for lvl in levels if lvl["type"] == level_type
+                 and (lvl["price"] > c if above else lvl["price"] < c)]
+        items.sort(key=lambda x: abs(x["price"] - c))
+        out = []
+        for lvl in items[:3]:
+            dist = abs(lvl["price"] - c)
+            out.append({
+                "price": lvl["price"],
+                "strength": lvl.get("strength", "weak"),
+                "timeframe": lvl.get("timeframe", ""),
+                "dist": dist,
+                "dist_atr": (dist / atr) if atr > 0 else None,
+                "dist_pct": dist / c if c else None,
+            })
+        return out
+
+    sides: dict[str, dict] = {}
+    for side in ("long", "short"):
+        blockers: list[str] = []
+        trend_ok = not (side == "long" and trend == "down") and \
+                   not (side == "short" and trend == "up")
+        if not trend_ok:
+            blockers.append("тренд дневки против сделки")
+        vol_ok = avg_vol > 0 and vol >= avg_vol * config.VOL_MULT
+        if not vol_ok:
+            blockers.append(f"объём {vol_ratio:.1f}× среднего — порог ×{config.VOL_MULT:g}")
+
+        # Условие «не входить вдогонку» (если включено) — от уровня не зависит.
+        risk_now = None
+        risk_atr_now = None
+        if atr > 0:
+            buffer = (l if side == "long" else h) * config.STOP_SPREAD
+            risk_now = (c - l + buffer) if side == "long" else (h - c + buffer)
+            risk_atr_now = risk_now / atr
+            if max_risk_atr and risk_atr_now > max_risk_atr:
+                blockers.append(
+                    f"риск сделки {risk_atr_now:.2f} ATR — фильтр «вдогонку» пускает "
+                    f"до {max_risk_atr:g}")
+
+        # Перебор уровней ровно как в _detect: ищем ложный пробой.
+        level_type = "support" if side == "long" else "resistance"
+        relevant = [lvl for lvl in levels if lvl["type"] == level_type]
+        far_from_level = closed_wrong = False
+        broken = None
+        rr = None
+        target = None
+        for lvl in relevant:
+            price = lvl["price"]
+            if side == "long":
+                broke, returned = l < price * (1 - config.BREAK_PCT), c > price
+            else:
+                broke, returned = h > price * (1 + config.BREAK_PCT), c < price
+            if not broke:
+                continue
+            if not returned:
+                closed_wrong = True
+                continue
+            if atr > 0 and max_entry_dist and abs(c - price) > atr * max_entry_dist:
+                far_from_level = True
+                continue
+            broken = {"price": price, "strength": lvl.get("strength", "weak"),
+                      "dist_atr": (abs(c - price) / atr) if atr > 0 else None}
+            break
+
+        if broken is None:
+            if far_from_level:
+                blockers.append("прокол есть, но закрылись далеко от уровня "
+                                f"(фильтр «вход у уровня» пускает до {max_entry_dist:g} ATR)")
+            elif closed_wrong:
+                blockers.append("уровень проколот, но цена НЕ вернулась за него — "
+                                "пробой не ложный")
+            else:
+                blockers.append("свеча не заходила за уровень")
+
+        # Какой R:R вышел бы при входе прямо сейчас (вход — закрытие, как в отборе).
+        if risk_now and risk_now > 0:
+            opposite = "resistance" if side == "long" else "support"
+            target = _nearest(levels, opposite, c, above=(side == "long"))
+            if target is not None:
+                rr = (abs(target - c)) / risk_now
+                if rr < config.MIN_RR:
+                    blockers.append(f"до ближайшей цели всего 1:{rr:.1f} — "
+                                    f"порог 1:{config.MIN_RR:g}")
+            else:
+                # Уровня впереди нет — цель ставится на MIN_RR × риск, места хватает
+                # по определению. Это не нехватка, а штатная запасная цель.
+                rr = config.MIN_RR
+
+        sides[side] = {
+            "trend_ok": trend_ok,
+            "vol_ok": vol_ok,
+            "broken_level": broken,
+            "risk": risk_now,
+            "risk_atr": risk_atr_now,
+            "target": target,
+            "rr": rr,
+            "blockers": blockers,
+            "ready": not blockers,
+        }
+
+    return {
+        "enough_history": True,
+        "bar_time": str(df.index[pos]),
+        "close": c, "high": h, "low": l,
+        "volume": vol, "avg_volume": avg_vol, "vol_ratio": vol_ratio,
+        "vol_mult": config.VOL_MULT,
+        "atr": atr, "atr_pct": (atr / c) if c else 0.0,
+        "trend": trend,
+        "resistances": near("resistance", above=True),
+        "supports": near("support", above=False),
+        "filters": {"MAX_ENTRY_DIST_ATR": max_entry_dist, "MAX_RISK_ATR": max_risk_atr},
+        "sides": sides,
+    }
 
 
 def evaluate_fill(signal: dict, df: pd.DataFrame, wait_bars: int | None = None,
