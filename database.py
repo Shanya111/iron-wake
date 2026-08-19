@@ -118,6 +118,25 @@ def init_db() -> None:
             conn.execute("ALTER TABLE signals ADD COLUMN user_id INTEGER")
         except sqlite3.OperationalError:
             pass  # колонка уже есть
+        # ── Лимитный вход (переход на фьючерсы BingX) ──────────────────────────
+        # Раньше вход был по закрытию свечи пробоя, то есть по рынку. Теперь бот
+        # выдаёт цену ЛИМИТНОЙ заявки, и у сигнала появляется состояние ДО входа:
+        #   waiting_fill     — заявка выставлена, цена до неё не дошла;
+        #   filled           — заявка исполнилась, ждём цель/стоп;
+        #   hit_tp / hit_sl / expired — как раньше, но отсчёт от момента ИСПОЛНЕНИЯ;
+        #   expired_unfilled — цена до заявки так и не дошла, сделки НЕ БЫЛО.
+        # fill_time — момент исполнения (якорь трекинга вместо bar_time),
+        # signal_price — закрытие свечи пробоя (для сообщения: «сигнал по X,
+        # заявка на Y»).
+        for column, kind in (("fill_time", "TEXT"), ("signal_price", "REAL")):
+            try:
+                conn.execute(f"ALTER TABLE signals ADD COLUMN {column} {kind}")
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
+        # Старые сигналы были рыночным входом — то есть заведомо исполненными.
+        # Переименовываем их статус, чтобы 'pending' не означал сразу две разные
+        # вещи. Запрос идемпотентный: новых 'pending' мы больше не пишем.
+        conn.execute("UPDATE signals SET status = 'filled' WHERE status = 'pending'")
         # Подписки пользователей на сигналы по инструменту.
         conn.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -387,39 +406,64 @@ def get_levels(instrument: str) -> list[dict]:
 def add_signal(instrument: str, pattern: str, direction: str, entry_price: float,
                stop_loss: float, take_profit: float, priority: str = "normal",
                level_id: int | None = None, bar_time: str | None = None,
-               user_id: int | None = None) -> int:
-    """Сохраняет новый сигнал со статусом 'pending'. Возвращает его id.
-    bar_time — время свечи пробоя (UTC), якорь для трекинга исхода.
+               user_id: int | None = None, signal_price: float | None = None) -> int:
+    """Сохраняет новый сигнал со статусом 'waiting_fill'. Возвращает его id.
+
+    entry_price — цена ЛИМИТНОЙ заявки (её и ставит пользователь), поэтому сигнал
+    рождается «заявка выставлена, ещё не исполнена». Сделка начнётся, только когда
+    цена дойдёт до заявки (scheduler.track_signals переведёт в 'filled').
+    bar_time — время свечи пробоя (UTC), от него отсчитывается срок жизни заявки.
+    signal_price — закрытие свечи пробоя (для сообщения и статистики).
     user_id — владелец (сигнал персональный, по его порогам)."""
     created_at = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.execute("""
             INSERT INTO signals (instrument, pattern, level_id, direction,
                                  entry_price, stop_loss, take_profit, priority,
-                                 status, created_at, bar_time, user_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                                 status, created_at, bar_time, user_id, signal_price)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'waiting_fill', ?, ?, ?, ?)
         """, (instrument, pattern, level_id, direction, entry_price, stop_loss,
-              take_profit, priority, created_at, bar_time, user_id))
+              take_profit, priority, created_at, bar_time, user_id, signal_price))
         conn.commit()
         return cur.lastrowid
 
 
+# Статусы сигнала, у которых ещё может измениться исход: заявка либо ждёт
+# исполнения, либо сделка открыта. Всё остальное — терминальные состояния.
+OPEN_SIGNAL_STATUSES = ("waiting_fill", "filled")
+
+
 def get_open_signals() -> list[dict]:
-    """Открытые (status='pending') сигналы — те, чей исход ещё отслеживаем."""
+    """Сигналы, за которыми ещё следим: заявка ждёт исполнения либо сделка открыта."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             SELECT id, instrument, direction, entry_price, stop_loss, take_profit,
-                   bar_time, user_id
-            FROM signals WHERE status = 'pending'
+                   bar_time, fill_time, signal_price, status, user_id
+            FROM signals WHERE status IN ('waiting_fill', 'filled')
         """).fetchall()
     return [dict(row) for row in rows]
 
 
 def update_signal_status(signal_id: int, status: str) -> None:
-    """Меняет статус сигнала (pending → hit_tp | hit_sl | expired)."""
+    """Меняет статус сигнала (waiting_fill/filled → hit_tp | hit_sl | expired |
+    expired_unfilled)."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("UPDATE signals SET status = ? WHERE id = ?", (status, signal_id))
+        conn.commit()
+
+
+def mark_signal_filled(signal_id: int, fill_time: str) -> None:
+    """Заявка исполнилась: сделка открыта, а fill_time — точка отсчёта её исхода.
+
+    Отсчитывать исход от свечи пробоя после лимитного входа нельзя: между сигналом
+    и входом проходит до ENTRY_WAIT_BARS часов, и на этом отрезке цена уже могла
+    сходить к стопу — но нас там ещё не было."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE signals SET status = 'filled', fill_time = ? WHERE id = ?",
+            (fill_time, signal_id),
+        )
         conn.commit()
 
 
@@ -444,7 +488,7 @@ def get_recent_signals(user_id: int, limit: int = 10) -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute("""
             SELECT instrument, pattern, direction, entry_price, stop_loss, take_profit,
-                   priority, status, created_at
+                   priority, status, created_at, signal_price, fill_time
             FROM signals
             WHERE user_id = ? OR user_id IS NULL
             ORDER BY id DESC LIMIT ?

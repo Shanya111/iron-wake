@@ -1028,8 +1028,13 @@ async def cmd_signals(message: Message):
     if not signals:
         await message.answer("Сигналов пока нет. Подписаться на инструменты — /subscribe.")
         return
+    # Статусы: вход теперь лимитной заявкой, поэтому у сигнала есть состояние ДО
+    # сделки. «Заявка снята» — сделки не было вовсе, и в винрейт она не идёт.
     status_label = {
-        "pending": "⏳ ждём",
+        "waiting_fill": "📥 заявка стоит",
+        "filled": "⏳ в сделке",
+        "expired_unfilled": "⏹ заявка снята",
+        "pending": "⏳ в сделке",   # старые сигналы рыночного входа
         "hit_tp": "✅ цель",
         "hit_sl": "🛑 стоп",
         "expired": "⌛ истёк",
@@ -1044,8 +1049,9 @@ async def cmd_signals(message: Message):
         label = status_label.get(s["status"], s["status"])
         risk = abs(s["entry_price"] - s["stop_loss"])
         rr = abs(s["take_profit"] - s["entry_price"]) / risk if risk else 0
+        word = "заявка" if s["status"] == "waiting_fill" else "вход"
         lines.append(
-            f"{arrow}{star} {info['name']} {pat} — вход {fmt(s['entry_price'], d)}, "
+            f"{arrow}{star} {info['name']} {pat} — {word} {fmt(s['entry_price'], d)}, "
             f"стоп {fmt(s['stop_loss'], d)}, цель {fmt(s['take_profit'], d)} "
             f"(1:{rr:.1f}) [{label}]"
         )
@@ -1056,18 +1062,29 @@ async def cmd_signals(message: Message):
 
 def compute_signal_stats(rows: list[dict]) -> dict:
     """Считает агрегаты по списку сигналов. Денег не храним → меряем в R
-    (риск на сделку = 1R): цель дала +R:R, стоп = −1R. pending/expired в
-    винрейт и профит-фактор не входят (исход не определён). Разбивка по
-    инструментам — только по закрытым (цель/стоп)."""
-    tp = sl = pending = expired = 0
+    (риск на сделку = 1R): цель дала +R:R, стоп = −1R.
+
+    В винрейт и профит-фактор не входят три состояния, и по разным причинам:
+      • ждём (заявка стоит / сделка открыта) и истёк — исход ещё не определён;
+      • НЕ ИСПОЛНЕНА (expired_unfilled) — сделки не было вообще. Это не ноль в
+        статистике, а отсутствие сделки: цена до лимитной заявки не дошла. Считать
+        её нулевым результатом значило бы разбавлять винрейт событиями, которых не
+        было. Показываем отдельным счётчиком — по нему видно, не слишком ли далеко
+        от рынка стоят заявки.
+    Разбивка по инструментам — только по закрытым (цель/стоп)."""
+    tp = sl = pending = expired = unfilled = 0
     gross_profit = 0.0            # сумма плюсов в R (по факт. R:R достигших цели)
     gross_loss = 0.0             # сумма минусов в R (каждый стоп = 1R)
     by_instrument: dict[str, dict] = {}
 
     for s in rows:
         status = s["status"]
-        if status == "pending":
+        # 'pending' — старые сигналы рыночного входа (до перехода на лимитный).
+        if status in ("waiting_fill", "filled", "pending"):
             pending += 1
+            continue
+        if status == "expired_unfilled":
+            unfilled += 1
             continue
         if status == "expired":
             expired += 1
@@ -1093,6 +1110,7 @@ def compute_signal_stats(rows: list[dict]) -> dict:
     return {
         "total": len(rows),
         "tp": tp, "sl": sl, "pending": pending, "expired": expired,
+        "unfilled": unfilled,
         "decided": decided,
         "winrate": (tp / decided) if decided else None,
         "net_r": gross_profit - gross_loss,
@@ -1133,8 +1151,12 @@ def render_stats(user_id: int, period: str) -> tuple[str, InlineKeyboardMarkup]:
         f"Всего: {st['total']}",
         f"✅ Цель: {st['tp']}   🛑 Стоп: {st['sl']}   "
         f"⏳ Ждём: {st['pending']}   ⌛ Истекло: {st['expired']}",
-        "",
     ]
+    if st["unfilled"]:
+        share = st["unfilled"] / st["total"]
+        lines.append(f"⏹ Заявка не исполнилась: {st['unfilled']} ({share:.0%}) — "
+                     "сделки не было, в винрейт не входит")
+    lines.append("")
 
     if st["decided"]:
         lines.append(f"Винрейт: {st['winrate'] * 100:.0f}% "

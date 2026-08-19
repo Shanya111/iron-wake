@@ -4,12 +4,12 @@
   • run_analysis  (раз в час) — пересчитывает тренд/уровни/зоны и пишет в БД (levels);
   • monitor_signals (каждые 5 мин) — ищет Spring/Upthrust по свежим H1-свечам, пишет
     в signals и рассылает подписчикам;
-  • track_signals (каждые 5 мин) — следит за исходом открытых сигналов (дошёл до
-    цели/стопа/истёк) и сообщает подписчикам результат.
+  • track_signals (каждые 5 мин) — ведёт сигнал по двум ступеням: исполнилась ли
+    лимитная заявка, а потом — дошла ли сделка до цели/стопа; сообщает владельцу.
 
 Анализируются инструменты движка (есть источник объёма) из числа подписанных —
 лишние пары не дёргаем. Источник свечей зависит от инструмента (instruments.data_source):
-крипта/форекс — Kraken (CCXT), золото/нефть — Yahoo (см. fetch_candles).
+все инструменты движка — бессрочные фьючерсы BingX (CCXT), см. fetch_candles.
 """
 
 import asyncio
@@ -36,7 +36,8 @@ def _yahoo_days(timeframe: str, limit: int) -> int:
 
 async def fetch_candles(code: str, timeframe: str, limit: int):
     """Свечи инструмента движка из его источника (см. instruments.data_source):
-    'ccxt' — биржа Kraken (крипта/форекс), 'yahoo' — свечи Yahoo (золото/нефть).
+    'ccxt' — биржа BingX, фьючерсы (весь движок), 'yahoo' — свечи Yahoo (сейчас
+    на неё никто не попадает, но ветка нужна журналу сделок по своим тикерам).
     Возвращает DataFrame OHLCV с UTC-индексом — единый формат для аналитики."""
     src = data_source(code)
     if src == "ccxt":
@@ -126,7 +127,7 @@ async def monitor_signals(bot) -> None:
                     code, signal["pattern"], signal["direction"],
                     signal["entry_price"], signal["stop_loss"], signal["take_profit"],
                     priority=signal["priority"], bar_time=signal.get("bar_time"),
-                    user_id=user_id,
+                    user_id=user_id, signal_price=signal.get("signal_price"),
                 )
                 print(f"[monitor_signals] СИГНАЛ {code} {signal['pattern']} {signal['direction']} → {user_id}")
                 key = (signal["pattern"], signal["direction"], round(signal["take_profit"], 10))
@@ -136,9 +137,19 @@ async def monitor_signals(bot) -> None:
 
 
 async def track_signals(bot) -> None:
-    """Каждые N минут: смотрим, дошли ли открытые сигналы до цели/стопа, и
-    сообщаем подписчикам исход. Свечи берём по разу на инструмент (кеш H1 общий
-    с monitor_signals, так что лишних запросов к бирже нет)."""
+    """Каждые N минут: ведём сигнал по двум ступеням — сначала ВХОД, потом ИСХОД.
+
+    Вход теперь лимитной заявкой, поэтому сделки может не случиться вовсе. Порядок:
+      1. status='waiting_fill' — дошла ли цена до заявки (pattern_detector.evaluate_fill).
+         Не дошла за ENTRY_WAIT_BARS часов или ушла к цели без нас → 'expired_unfilled',
+         сделки не было. Дошла → 'filled', запоминаем момент исполнения.
+      2. status='filled' — куда дошла цена ПОСЛЕ входа: цель, стоп или истечение.
+         Отсчёт идёт от fill_time, а не от свечи пробоя: между сигналом и входом
+         проходит до нескольких часов, и приписывать себе то, что случилось до входа,
+         нельзя.
+    Свечи берём по разу на инструмент (кеш H1 общий с monitor_signals, так что
+    лишних запросов к бирже нет).
+    """
     open_signals = database.get_open_signals()
     if not open_signals:
         return
@@ -152,6 +163,21 @@ async def track_signals(bot) -> None:
         df = candles.get(s["instrument"])
         if df is None:
             continue
+        # Ступень 1 — исполнение заявки.
+        if s.get("status") == "waiting_fill":
+            fill = pattern_detector.evaluate_fill(s, df)
+            if fill["status"] == "waiting_fill":
+                continue
+            if fill["status"] == "expired_unfilled":
+                database.update_signal_status(s["id"], "expired_unfilled")
+                print(f"[track_signals] {s['instrument']} #{s['id']} → заявка не исполнена")
+                await _notify_unfilled(bot, s)
+                continue
+            database.mark_signal_filled(s["id"], fill["fill_time"])
+            s["fill_time"] = fill["fill_time"]
+            print(f"[track_signals] {s['instrument']} #{s['id']} → вход состоялся")
+            await _notify_filled(bot, s)
+        # Ступень 2 — исход уже открытой сделки.
         outcome = pattern_detector.evaluate_signal(s, df)
         if outcome == "pending":
             continue
@@ -161,11 +187,49 @@ async def track_signals(bot) -> None:
             await _notify_outcome(bot, s, outcome)
 
 
+async def _send_to_owner(bot, signal: dict, text: str) -> None:
+    """Шлёт текст владельцу сигнала. Старые «общие» сигналы (user_id NULL, до
+    перехода на персональные) уходят всем текущим подписчикам, как раньше."""
+    owner = signal.get("user_id")
+    recipients = [owner] if owner else database.get_subscribers(signal["instrument"])
+    for user_id in recipients:
+        try:
+            await bot.send_message(user_id, text)
+        except Exception as e:
+            print(f"[track_signals] не отправить {user_id}: {e}")
+
+
+async def _notify_unfilled(bot, signal: dict) -> None:
+    """Заявка не исполнилась — сделки не было. Сказать об этом надо: иначе заявка
+    так и провисит в терминале и однажды сработает не вовремя."""
+    info = resolve(signal["instrument"])
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
+    await _send_to_owner(bot, signal, (
+        f"⏹ Заявка снята — {info['name']}\n"
+        f"Цена так и не дошла до {fmt(signal['entry_price'], d)} "
+        f"за {config.ENTRY_WAIT_BARS} ч. Сделки не было.\n"
+        "Если заявка ещё стоит в терминале — сними её."
+    ))
+
+
+async def _notify_filled(bot, signal: dict) -> None:
+    """Заявка исполнилась — сделка открыта, дальше ведём её до цели или стопа."""
+    info = resolve(signal["instrument"])
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
+    arrow = "🟢 ЛОНГ" if signal["direction"] == "long" else "🔴 ШОРТ"
+    await _send_to_owner(bot, signal, (
+        f"▶️ Заявка исполнена — {info['name']} ({arrow})\n"
+        f"Вход {fmt(signal['entry_price'], d)}, "
+        f"стоп {fmt(signal['stop_loss'], d)}, цель {fmt(signal['take_profit'], d)}.\n"
+        "Дальше веду её сам — сообщу, когда дойдёт до цели или стопа."
+    ))
+
+
 async def track_trades(bot) -> None:
     """Каждые N минут: проверяем сделки журнала — дошли ли до цели/стопа.
 
-    Источник свечей по инструменту: движковые (BTC, EUR/USD…) — Kraken H1 (общий кеш
-    с сигналами), остальные (золото, нефть, своя пара) — часовые свечи Yahoo. Журнал
+    Источник свечей по инструменту: движковые (BTC, GOLD…) — BingX H1 (общий кеш
+    с сигналами), остальные (своя пара) — часовые свечи Yahoo. Журнал
     НЕ истекает: 'expired' трактуем как 'ещё открыта' — держим до цели/стопа/ручного
     закрытия. Внутри свечи при двусмысленности pattern_detector считает стоп раньше.
     """
@@ -232,15 +296,8 @@ async def _notify_outcome(bot, signal: dict, outcome: str) -> None:
         f"Вход был {fmt(signal['entry_price'], d)}, цена дошла до {fmt(price, d)}.\n\n"
         "Это итог подсказки, не финсовет."
     )
-    # Сигнал персональный → исход шлём его владельцу. Старые «общие» сигналы (до
-    # перехода, user_id отсутствует/NULL) — всем текущим подписчикам, как раньше.
-    owner = signal.get("user_id")
-    recipients = [owner] if owner else database.get_subscribers(signal["instrument"])
-    for user_id in recipients:
-        try:
-            await bot.send_message(user_id, text)
-        except Exception as e:
-            print(f"[track_signals] не отправить {user_id}: {e}")
+    # Сигнал персональный → исход шлём его владельцу (см. _send_to_owner).
+    await _send_to_owner(bot, signal, text)
 
 
 async def _signal_comment(code: str, signal: dict, trend: str) -> str | None:
@@ -251,7 +308,7 @@ async def _signal_comment(code: str, signal: dict, trend: str) -> str | None:
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
     dom = ""
     sym = ccxt_symbol(code)
-    if sym:  # стакан есть только у биржевых инструментов (Kraken); у золота/нефти — нет
+    if sym:  # стакан есть у всех инструментов движка (BingX), включая золото и нефть
         try:
             ob = analyzer.analyze_order_book(
                 await data_fetcher.get_order_book(sym["symbol"], exchange=sym["exchange"])
@@ -290,13 +347,27 @@ async def _notify(bot, code: str, signal: dict, user_id: int, comment: str | Non
     risk = abs(signal["entry_price"] - signal["stop_loss"])
     reward = abs(signal["take_profit"] - signal["entry_price"])
     rr = reward / risk if risk else 0
+    # Вход — ЛИМИТНОЙ заявкой, поэтому сообщение обязано называть три вещи: по какой
+    # цене ставить заявку, сколько она живёт и что бывает, если не исполнится.
+    # Без этого пользователь по привычке войдёт по рынку и заплатит тейкера — то
+    # есть ровно ту разницу, ради которой всё и делалось.
+    side = "покупку" if signal["direction"] == "long" else "продажу"
+    # Строку «сигнал был по …» показываем, только когда заявка ДЕЙСТВИТЕЛЬНО стоит
+    # не по закрытию (ENTRY_PULLBACK > 0). Иначе она повторяла бы ту же цену дважды.
+    sig_price = signal.get("signal_price")
+    was = ""
+    if sig_price and abs(sig_price - signal["entry_price"]) > 1e-12:
+        was = f"Сигнал был по {fmt(sig_price, d)} — заявка ставится ближе к уровню.\n"
     text = (
         f"{star}{arrow} — {info['name']}\n"
         f"Паттерн: {name}\n"
-        f"Вход: {fmt(signal['entry_price'], d)}\n"
+        f"📥 ЛИМИТНАЯ заявка на {side}: {fmt(signal['entry_price'], d)}\n"
         f"Стоп: {fmt(signal['stop_loss'], d)}\n"
         f"Цель: {fmt(signal['take_profit'], d)}\n"
-        f"Профит/риск: 1:{rr:.1f}\n\n"
+        f"Профит/риск: 1:{rr:.1f}\n"
+        f"{was}"
+        f"⏳ Заявка живёт {config.ENTRY_WAIT_BARS} ч. Не исполнится — сделки нет, "
+        "я об этом напишу.\n\n"
         "Это подсказка, не приказ. Решение и риск — на тебе."
     )
     if comment:

@@ -272,6 +272,76 @@ def test_orderbook_kraken_three_element_entries():
     assert s["pressure"] == "buyers"
 
 
+# ── Лимитный вход (заявка вместо входа по рынку) ─────────────────────────────
+
+def test_limit_price_fractions():
+    # Лонг: закрытие 105, пробитый уровень 100. Половина пути → 102.5, весь → 100.
+    assert pattern_detector.limit_price("long", 105, 100, 95, 0.0) == 105
+    assert pattern_detector.limit_price("long", 105, 100, 95, 0.5) == 102.5
+    assert pattern_detector.limit_price("long", 105, 100, 95, 1.0) == 100
+    # Шорт — зеркально: закрытие 95, уровень 100.
+    assert pattern_detector.limit_price("short", 95, 100, 105, 0.5) == 97.5
+
+
+def test_limit_price_never_behind_stop():
+    # Заявка за стопом оставила бы сделку без риска — падаем обратно на закрытие.
+    assert pattern_detector.limit_price("long", 105, 100, 101, 1.0) == 105
+
+
+def _limit_signal(entry=100.0, stop=98.0, tp=106.0, direction="long"):
+    return {"direction": direction, "entry_price": entry, "stop_loss": stop,
+            "take_profit": tp, "bar_time": "2024-01-01 00:00:00+00:00"}
+
+
+def test_fill_waits_while_price_far():
+    # Цена гуляет выше заявки и время ещё не вышло → ждём.
+    df = _df([(105, 105.5, 104, 105, 10), (105, 105.5, 104, 105, 10)])
+    res = pattern_detector.evaluate_fill(_limit_signal(), df, wait_bars=4)
+    assert res["status"] == "waiting_fill"
+
+
+def test_fill_happens_on_touch():
+    df = _df([(105, 105.5, 104, 105, 10), (104, 105, 99, 103, 10)])
+    res = pattern_detector.evaluate_fill(_limit_signal(), df, wait_bars=4)
+    assert res["status"] == "filled"
+    assert res["fill_time"].startswith("2024-01-01 01:00")
+    assert res["stopped_at_fill"] is False
+
+
+def test_fill_and_stop_on_same_candle():
+    # Стоп лежит ДАЛЬШЕ заявки, поэтому порядок однозначен: вход, потом стоп.
+    df = _df([(105, 105.5, 104, 105, 10), (104, 105, 97, 98, 10)])
+    res = pattern_detector.evaluate_fill(_limit_signal(), df, wait_bars=4)
+    assert res["status"] == "filled" and res["stopped_at_fill"] is True
+
+
+def test_unfilled_when_price_runs_to_target():
+    # Ушла к цели, не откатившись к заявке — сделки не было. Это и есть
+    # адверс-селекция: лимитка теряет как раз сильные движения.
+    df = _df([(105, 105.5, 104, 105, 10), (105, 107, 104, 106, 10)])
+    res = pattern_detector.evaluate_fill(_limit_signal(), df, wait_bars=4)
+    assert res["status"] == "expired_unfilled"
+
+
+def test_unfilled_when_time_runs_out():
+    df = _df([(105, 105.5, 104, 105, 10)] * 5)
+    res = pattern_detector.evaluate_fill(_limit_signal(), df, wait_bars=4)
+    assert res["status"] == "expired_unfilled"
+
+
+def test_outcome_counted_from_fill_not_breakout():
+    # До входа цена сходила к стопу, но нас там ещё не было: отсчёт идёт от
+    # fill_time, поэтому этот провал в исход не попадает, а цель — попадает.
+    df = _df([
+        (105, 106, 97, 105, 10),    # 00:00 — «стоп» до входа, он не наш
+        (105, 105, 99, 100, 10),    # 01:00 — заявка исполнилась
+        (100, 107, 100, 106, 10),   # 02:00 — дошли до цели
+    ])
+    s = _limit_signal()
+    s["fill_time"] = "2024-01-01 01:00:00+00:00"
+    assert pattern_detector.evaluate_signal(s, df) == "hit_tp"
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

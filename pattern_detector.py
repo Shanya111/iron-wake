@@ -6,6 +6,22 @@ Upthrust — зеркало по сопротивлению (пробой вве
 
 Работаем по последней ЗАКРЫТОЙ свече H1 (df.iloc[-2]); df.iloc[-1] обычно ещё
 формируется и для оценки «закрылась обратно» не годится.
+
+── Вход ЛИМИТНОЙ заявкой, а не по рынку ─────────────────────────────────────────
+Раньше сигнал говорил «вход = закрытие свечи пробоя». Это рыночная заявка, то есть
+роль ТЕЙКЕРА: на BingX-фьючерсах она стоит 0.05% против 0.02% у мейкера, плюс
+половина спреда. При среднем риске сделки ~0.5% от цены разница между тейкером и
+мейкером — это десятые доли R на каждой сделке, то есть примерно вся разница между
+плюсом и минусом на счёте.
+
+Поэтому детектор отдаёт ЦЕНУ ЗАЯВКИ: точку между закрытием свечи и пробитым уровнем
+(доля пути задаётся config.ENTRY_PULLBACK; 1.0 = ровно на уровне). Заявка ждёт
+config.ENTRY_WAIT_BARS часов; не исполнилась — сделки не было вовсе.
+
+Цена этого решения — НЕИСПОЛНЕННЫЕ ЗАЯВКИ, и они не случайные: если цена сразу пошла
+к цели и не откатилась, заявка не сработала. То есть теряются в первую очередь
+выигрышные сделки (адверс-селекция). Поэтому ENTRY_PULLBACK — не «просто поставь
+лимитку», а измеренный компромисс; таблица замера — в config.ENTRY_PULLBACK.
 """
 
 import pandas as pd
@@ -44,6 +60,28 @@ def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool)
     if not prices:
         return None
     return min(prices) if above else max(prices)
+
+
+def limit_price(side: str, close: float, level: float, stop: float,
+                frac: float | None = None) -> float:
+    """Цена лимитной заявки: доля пути от закрытия свечи пробоя обратно к уровню.
+
+    frac=0 — заявка ровно по закрытию (прежнее поведение, фактически вход по рынку);
+    frac=0.5 — на полпути к уровню; frac=1.0 — ровно на пробитом уровне.
+    Чем ближе к уровню, тем лучше вход при том же стопе и цели (больше R:R), но тем
+    реже заявка вообще исполняется.
+
+    Заявка никогда не заходит за стоп: там от сделки не осталось бы риска, а значит
+    и смысла. Такое возможно только при испорченных данных, но проверка дешёвая.
+    """
+    frac = config.ENTRY_PULLBACK if frac is None else frac
+    if not frac:
+        return close
+    price = (close - frac * (close - level) if side == "long"
+             else close + frac * (level - close))
+    if (price <= stop) if side == "long" else (price >= stop):
+        return close
+    return price
 
 
 def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
@@ -90,35 +128,43 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
         # Минимальный R:R (прибыль/риск). Цель — ближайший противоположный уровень,
         # но сигнал берём, только если он даёт хотя бы MIN_RR; ближе — сделка
         # невыгодна, пропускаем. Нет уровня впереди → ставим цель ровно на MIN_RR×риск.
+        #
+        # ВАЖНО: отбор (и MIN_RR, и запасная цель) считается ОТ ЗАКРЫТИЯ свечи, а не
+        # от цены лимитной заявки. Так набор сигналов не зависит от ENTRY_PULLBACK —
+        # заявка меняет только цену входа, а какие сетапы вообще берём, решает та же
+        # логика, что и раньше. Иначе замер «что даёт лимитный вход» смешал бы эффект
+        # входа с эффектом отбора, и сравнивать было бы нечего.
         if side == "long":
-            entry = c
             stop = l * (1 - config.STOP_SPREAD)
-            risk = entry - stop
-            target = _nearest(levels, "resistance", entry, above=True)
+            risk = c - stop
+            target = _nearest(levels, "resistance", c, above=True)
             if target is None:
-                tp = entry + risk * min_rr
-            elif (target - entry) >= risk * min_rr:
+                tp = c + risk * min_rr
+            elif (target - c) >= risk * min_rr:
                 tp = target
             else:
                 continue
         else:
-            entry = c
             stop = h * (1 + config.STOP_SPREAD)
-            risk = stop - entry
-            target = _nearest(levels, "support", entry, above=False)
+            risk = stop - c
+            target = _nearest(levels, "support", c, above=False)
             if target is None:
-                tp = entry - risk * min_rr
-            elif (entry - target) >= risk * min_rr:
+                tp = c - risk * min_rr
+            elif (c - target) >= risk * min_rr:
                 tp = target
             else:
                 continue
 
+        entry = limit_price(side, c, price, stop, s.get("ENTRY_PULLBACK"))
         return {
             "pattern": "spring" if side == "long" else "upthrust",
             "direction": "long" if side == "long" else "short",
             "level_price": price,
             "priority": priority,
+            # entry_price — цена ЛИМИТНОЙ ЗАЯВКИ (её и ставит пользователь),
+            # signal_price — закрытие свечи пробоя, от которого считался отбор.
             "entry_price": entry,
+            "signal_price": c,
             "stop_loss": stop,
             "take_profit": tp,
             "bar_time": str(df.index[pos]),
@@ -126,11 +172,61 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     return None
 
 
-def evaluate_signal(signal: dict, df: pd.DataFrame) -> str:
-    """Исход открытого сигнала по свечам, появившимся ПОСЛЕ свечи пробоя.
+def evaluate_fill(signal: dict, df: pd.DataFrame, wait_bars: int | None = None,
+                  optimistic: bool = False) -> dict:
+    """Исполнилась ли лимитная заявка. {'status', 'fill_time', 'stopped_at_fill'}.
 
-    Вход в сделку — это закрытие свечи пробоя (signal['bar_time']), поэтому смотрим
-    только свечи строго после неё. Возвращает:
+    status:
+      • 'waiting_fill'     — время ещё есть, цена до заявки не дошла, ждём;
+      • 'filled'           — заявка исполнилась (в fill_time — момент исполнения);
+      • 'expired_unfilled' — сделки не будет: либо цена ушла к цели без нас, либо
+                             за wait_bars часов до заявки так и не дошла.
+
+    Порядок событий внутри часовой свечи неизвестен, поэтому есть две границы:
+      • optimistic=False (по умолчанию) — если свеча накрыла и нашу цену, и цель,
+        считаем, что цель была раньше, и заявка НЕ исполнилась. Это осторожная
+        сторона: она не даёт приписать себе сделку, которой могло не быть;
+      • optimistic=True — считаем, что заявка успела исполниться.
+
+    stopped_at_fill=True означает, что та же свеча дошла и до стопа. Здесь порядок
+    как раз однозначен: стоп лежит ДАЛЬШЕ нашей цены, значит сначала вход, потом
+    стоп — сделка открылась и тут же закрылась в минус.
+    """
+    wait_bars = config.ENTRY_WAIT_BARS if wait_bars is None else wait_bars
+    bar_time = signal.get("bar_time")
+    if not bar_time:
+        return {"status": "waiting_fill", "fill_time": None, "stopped_at_fill": False}
+
+    limit = signal["entry_price"]
+    stop, tp = signal["stop_loss"], signal["take_profit"]
+    long = signal["direction"] == "long"
+    after = df[df.index > pd.Timestamp(bar_time)]
+
+    for n, (ts, c) in enumerate(after.iloc[:wait_bars].iterrows(), start=1):
+        hi, lo = float(c["high"]), float(c["low"])
+        hit_limit = lo <= limit if long else hi >= limit
+        hit_tp = hi >= tp if long else lo <= tp
+        hit_stop = lo <= stop if long else hi >= stop
+        if hit_tp and not (hit_limit and optimistic):
+            return {"status": "expired_unfilled", "fill_time": None,
+                    "stopped_at_fill": False}
+        if hit_limit:
+            return {"status": "filled", "fill_time": str(ts),
+                    "stopped_at_fill": bool(hit_stop)}
+    if len(after) >= wait_bars:
+        return {"status": "expired_unfilled", "fill_time": None,
+                "stopped_at_fill": False}
+    return {"status": "waiting_fill", "fill_time": None, "stopped_at_fill": False}
+
+
+def evaluate_signal(signal: dict, df: pd.DataFrame) -> str:
+    """Исход ОТКРЫТОЙ сделки по свечам, появившимся ПОСЛЕ входа.
+
+    Точка отсчёта — момент входа: `fill_time` (когда исполнилась лимитная заявка),
+    а если его нет — `bar_time` (свеча пробоя). Второй случай — это старые сигналы
+    рыночного входа и журнал сделок, где вход считается моментом записи.
+
+    Возвращает:
       • 'hit_tp'  — цена дошла до цели (плюс);
       • 'hit_sl'  — цена дошла до стопа (минус);
       • 'expired' — за SIGNAL_EXPIRE_HOURS не дошла никуда (исход неизвестен);
@@ -138,13 +234,13 @@ def evaluate_signal(signal: dict, df: pd.DataFrame) -> str:
 
     Внутри одной свечи порядок касаний неизвестен, поэтому при двусмысленности
     (свеча накрыла и стоп, и цель) считаем консервативно — сначала стоп.
-    Если у сигнала нет якоря bar_time (старый сигнал до 2-й волны) — не трогаем
-    его ('pending'): без точки отсчёта исход не определить честно.
+    Если якоря нет вовсе (совсем старый сигнал) — не трогаем его ('pending'):
+    без точки отсчёта исход не определить честно.
     """
-    bar_time = signal.get("bar_time")
-    if not bar_time:
+    anchor = signal.get("fill_time") or signal.get("bar_time")
+    if not anchor:
         return "pending"
-    after = df[df.index > pd.Timestamp(bar_time)]
+    after = df[df.index > pd.Timestamp(anchor)]
     if after.empty:
         return "pending"
 
@@ -163,7 +259,7 @@ def evaluate_signal(signal: dict, df: pd.DataFrame) -> str:
             if lo <= tp:
                 return "hit_tp"
 
-    age_hours = (after.index[-1] - pd.Timestamp(bar_time)).total_seconds() / 3600
+    age_hours = (after.index[-1] - pd.Timestamp(anchor)).total_seconds() / 3600
     if age_hours >= config.SIGNAL_EXPIRE_HOURS:
         return "expired"
     return "pending"

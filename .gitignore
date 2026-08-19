@@ -54,3 +54,6 @@ logs/
 # Windows
 Thumbs.db
 desktop.ini
+
+# Кеш скачанной истории для бэктеста (гигабайты пиклов, к коду не относится)
+.backtest_cache/
