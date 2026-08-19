@@ -102,7 +102,7 @@ def analyze_order_book(ob: dict, wall_mult: float | None = None) -> dict | None:
     if not bids or not asks:
         return None
 
-    # Запись стакана: [цена, объём] (Binance) или [цена, объём, время] (Kraken) —
+    # Запись стакана: [цена, объём] (BingX) или [цена, объём, время] (Kraken) —
     # берём по индексу, чтобы не падать на лишнем третьем элементе.
     bid_vol = sum(float(e[1]) for e in bids)
     ask_vol = sum(float(e[1]) for e in asks)

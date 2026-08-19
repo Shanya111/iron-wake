@@ -778,7 +778,7 @@ async def cb_close_trade(call: CallbackQuery):
 # ── Торговый движок: анализ, подписки, сигналы, настройки ───────────────────────
 
 def engine_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKeyboardMarkup:
-    """Кнопки инструментов движка — крипта + форекс (по 2 в ряд). prefix — начало
+    """Кнопки инструментов движка — 16 фьючерсов BingX (по 2 в ряд). prefix — начало
     callback_data. Если передан subscribed — отмечает галочкой подписанные (для /subscribe)."""
     codes = engine_codes()
     rows = []
@@ -800,7 +800,7 @@ def _format_orderbook(ob: dict, d: int) -> list[str]:
         "sellers": "перевес продавцов 🔴 — заявок на продажу больше",
         "balance": "силы примерно равны → — ни одна сторона не давит",
     }
-    # Широкий спред = стакан тонкий (например, форекс на Kraken по ночам/выходным):
+    # Широкий спред = стакан тонкий (у тонких пар набора — TON, ADA — это штатно):
     # давление и стены по такому стакану недостоверны — честно об этом предупреждаем.
     thin = ob["spread_pct"] > 0.005
     if ob["spread_pct"] < 0.001:
@@ -931,7 +931,7 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     info = resolve(code)
     waiting = await message.answer(f"Анализирую {info['name']}...")
     try:
-        # Свечи берём из источника инструмента: крипта/форекс — Kraken, золото/нефть — Yahoo.
+        # Свечи берём из источника инструмента — для всего движка это фьючерсы BingX.
         d1 = await engine.fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
         h1 = await engine.fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
     except Exception:
@@ -946,8 +946,8 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     liq_mult = config.effective(database.get_user_settings(user_id))["LIQUIDITY_MULT"]
     zones = analyzer.find_liquidity_zones(d1, liq_mult)
 
-    # Стакан (DOM) есть только у биржевых инструментов (Kraken). У золота/нефти (Yahoo)
-    # стакана нет → пропускаем; анализ это переживает (ob=None обрабатывается ниже).
+    # Стакан (DOM) есть у всех инструментов движка (BingX), включая золото и нефть —
+    # на Yahoo его не было вовсе. Ошибка стакана анализ не валит (ob=None ниже).
     ob = None
     sym = ccxt_symbol(code)
     if sym:
@@ -1492,8 +1492,8 @@ async def _nl_log_trade(message: Message, state: FSMContext, intent: dict) -> No
 async def _nl_subscribe(message: Message, intent: dict, action: str) -> None:
     code = str(intent.get("instrument") or "").strip().upper()
     if code not in engine_codes():
-        await message.answer("Подписка на сигналы — по крипте, форексу, золоту и нефти. "
-                             "Открой /subscribe и выбери инструмент.")
+        await message.answer("Подписка на сигналы — по крипте, золоту и нефти "
+                             "(фьючерсы BingX). Открой /subscribe и выбери инструмент.")
         return
     info = resolve(code)
     if action == "subscribe":
@@ -1507,8 +1507,8 @@ async def _nl_subscribe(message: Message, intent: dict, action: str) -> None:
 async def _nl_analyze(message: Message, intent: dict) -> None:
     code = str(intent.get("instrument") or "").strip().upper()
     if code not in engine_codes():
-        await message.answer("Анализ — по крипте, форексу, золоту и нефти (BTC, ETH, SOL, TON, "
-                             "EUR/USD, GBP/USD, AUD/USD, USD/CAD, Золото, Нефть). "
+        await message.answer("Анализ — по инструментам движка: BTC, ETH, SOL, TON, XRP, ADA, "
+                             "XLM, AVAX, SUI, UNI, LTC, AAVE, DOGE, LINK, Золото, Нефть. "
                              "Выбрать — /analyze.")
         return
     await _do_analyze(message, code, message.from_user.id)
