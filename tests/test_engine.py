@@ -329,6 +329,16 @@ def test_unfilled_when_time_runs_out():
     assert res["status"] == "expired_unfilled"
 
 
+def test_unfilled_when_breakout_older_than_window():
+    # Бот лежал дольше окна свечей: первые свечи окна — уже не те, что шли за
+    # пробоем. Судить по ним нельзя, заявка давно протухла — снимаем.
+    df = _df([(105, 105.5, 99, 105, 10)] * 3)
+    s = _limit_signal()
+    s["bar_time"] = "2023-12-25 00:00:00+00:00"     # сильно раньше окна
+    res = pattern_detector.evaluate_fill(s, df, wait_bars=4)
+    assert res["status"] == "expired_unfilled"
+
+
 def test_outcome_counted_from_fill_not_breakout():
     # До входа цена сходила к стопу, но нас там ещё не было: отсчёт идёт от
     # fill_time, поэтому этот провал в исход не попадает, а цель — попадает.

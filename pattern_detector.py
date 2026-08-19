@@ -200,6 +200,13 @@ def evaluate_fill(signal: dict, df: pd.DataFrame, wait_bars: int | None = None,
     limit = signal["entry_price"]
     stop, tp = signal["stop_loss"], signal["take_profit"]
     long = signal["direction"] == "long"
+    # Свеча пробоя старше всего окна свечей — так бывает, если бот лежал дольше, чем
+    # H1_LIMIT часов. Тогда первые свечи окна это НЕ те, что шли за пробоем, и судить
+    # по ним об исполнении нельзя. Заявка к этому моменту всё равно давно протухла:
+    # снимаем её, а не гадаем.
+    if len(df) and pd.Timestamp(bar_time) < df.index[0]:
+        return {"status": "expired_unfilled", "fill_time": None,
+                "stopped_at_fill": False}
     after = df[df.index > pd.Timestamp(bar_time)]
 
     for n, (ts, c) in enumerate(after.iloc[:wait_bars].iterrows(), start=1):
