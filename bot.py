@@ -712,10 +712,7 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict],
             what = (f"ЕСТЬ — проколот уровень {fmt(br['price'], d)}{star}, "
                     "закрылись обратно ✅")
         else:
-            # Первый блокер, не считая тренда, объёма и R:R, — это причина по пробою.
-            reasons = [b for b in s["blockers"]
-                       if not b.startswith(("тренд", "объём", "до ближайшей"))]
-            what = (reasons[0] if reasons else "нет") + " ❌"
+            what = (s["break_note"] or "нет") + " ❌"
         lines.append(f"  {SIDE_WORD[side]}: {what}")
 
     lines += ["", "5. Профит/риск, если бы входили прямо сейчас:"]

@@ -251,14 +251,28 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
     vol_ratio = (vol / avg_vol) if avg_vol > 0 else 0.0
     atr = _atr(df, pos)
 
-    def near(level_type: str, above: bool) -> list[dict]:
-        """Ближайшие уровни нужного типа с расстоянием от закрытия — в ATR и в %."""
+    def near(level_type: str, above: bool, limit: int = 3) -> list[dict]:
+        """Ближайшие уровни нужного типа с расстоянием от закрытия — в ATR и в %.
+
+        Близкие уровни СЛИВАЕМ (в пределах 0.15% друг от друга): фрактал на H1 часто
+        отмечает одну и ту же вершину тремя соседними барами, и без склейки отчёт
+        печатает «1.3520, 1.3520, 1.3520» — три строки об одном уровне. При склейке
+        сильный побеждает: если хоть один из совпавших помечен strong, таким и
+        остаётся весь уровень.
+        """
         items = [lvl for lvl in levels if lvl["type"] == level_type
                  and (lvl["price"] > c if above else lvl["price"] < c)]
         items.sort(key=lambda x: abs(x["price"] - c))
-        out = []
-        for lvl in items[:3]:
+        out: list[dict] = []
+        for lvl in items:
             dist = abs(lvl["price"] - c)
+            same = next((k for k in out
+                         if abs(k["price"] - lvl["price"]) <= lvl["price"] * 0.0015), None)
+            if same is not None:
+                if lvl.get("strength") == "strong":
+                    same["strength"] = "strong"
+                    same["timeframe"] = lvl.get("timeframe", same["timeframe"])
+                continue
             out.append({
                 "price": lvl["price"],
                 "strength": lvl.get("strength", "weak"),
@@ -267,6 +281,8 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
                 "dist_atr": (dist / atr) if atr > 0 else None,
                 "dist_pct": dist / c if c else None,
             })
+            if len(out) >= limit:
+                break
         return out
 
     sides: dict[str, dict] = {}
@@ -317,15 +333,20 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
                       "dist_atr": (abs(c - price) / atr) if atr > 0 else None}
             break
 
+        # break_note — отдельная строка ИМЕННО про пробой. Держим её полем, а не
+        # выуживаем из списка блокеров: в blockers лежат и тренд, и объём, и фильтры,
+        # и «первый попавшийся» оттуда — не обязательно про пробой.
+        break_note = None
         if broken is None:
             if far_from_level:
-                blockers.append("прокол есть, но закрылись далеко от уровня "
-                                f"(фильтр «вход у уровня» пускает до {max_entry_dist:g} ATR)")
+                break_note = ("прокол есть, но закрылись далеко от уровня "
+                              f"(фильтр «вход у уровня» пускает до {max_entry_dist:g} ATR)")
             elif closed_wrong:
-                blockers.append("уровень проколот, но цена НЕ вернулась за него — "
-                                "пробой не ложный")
+                break_note = ("уровень проколот, но цена НЕ вернулась за него — "
+                              "пробой не ложный")
             else:
-                blockers.append("свеча не заходила за уровень")
+                break_note = "свеча не заходила за уровень"
+            blockers.append(break_note)
 
         # Какой R:R вышел бы при входе прямо сейчас (вход — закрытие, как в отборе).
         if risk_now and risk_now > 0:
@@ -345,6 +366,7 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
             "trend_ok": trend_ok,
             "vol_ok": vol_ok,
             "broken_level": broken,
+            "break_note": break_note,
             "risk": risk_now,
             "risk_atr": risk_atr_now,
             "target": target,

@@ -488,6 +488,33 @@ def test_explain_short_history_is_flagged():
     assert pattern_detector.explain(_df(rows), _EX_LEVELS, "up")["enough_history"] is False
 
 
+def test_explain_merges_close_levels():
+    # Фрактал на H1 отмечает одну вершину тремя соседними барами. В отчёте это должен
+    # быть ОДИН уровень, иначе печатается «1.3520, 1.3520, 1.3520» — так было у TON.
+    levels = [
+        {"price": 110.00, "type": "resistance", "strength": "weak", "timeframe": "H1"},
+        {"price": 110.05, "type": "resistance", "strength": "strong", "timeframe": "D1"},
+        {"price": 110.10, "type": "resistance", "strength": "weak", "timeframe": "H1"},
+        {"price": 120.00, "type": "resistance", "strength": "weak", "timeframe": "H1"},
+    ]
+    ex = pattern_detector.explain(_spring_df(), levels, trend="up")
+    prices = [round(r["price"], 2) for r in ex["resistances"]]
+    assert prices == [110.0, 120.0]
+    # При склейке сильный побеждает: среди слитых был strong.
+    assert ex["resistances"][0]["strength"] == "strong"
+
+
+def test_explain_break_note_is_about_breakout_only():
+    # Фильтр «вдогонку» — это НЕ причина по пробою. Раньше отчёт брал первый блокер
+    # подряд и печатал текст фильтра в пункте «Ложный пробой».
+    ex = pattern_detector.explain(_spring_df(), _EX_LEVELS, trend="up",
+                                  settings={"MAX_RISK_ATR": 0.5})
+    assert "вдогонку" not in (ex["sides"]["long"]["break_note"] or "")
+    # Сам пробой при этом состоялся — фильтр снял сигнал, но не отменил прокол.
+    assert ex["sides"]["long"]["broken_level"] is not None
+    assert ex["sides"]["long"]["break_note"] is None
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0
