@@ -793,6 +793,22 @@ def engine_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKe
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _amount(value: float) -> str:
+    """Объём заявки человеческим видом: 18660 → «18.7 тыс.», 272000 → «272 тыс.».
+
+    Нужно из-за перехода на BingX: у контрактов на нефть и мелкие монеты объёмы
+    в стакане шестизначные, и формат «:.4g» печатал их как 1.866e+04 — в телеграме
+    это выглядит как ошибка, а не как число.
+    """
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f} млн"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f} тыс."
+    if value >= 10:
+        return f"{value:.0f}"
+    return f"{value:.4g}"
+
+
 def _format_orderbook(ob: dict, d: int) -> list[str]:
     """Блок «Стакан заявок» человеческим языком. ob — сводка analyzer.analyze_order_book."""
     pressure_ru = {
@@ -820,12 +836,12 @@ def _format_orderbook(ob: dict, d: int) -> list[str]:
     if ob["bid_wall"]:
         lines.append(
             f"  • 🧱 Крупная заявка на покупку у {fmt(ob['bid_wall']['price'], d)} "
-            f"— может держать цену снизу (объём {ob['bid_wall']['amount']:.4g})"
+            f"— может держать цену снизу (объём {_amount(ob['bid_wall']['amount'])})"
         )
     if ob["ask_wall"]:
         lines.append(
             f"  • 🧱 Крупная заявка на продажу у {fmt(ob['ask_wall']['price'], d)} "
-            f"— может тормозить рост (объём {ob['ask_wall']['amount']:.4g})"
+            f"— может тормозить рост (объём {_amount(ob['ask_wall']['amount'])})"
         )
     return lines
 
