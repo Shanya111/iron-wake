@@ -94,7 +94,11 @@ def test_detect_spring():
     assert sig is not None
     assert sig["direction"] == "long"
     assert sig["priority"] == "high"               # пробитый уровень сильный
-    assert abs(sig["entry_price"] - 100.5) < 1e-9
+    # Закрытие свечи пробоя 100.5, пробитый уровень 100.0 → заявка на полпути
+    # (config.ENTRY_PULLBACK = 0.5). signal_price — то самое закрытие.
+    assert abs(sig["signal_price"] - 100.5) < 1e-9
+    expected = 100.5 - config.ENTRY_PULLBACK * (100.5 - 100.0)
+    assert abs(sig["entry_price"] - expected) < 1e-9
     assert abs(sig["take_profit"] - 110.0) < 1e-9
     assert sig["stop_loss"] < 99.0                 # стоп ниже минимума пробоя
 
@@ -129,8 +133,10 @@ def test_spring_fallback_target_min_rr():
     levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
     sig = pattern_detector.detect_spring(df, levels, trend="up")
     assert sig is not None
-    risk = sig["entry_price"] - sig["stop_loss"]
-    expected_tp = sig["entry_price"] + risk * config.get("MIN_RR")
+    # Запасная цель считается ОТ ЗАКРЫТИЯ свечи, а не от цены заявки: так набор
+    # сигналов не зависит от ENTRY_PULLBACK (см. пояснение в pattern_detector).
+    risk = sig["signal_price"] - sig["stop_loss"]
+    expected_tp = sig["signal_price"] + risk * config.get("MIN_RR")
     assert abs(sig["take_profit"] - expected_tp) < 1e-9
 
 
@@ -151,7 +157,9 @@ def test_detect_upthrust():
     sig = pattern_detector.detect_upthrust(df, levels, trend="down")
     assert sig is not None
     assert sig["direction"] == "short"
-    assert abs(sig["entry_price"] - 99.5) < 1e-9
+    assert abs(sig["signal_price"] - 99.5) < 1e-9
+    expected = 99.5 + config.ENTRY_PULLBACK * (100.0 - 99.5)
+    assert abs(sig["entry_price"] - expected) < 1e-9
     assert abs(sig["take_profit"] - 90.0) < 1e-9
     assert sig["stop_loss"] > 101.0                # стоп выше максимума пробоя
 
