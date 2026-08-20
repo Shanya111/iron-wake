@@ -1101,96 +1101,98 @@ async def cb_stats(call: CallbackQuery):
     await call.answer()
 
 
-# Кнопки фильтров строгости отбора: (значение, подпись). 0 — фильтр выключен.
-# Сетка не выдумана: это те пороги, что реально прогонялись на 833 днях истории
-# (замер 19 августа 2026, таблица — в config._DEFAULTS и в тексте /settings).
-ENTRY_DIST_CHOICES = ((0.0, "выкл"), (0.05, "0.05"), (0.075, "0.075"),
-                      (0.1, "0.1"), (0.15, "0.15"))
-RISK_ATR_CHOICES = ((0.0, "выкл"), (0.5, "0.5"), (0.75, "0.75"), (1.0, "1.0"))
+# Кнопки /settings — это ЦЕЛЫЕ измеренные конфигурации, а не отдельные ползунки.
+# Поля: (MAX_ENTRY_DIST_ATR, MAX_RISK_ATR, подпись, сигналов в месяц, R на сделку,
+#        нетто на свежей половине истории).
+#
+# Почему конфигурациями, а не двумя независимыми ползунками. Во-первых, так на кнопке
+# видно, что именно ты получишь — частоту и качество, а не голое число ATR. Во-вторых,
+# работает ровно ОДНА кнопка: нажал новую — прежняя выключилась. Значит включить
+# сочетание, которого никто не мерил, невозможно в принципе — в списке только строки,
+# реально прогнанные на истории.
+#
+# ЗАМЕР: 19–20 августа 2026, 14 инструментов BingX, 833 дня часовых свечей, одна
+# конвенция издержек на все строки (вход по закрытию мейкером). Одиночные фильтры —
+# перебор dist2/risk2, сочетания — перебор both; три общие строки в них совпали до
+# третьего знака, поэтому колонки сравнимы между собой.
+FILTER_CHOICES = [
+    (0.0,   0.0,  "выкл",                    88, -0.044, -198.6),
+    (0.05,  0.0,  "вход 0.05",               17, +0.121,  +23.7),
+    (0.075, 0.0,  "вход 0.075",              25, +0.139,   +9.2),
+    (0.1,   0.0,  "вход 0.1",                31, +0.094,   -4.7),
+    (0.15,  0.0,  "вход 0.15",               41, +0.055,  -32.3),
+    (0.0,   0.5,  "риск 0.5",                28, +0.084,  +11.5),
+    (0.0,   0.75, "риск 0.75",               53, +0.051,  -60.8),
+    (0.0,   1.0,  "риск 1.0",                69, +0.006, -128.2),
+    (0.05,  0.5,  "вход 0.05 + риск 0.5",     9, +0.145,  +28.1),
+    (0.075, 0.5,  "вход 0.075 + риск 0.5",   13, +0.164,  +21.5),
+    (0.1,   0.5,  "вход 0.1 + риск 0.5",     16, +0.161,  +32.7),
+    (0.075, 0.75, "вход 0.075 + риск 0.75",  19, +0.179,  +24.8),
+]
 
-# Таблица замера — показываем её прямо в меню. Крутить фильтр вслепую бессмысленно:
-# каждый порог уже прогнан, и видно, чем именно платишь за качество.
-SETTINGS_TABLE = (
-    "📊 Что это даёт (замер 19.08.2026: 14 инструментов BingX, 833 дня часовых свечей).\n"
-    "В скобках — итог на свежей половине истории, которую подбор порогов не видел:\n"
-    "• оба выключены — 88 сигналов/мес, −0.044 R на сделку (−198.6 R)\n"
-    "• вход ≤ 0.05 ATR — 17/мес, +0.121 R (+23.7 R)\n"
-    "• вход ≤ 0.075 ATR — 25/мес, +0.139 R (+9.2 R)\n"
-    "• вход ≤ 0.1 ATR — 31/мес, +0.094 R (−4.7 R)\n"
-    "• вход ≤ 0.15 ATR — 41/мес, +0.055 R (−32.3 R)\n"
-    "• риск ≤ 0.5 ATR — 28/мес, +0.084 R (+11.5 R)\n"
-    "• риск ≤ 0.75 ATR — 53/мес, +0.051 R (−60.8 R)\n"
-    "• риск ≤ 1.0 ATR — 69/мес, +0.006 R (−128.2 R)\n\n"
-    "Правило простое: строже порог → лучше средняя сделка и во столько же раз меньше "
-    "сигналов. Включаешь впервые — бери «вход ≤ 0.075»: лучшая средняя сделка во всём замере.\n\n"
-    "⚠️ Честно: ПРИБЫЛЬНЫМ движок это не делает. Плюс на свежей половине есть, но на "
-    "калибровочной половине эти пороги все в минусе, и по всей истории целиком — тоже. "
-    "Фильтры про «реже и качественнее», а не про заработок.\n"
-    "⚠️ Оба сразу — пока не измерено. Порознь мерили, вместе нет, поэтому чисел про "
-    "сочетание тут нет.\n\n"
-)
+
+def _current_filters(user_id: int, is_admin: bool) -> tuple[float, float]:
+    """Действующая пара (вход у уровня, вдогонку) — личная или общая."""
+    eff = config.effective({} if is_admin else database.get_user_settings(user_id))
+    return float(eff.get("MAX_ENTRY_DIST_ATR") or 0), float(eff.get("MAX_RISK_ATR") or 0)
 
 
-def _filter_line(eff: dict, key: str, unit: str) -> str:
-    """«выключен» или «≤ 0.075 ATR» — текущее значение фильтра человеческим видом."""
-    value = eff.get(key) or 0
-    return "выключен" if not value else f"≤ {value:g} {unit}"
+def _filters_line(dist: float, risk: float) -> str:
+    """«выключены» / «вход у уровня ≤ 0.075 ATR» / «… и вдогонку ≤ 0.5 ATR»."""
+    parts = []
+    if dist:
+        parts.append(f"вход у уровня ≤ {dist:g} ATR")
+    if risk:
+        parts.append(f"вдогонку ≤ {risk:g} ATR")
+    return " + ".join(parts) if parts else "выключены — движок берёт всё, что находит"
 
 
 def settings_text(user_id: int, is_admin: bool) -> str:
     # Фильтры персональные: подписчик крутит их под себя, поверх общих значений.
     # Админ правит ОБЩИЙ дефолт (для всех, кто не настроил своё) — у него личных нет.
     overrides = {} if is_admin else database.get_user_settings(user_id)
-    eff = config.effective(overrides)
+    dist, risk = _current_filters(user_id, is_admin)
+    personal = " (личное)" if overrides else ""
 
-    def mark(key: str) -> str:
-        return " (личное)" if key in overrides else ""
-
-    if is_admin:
-        footer = (
-            "Это общий дефолт — для всех, кто не настроил своё.\n"
-            "Меняй кнопками ниже (применится сразу ко всем «по умолчанию»):"
-        )
-    else:
-        footer = (
-            "Это твои личные фильтры. «Сбросить» вернёт общие значения, "
-            "метка «(личное)» = твоё переопределение."
-        )
+    footer = (
+        "Это общий дефолт — для всех, кто не настроил своё. Кнопка применится сразу ко "
+        "всем «по умолчанию»."
+        if is_admin else
+        "Это твоя личная настройка. «Сбросить» вернёт общую."
+    )
     return (
         "⚙️ Строгость отбора сигналов\n\n"
-        "Два фильтра, каждый включается сам по себе. Оба про одно: не входить вдогонку "
-        "за ушедшим движением. Пружина торгуется ОТ уровня — сняли ликвидность фитилём "
-        "и вернулись; вход в конце размашистой свечи это уже погоня.\n\n"
-        f"📏 Вход у уровня: {_filter_line(eff, 'MAX_ENTRY_DIST_ATR', 'ATR')}"
-        f"{mark('MAX_ENTRY_DIST_ATR')}\n"
-        "   Не берём сигнал, если свеча пробоя закрылась далеко от пробитого уровня.\n"
-        f"🏃 Не входить вдогонку: {_filter_line(eff, 'MAX_RISK_ATR', 'ATR')}"
-        f"{mark('MAX_RISK_ATR')}\n"
-        "   Не берём сигнал, если сам риск сделки (вход → стоп) великоват.\n\n"
-        "ATR — средний размах свечи. Меряем в нём, потому что «0.1% от цены» у биткоина "
-        "и у золота значит разное, а «0.1 ATR» — одно и то же.\n\n"
-        + SETTINGS_TABLE
+        f"Сейчас: {_filters_line(dist, risk)}{personal}\n\n"
+        "Оба фильтра про одно — не входить вдогонку за ушедшим движением. Пружина "
+        "торгуется ОТ уровня: сняли ликвидность фитилём и вернулись; вход в конце "
+        "размашистой свечи это уже погоня.\n"
+        "• «вход у уровня» — не берём сигнал, если свеча пробоя закрылась далеко от "
+        "пробитого уровня;\n"
+        "• «вдогонку» — не берём, если сам риск сделки (вход → стоп) великоват.\n"
+        "Меряется в ATR (средний размах свечи): «0.1% от цены» у биткоина и у золота "
+        "значит разное, а «0.1 ATR» — одно и то же.\n\n"
+        "На кнопках — замер за 833 дня по 14 инструментам BingX: сколько сигналов в "
+        "месяц и какая выходит средняя сделка (в R). Работает ровно ОДНА кнопка: "
+        "нажал новую — прежняя выключилась.\n\n"
+        "⚠️ Честно: ПРИБЫЛЬНЫМ движок это не делает. После издержек ни одна строка не "
+        "вышла в плюс на обеих половинах истории. Настройка про «реже и качественнее», "
+        "а не про заработок.\n\n"
         + footer
     )
 
 
 def settings_keyboard(user_id: int, is_admin: bool) -> InlineKeyboardMarkup:
-    """Кнопки значений обоих фильтров. Галочка — текущее значение (своё или общее)."""
-    eff = config.effective({} if is_admin else database.get_user_settings(user_id))
-
-    def btn(key: str, value: float, label: str) -> InlineKeyboardButton:
-        mark = "✅ " if abs(eff.get(key, 0) - value) < 1e-9 else ""
-        return InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"set:{key}:{value:g}")
-
-    ed, ra = "MAX_ENTRY_DIST_ATR", "MAX_RISK_ATR"
-    rows = [
-        [btn(ed, v, ("📏 " if i == 0 else "") + label)
-         for i, (v, label) in enumerate(ENTRY_DIST_CHOICES[:3])],
-        [btn(ed, v, label) for v, label in ENTRY_DIST_CHOICES[3:]],
-        [btn(ra, v, ("🏃 " if i == 0 else "") + label)
-         for i, (v, label) in enumerate(RISK_ATR_CHOICES)],
-    ]
-    # Подписчику — сброс личных порогов к общим. Админу нечего сбрасывать (он и есть общие).
+    """По кнопке на каждую измеренную конфигурацию. Галочка — действующая."""
+    cur_dist, cur_risk = _current_filters(user_id, is_admin)
+    rows = []
+    for dist, risk, label, per_month, r_trade, _fresh in FILTER_CHOICES:
+        active = abs(cur_dist - dist) < 1e-9 and abs(cur_risk - risk) < 1e-9
+        mark = "✅ " if active else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{mark}{label} · {per_month}/мес · {r_trade:+.3f} R",
+            callback_data=f"set:{dist:g}:{risk:g}",
+        )])
+    # Подписчику — сброс личной настройки к общей. Админу нечего сбрасывать.
     if not is_admin:
         rows.append([InlineKeyboardButton(text="↩️ Сбросить к общим", callback_data="set:reset")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1212,9 +1214,8 @@ async def cb_settings(call: CallbackQuery):
     parts = call.data.split(":")
 
     async def refresh() -> None:
-        """Перерисовать меню. Нажатие на уже выбранное значение даёт тот же текст и
-        ту же клавиатуру — Telegram на это отвечает ошибкой «не изменено», и она тут
-        не значит ничего плохого."""
+        """Перерисовать меню. Нажатие на уже выбранную кнопку даёт тот же текст и ту же
+        клавиатуру — Telegram отвечает на это ошибкой «не изменено», и она безобидна."""
         try:
             await call.message.edit_text(
                 settings_text(call.from_user.id, is_admin),
@@ -1223,27 +1224,33 @@ async def cb_settings(call: CallbackQuery):
         except TelegramBadRequest:
             pass
 
-    # Сброс личных фильтров подписчика к общим.
+    # Сброс личной настройки к общей.
     if len(parts) == 2 and parts[1] == "reset":
         database.reset_user_settings(call.from_user.id)
         await call.answer("Сброшено к общим")
         await refresh()
         return
 
+    # Кнопка — это ЦЕЛАЯ конфигурация: пишем оба ключа сразу. Поэтому прежняя настройка
+    # всегда выключается, и включить непроверенное сочетание нельзя.
     try:
-        _, key, value = parts
-        value = float(value)
-        if key not in config.TUNABLE:
-            raise KeyError(key)
-    except (ValueError, KeyError):
+        _, dist, risk = parts
+        dist, risk = float(dist), float(risk)
+        if not any(abs(d - dist) < 1e-9 and abs(r - risk) < 1e-9
+                   for d, r, *_ in FILTER_CHOICES):
+            raise ValueError("не наша кнопка")
+    except ValueError:
         await call.answer("Не понял настройку")
         return
 
-    if is_admin:
-        config.set_value(key, value)                       # общий дефолт для всех
-    else:
-        database.set_user_setting(call.from_user.id, key, value)  # личный порог
-    await call.answer("Фильтр выключен" if not value else f"Порог {value:g} ATR")
+    values = {"MAX_ENTRY_DIST_ATR": dist, "MAX_RISK_ATR": risk}
+    for key, value in values.items():
+        if is_admin:
+            config.set_value(key, value)                       # общий дефолт для всех
+        else:
+            database.set_user_setting(call.from_user.id, key, value)  # личная настройка
+    await call.answer("Фильтры выключены" if not (dist or risk)
+                      else f"Включено: {_filters_line(dist, risk)}")
     await refresh()
 
 
