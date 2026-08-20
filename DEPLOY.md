@@ -206,7 +206,7 @@ docker exec iron-wake-bot python -c \
   "import sqlite3;c=sqlite3.connect('/app/bot.db');print([r[1] for r in c.execute('PRAGMA table_info(alerts)')])"
 ```
 
-В Telegram: `/start` отвечает, `/alert` показывает инструменты, `/myalerts` показывает алерты.
+В Telegram: `/start` отвечает, `/analyze` показывает инструменты, `/settings` — два фильтра.
 
 ## Откат
 

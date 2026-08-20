@@ -64,10 +64,10 @@ def find_liquidity_zones(df: pd.DataFrame, mult: float | None = None) -> list[di
     """Зоны скопления объёма (Smart Money): свечи, где volume > среднего × mult.
 
     Возвращает ценовые уровни (середина свечи) с объёмом — это зоны ликвидности,
-    куда рынок может тянуться. mult по умолчанию из настроек (/settings).
+    куда рынок может тянуться. mult по умолчанию — config.LIQUIDITY_MULT.
     """
     if mult is None:
-        mult = config.get("LIQUIDITY_MULT")
+        mult = config.LIQUIDITY_MULT
     vol = df["volume"]
     if vol.empty or float(vol.mean()) == 0:
         return []
