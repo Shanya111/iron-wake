@@ -745,11 +745,22 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict],
     if not fired:
         lines.append("  Ждём: сигнал родится на той свече, которая закроет все пункты выше.")
 
-    f = ex["filters"]
-    fl = ["вход у уровня " + (f"≤ {f['MAX_ENTRY_DIST_ATR']:g} ATR"
-                              if f["MAX_ENTRY_DIST_ATR"] else "выкл"),
-          "вдогонку " + (f"≤ {f['MAX_RISK_ATR']:g} ATR" if f["MAX_RISK_ATR"] else "выкл")]
-    lines += ["", f"⚙️ Твои фильтры отбора: {', '.join(fl)} (меняются в /settings)"]
+    if ex.get("fx"):
+        # У валютных пар свои пороги детектора, а фильтры строгости к ним не
+        # применяются (см. config.FX_BREAK_ATR). Сказать это обязательно: иначе
+        # пользователь читает про отбор, которого на этой паре не происходит.
+        lines += ["", "⚙️ Валютная пара — пороги свои: глубина пробоя "
+                  f"{config.FX_BREAK_ATR:g} ATR, запас стопа {config.FX_STOP_ATR:g} ATR.",
+                  "     Фильтры из /settings к валютным парам НЕ применяются — они "
+                  "настроены на крипту и забраковали бы такой сигнал всегда.",
+                  "     ⚠️ Замер этой конфигурации отрицательный: сигналов много, но "
+                  "издержки съедают больше, чем сделка приносит."]
+    else:
+        f = ex["filters"]
+        fl = ["вход у уровня " + (f"≤ {f['MAX_ENTRY_DIST_ATR']:g} ATR"
+                                  if f["MAX_ENTRY_DIST_ATR"] else "выкл"),
+              "вдогонку " + (f"≤ {f['MAX_RISK_ATR']:g} ATR" if f["MAX_RISK_ATR"] else "выкл")]
+        lines += ["", f"⚙️ Твои фильтры отбора: {', '.join(fl)} (меняются в /settings)"]
 
     if zones:
         near = sorted(zones, key=lambda z: abs(z["price"] - c))[:6]
@@ -836,7 +847,7 @@ async def _do_analyze(message: Message, code: str, user_id: int):
 
     # Разбор — по ЛИЧНЫМ фильтрам пользователя: он должен видеть свой отбор, а не чужой.
     settings = config.effective(database.get_user_settings(user_id))
-    ex = pattern_detector.explain(h1, levels, trend, settings)
+    ex = pattern_detector.explain(h1, levels, trend, settings, code)
     if not ex.get("enough_history"):
         await waiting.delete()
         await message.answer("Слишком мало часовых свечей для разбора, попробуй позже.")
@@ -844,8 +855,8 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     # Сам детектор гоняем тоже: если сигнал есть, показываем ЕГО числа, а не свои
     # пересчёты. Заодно это страховка от расхождения explain() и _detect.
     signals = {
-        "long": pattern_detector.detect_spring(h1, levels, trend, settings),
-        "short": pattern_detector.detect_upthrust(h1, levels, trend, settings),
+        "long": pattern_detector.detect_spring(h1, levels, trend, settings, code),
+        "short": pattern_detector.detect_upthrust(h1, levels, trend, settings, code),
     }
 
     # Стакан (DOM) есть у всех инструментов движка (BingX), включая золото и нефть —
@@ -1193,7 +1204,10 @@ def settings_text(user_id: int, is_admin: bool) -> str:
         "пробитого уровня;\n"
         "• «вдогонку» — не берём, если сам риск сделки (вход → стоп) великоват.\n"
         "Меряется в ATR (средний размах свечи): «0.1% от цены» у биткоина и у золота "
-        "значит разное, а «0.1 ATR» — одно и то же.\n\n"
+        "значит разное, а «0.1 ATR» — одно и то же.\n"
+        "⚠️ К валютным парам (EUR/USD, GBP/USD, AUD/USD, USD/CAD, USD/JPY) эти фильтры "
+        "НЕ применяются: у форекса свои пороги, а эти настроены на крипту и "
+        "забраковали бы форекс-сигнал всегда.\n\n"
         "На кнопке — что ты получишь по замеру за 833 дня на 14 инструментах BingX: "
         "сколько сигналов в месяц и какая выходит средняя сделка (в R, округлённо). "
         "Работает ровно ОДНА кнопка: нажал новую — прежняя выключилась.\n"

@@ -14,6 +14,7 @@ import pandas as pd  # noqa: E402
 
 import analyzer  # noqa: E402
 import config  # noqa: E402
+import instruments
 import pattern_detector  # noqa: E402
 
 
@@ -513,6 +514,111 @@ def test_explain_break_note_is_about_breakout_only():
     # Сам пробой при этом состоялся — фильтр снял сигнал, но не отменил прокол.
     assert ex["sides"]["long"]["broken_level"] is not None
     assert ex["sides"]["long"]["break_note"] is None
+
+
+# ── Валютные пары: свои пороги детектора (форекс на фьючерсах BingX) ─────────
+#
+# Смысл блока: у форекса глубина пробоя и запас стопа заданы в долях ATR, а не в
+# процентах цены, и ATR-фильтры строгости из /settings к нему не применяются.
+# Данные подобраны так, чтобы ОТЛИЧИТЬ одно от другого: прокол здесь мельче, чем
+# требует BREAK_PCT (0.05% от 1.1 = 0.00055), но крупнее, чем требует FX_BREAK_ATR
+# (0.02 × ATR 0.0010 = 0.00002). Значит для валютной пары сигнал есть, а для
+# крипты на тех же свечах — нет.
+
+_FX_LEVELS = [
+    {"price": 1.10000, "type": "support", "strength": "strong", "timeframe": "D1"},
+    {"price": 1.11000, "type": "resistance", "strength": "weak", "timeframe": "H1"},
+]
+
+
+def _fx_df() -> pd.DataFrame:
+    """Свечи «как у EUR/USD»: цена ~1.1, размах свечи 0.0010 → ATR(14) = 0.0010."""
+    rows = [(1.10050, 1.10100, 1.10000, 1.10050, 100.0) for _ in range(25)]
+    # Свеча пробоя (индекс 23 = последняя ЗАКРЫТАЯ): прокол уровня 1.10000 на
+    # 0.00020 вниз и закрытие обратно выше, объём втрое выше среднего.
+    rows[23] = (1.10040, 1.10070, 1.09980, 1.10050, 300.0)
+    rows[24] = (1.10050, 1.10080, 1.10030, 1.10060, 50.0)   # текущая, не закрыта
+    return _df(rows)
+
+
+def test_fx_registry_has_engine_source():
+    # Все пять валютных пар входят в движок и помечены флагом fx.
+    for code in ("EURUSD", "GBPUSD", "AUDUSD", "USDCAD", "USDJPY"):
+        assert instruments.is_fx(code), code
+        assert instruments.data_source(code) == "ccxt", code
+        assert code in instruments.engine_codes(), code
+    # Крипта и товары флагом не помечены — их пороги не меняются.
+    for code in ("BTC", "ETH", "GOLD", "BRENT"):
+        assert not instruments.is_fx(code), code
+    assert not instruments.is_fx(None)
+    assert not instruments.is_fx("EURJPY=X")      # своя пара — не форекс реестра
+
+
+def test_fx_break_depth_in_atr_gives_signal():
+    # Тот же самый набор свечей: валютная пара сигналит, крипта молчит.
+    df = _fx_df()
+    fx_sig = pattern_detector.detect_spring(df, _FX_LEVELS, "up", None, "EURUSD")
+    assert fx_sig is not None, "форекс должен ловить мелкий прокол (порог в ATR)"
+    crypto_sig = pattern_detector.detect_spring(df, _FX_LEVELS, "up", None, "BTC")
+    assert crypto_sig is None, "у крипты порог в % цены — этот прокол мелкий"
+    # Без кода инструмента ведём себя как раньше (крипта) — обратная совместимость.
+    assert pattern_detector.detect_spring(df, _FX_LEVELS, "up") is None
+
+
+def test_fx_stop_buffer_in_atr():
+    df = _fx_df()
+    sig = pattern_detector.detect_spring(df, _FX_LEVELS, "up", None, "EURUSD")
+    # ATR берём у самого детектора, а не круглым числом: тест обязан проверять
+    # ФОРМУЛУ запаса стопа, а не совпадение с приближённой константой.
+    atr = pattern_detector._atr(df, len(df) - 2)
+    assert 0.0009 < atr < 0.0011                   # по построению _fx_df ≈ размах свечи
+    expected = 1.09980 - atr * config.FX_STOP_ATR  # минимум пробоя минус доля ATR
+    assert abs(sig["stop_loss"] - expected) < 1e-9
+    # Процентный запас дал бы стоп ВЫШЕ (0.1% от 1.0998 = 0.0011 против 0.00025),
+    # то есть риск сделки был бы вчетверо больше — ровно тот блокиратор, из-за
+    # которого форекс молчал.
+    assert sig["stop_loss"] > 1.09980 * (1 - config.STOP_SPREAD)
+
+
+def test_fx_ignores_strictness_filters():
+    # Оба ATR-фильтра выкручены до заведомо непроходимых значений.
+    strict = {"MAX_ENTRY_DIST_ATR": 0.01, "MAX_RISK_ATR": 0.05}
+    df = _fx_df()
+    assert pattern_detector.detect_spring(df, _FX_LEVELS, "up", strict, "EURUSD") is not None
+    # А на крипте те же фильтры продолжают работать как работали.
+    crypto_df = _spring_df()
+    crypto_levels = [{"price": 100.0, "type": "support", "strength": "strong"},
+                     {"price": 110.0, "type": "resistance", "strength": "weak"}]
+    assert pattern_detector.detect_spring(crypto_df, crypto_levels, "up") is not None
+    assert pattern_detector.detect_spring(crypto_df, crypto_levels, "up", strict, "BTC") is None
+
+
+def test_fx_explain_agrees_with_detector():
+    # То же требование, что и для крипты: разбор не должен расходиться с детектором.
+    df = _fx_df()
+    for settings in ({}, {"MAX_ENTRY_DIST_ATR": 0.01}, {"MAX_RISK_ATR": 0.05},
+                     {"MAX_ENTRY_DIST_ATR": 1.0, "MAX_RISK_ATR": 3.0}):
+        ex = pattern_detector.explain(df, _FX_LEVELS, "up", settings, "EURUSD")
+        sig = pattern_detector.detect_spring(df, _FX_LEVELS, "up", settings, "EURUSD")
+        assert ex["sides"]["long"]["ready"] == (sig is not None), settings
+        assert ex["fx"] is True
+        # Фильтры в отчёте показаны обнулёнными — /analyze не должен обещать
+        # пользователю отбор, которого для этой пары не происходит.
+        assert ex["filters"]["MAX_RISK_ATR"] == 0
+        assert ex["filters"]["MAX_ENTRY_DIST_ATR"] == 0
+
+
+def test_fx_explain_marks_crypto_as_not_fx():
+    ex = pattern_detector.explain(_spring_df(), _EX_LEVELS, "up", None, "BTC")
+    assert ex["fx"] is False
+
+
+def test_fx_without_atr_stays_silent():
+    # Плоские свечи → ATR = 0. Пороги форекса посчитать не на чем; детектор обязан
+    # промолчать, а НЕ откатиться на проценты цены (это была бы тихая подмена).
+    rows = [(1.10000, 1.10000, 1.10000, 1.10000, 100.0) for _ in range(25)]
+    rows[23] = (1.10000, 1.10000, 1.10000, 1.10000, 300.0)
+    assert pattern_detector.detect_spring(_df(rows), _FX_LEVELS, "up", None, "EURUSD") is None
 
 
 if __name__ == "__main__":

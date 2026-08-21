@@ -115,7 +115,8 @@ async def monitor_signals(bot) -> None:
         for user_id in subscribers:
             settings = config.effective(database.get_user_settings(user_id))
             for detector in (pattern_detector.detect_spring, pattern_detector.detect_upthrust):
-                signal = detector(h1, levels, trend, settings)
+                # code обязателен: у валютных пар свои пороги детектора.
+                signal = detector(h1, levels, trend, settings, code)
                 if signal is None:
                     continue
                 # Дедуп персональный: тот же паттерн тому же пользователю не чаще,

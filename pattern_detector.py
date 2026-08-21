@@ -27,20 +27,23 @@ config.ENTRY_WAIT_BARS часов; не исполнилась — сделки 
 import pandas as pd
 
 import config
+from instruments import is_fx
 
 
 def detect_spring(df: pd.DataFrame, levels: list[dict], trend: str,
-                  settings: dict | None = None) -> dict | None:
+                  settings: dict | None = None, code: str | None = None) -> dict | None:
     """Бычий Spring. Фильтр тренда: при нисходящем тренде ('down') не сигналим.
-    settings — персональные пороги подписчика (None → общие из config)."""
-    return _detect(df, levels, trend, side="long", settings=settings)
+    settings — персональные пороги подписчика (None → общие из config).
+    code — код инструмента: у валютных пар свои пороги (см. _detect)."""
+    return _detect(df, levels, trend, side="long", settings=settings, code=code)
 
 
 def detect_upthrust(df: pd.DataFrame, levels: list[dict], trend: str,
-                    settings: dict | None = None) -> dict | None:
+                    settings: dict | None = None, code: str | None = None) -> dict | None:
     """Медвежий Upthrust — зеркало Spring. При восходящем тренде ('up') не сигналим.
-    settings — персональные пороги подписчика (None → общие из config)."""
-    return _detect(df, levels, trend, side="short", settings=settings)
+    settings — персональные пороги подписчика (None → общие из config).
+    code — код инструмента: у валютных пар свои пороги (см. _detect)."""
+    return _detect(df, levels, trend, side="short", settings=settings, code=code)
 
 
 def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
@@ -71,6 +74,35 @@ def _atr(df: pd.DataFrame, pos: int, period: int | None = None) -> float:
         (window["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
     return float(tr.mean())
+
+
+def _stop_buffer(extreme: float, atr: float, fx: bool) -> float:
+    """Запас стопа за экстремум свечи пробоя, в абсолютных единицах цены.
+
+    У крипты это процент от цены (config.STOP_SPREAD), у валютных пар — доля ATR
+    (config.FX_STOP_ATR): 0.1% цены на форексе даёт 0.93-1.49 ATR, то есть стоп
+    выходил бы шире собственной волатильности инструмента, а риск сделки всегда
+    превышал бы фильтры строгости.
+
+    Функция общая для _detect и explain намеренно: разъедутся — и /analyze начнёт
+    показывать не тот риск, по которому движок принимает решение."""
+    if fx:
+        return atr * config.FX_STOP_ATR
+    return extreme * config.STOP_SPREAD
+
+
+def _break_depth(price: float, atr: float, fx: bool) -> float:
+    """Требуемая глубина прокола уровня, в абсолютных единицах цены.
+
+    У крипты — процент от уровня (config.BREAK_PCT), у валютных пар — доля ATR
+    (config.FX_BREAK_ATR). В процентах цены форексной свече пришлось бы проколоть
+    уровень на 0.42-0.68 СОБСТВЕННОГО размаха и в тот же час закрыться обратно;
+    отсюда 12 сигналов за год на четырёх парах против 207 с порогом в ATR.
+
+    Общая для _detect и explain по той же причине, что и _stop_buffer."""
+    if fx:
+        return atr * config.FX_BREAK_ATR
+    return price * config.BREAK_PCT
 
 
 def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool):
@@ -108,7 +140,7 @@ def limit_price(side: str, close: float, level: float, stop: float,
 
 
 def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
-            settings: dict | None = None) -> dict | None:
+            settings: dict | None = None, code: str | None = None) -> dict | None:
     # Пороги отбора (объём, глубина пробоя, R:R) — обычные константы: с 20 августа
     # 2026 пользователь их не крутит. Из settings приходят только два ATR-фильтра
     # строгости отбора — личные значения подписчика поверх общих (см. config._DEFAULTS).
@@ -118,6 +150,15 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     min_rr = config.MIN_RR
     max_entry_dist = s.get("MAX_ENTRY_DIST_ATR", config.get("MAX_ENTRY_DIST_ATR"))
     max_risk_atr = s.get("MAX_RISK_ATR", config.get("MAX_RISK_ATR"))
+    # ВАЛЮТНЫЕ ПАРЫ идут по своим порогам: глубина пробоя и запас стопа — в долях
+    # ATR, а не в процентах цены (в процентах они на форексе не срабатывают вовсе,
+    # см. config.FX_BREAK_ATR). ATR-фильтры строгости к ним НЕ применяются: они
+    # настроены на крипту и забраковали бы форекс-сигнал механически, ещё до всякой
+    # оценки качества — у форекса риск сделки почти всегда больше 0.75 ATR.
+    # На крипту это ничего не меняет: там фильтры работают как работали.
+    fx = is_fx(code)
+    if fx and config.FX_IGNORE_ATR_FILTERS:
+        max_entry_dist = max_risk_atr = 0
 
     if len(df) < config.VOL_LOOKBACK + 3:
         return None
@@ -139,7 +180,13 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
 
     # ATR считаем ЗДЕСЬ, а не выше: свеча уже прошла фильтр объёма, и таких свечей
     # единицы. Считать ATR на каждом баре подряд — лишняя работа.
-    atr = _atr(df, pos) if (max_entry_dist or max_risk_atr) else 0.0
+    # Форексу ATR нужен ВСЕГДА: в нём заданы и глубина пробоя, и запас стопа.
+    atr = _atr(df, pos) if (fx or max_entry_dist or max_risk_atr) else 0.0
+    # Без ATR у валютной пары считать нечем. Сигнал не выдаём и НЕ падаем обратно на
+    # проценты цены: они на форексе не работают, и это была бы тихая подмена порогов
+    # на те, что заведомо молчат.
+    if fx and atr <= 0:
+        return None
 
     # Фильтр «не входить вдогонку»: риск сделки (закрытие → экстремум свечи пробоя +
     # запас стопа) не больше max_risk_atr × ATR. Свеча пробоя может быть аномально
@@ -147,7 +194,7 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     # пружина торгуется ОТ уровня, а не вдогонку. Риск от УРОВНЯ не зависит (вход —
     # закрытие, стоп — экстремум той же свечи), поэтому считаем один раз до перебора.
     if atr > 0 and max_risk_atr:
-        buffer = (l if side == "long" else h) * config.STOP_SPREAD
+        buffer = _stop_buffer(l if side == "long" else h, atr, fx)
         risk_now = (c - l + buffer) if side == "long" else (h - c + buffer)
         if risk_now > atr * max_risk_atr:
             return None
@@ -157,11 +204,12 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
 
     for lvl in relevant:
         price = lvl["price"]
+        depth = _break_depth(price, atr, fx)
         if side == "long":
-            broke = l < price * (1 - break_pct)   # пробили поддержку вниз
+            broke = l < price - depth              # пробили поддержку вниз
             returned = c > price                   # закрылись обратно выше
         else:
-            broke = h > price * (1 + break_pct)    # пробили сопротивление вверх
+            broke = h > price + depth              # пробили сопротивление вверх
             returned = c < price                   # закрылись обратно ниже
         if not (broke and returned):
             continue
@@ -185,7 +233,7 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
         # логика, что и раньше. Иначе замер «что даёт лимитный вход» смешал бы эффект
         # входа с эффектом отбора, и сравнивать было бы нечего.
         if side == "long":
-            stop = l * (1 - config.STOP_SPREAD)
+            stop = l - _stop_buffer(l, atr, fx)
             risk = c - stop
             target = _nearest(levels, "resistance", c, above=True)
             if target is None:
@@ -195,7 +243,7 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             else:
                 continue
         else:
-            stop = h * (1 + config.STOP_SPREAD)
+            stop = h + _stop_buffer(h, atr, fx)
             risk = stop - c
             target = _nearest(levels, "support", c, above=False)
             if target is None:
@@ -223,7 +271,7 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
 
 
 def explain(df: pd.DataFrame, levels: list[dict], trend: str,
-            settings: dict | None = None) -> dict:
+            settings: dict | None = None, code: str | None = None) -> dict:
     """Что движок видит на последней закрытой свече и чего ему не хватает до сигнала.
 
     Это «рентген» детектора для команды /analyze: те же пять условий, в том же
@@ -239,6 +287,11 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
     s = settings or {}
     max_entry_dist = s.get("MAX_ENTRY_DIST_ATR", config.get("MAX_ENTRY_DIST_ATR"))
     max_risk_atr = s.get("MAX_RISK_ATR", config.get("MAX_RISK_ATR"))
+    # Те же правила для валютных пар, что и в _detect (см. там). Держать в согласии
+    # обязательно: иначе /analyze покажет пороги и блокеры, которых у движка нет.
+    fx = is_fx(code)
+    if fx and config.FX_IGNORE_ATR_FILTERS:
+        max_entry_dist = max_risk_atr = 0
 
     if len(df) < config.VOL_LOOKBACK + 3:
         return {"enough_history": False}
@@ -300,7 +353,7 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
         risk_now = None
         risk_atr_now = None
         if atr > 0:
-            buffer = (l if side == "long" else h) * config.STOP_SPREAD
+            buffer = _stop_buffer(l if side == "long" else h, atr, fx)
             risk_now = (c - l + buffer) if side == "long" else (h - c + buffer)
             risk_atr_now = risk_now / atr
             if max_risk_atr and risk_atr_now > max_risk_atr:
@@ -317,10 +370,11 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
         target = None
         for lvl in relevant:
             price = lvl["price"]
+            depth = _break_depth(price, atr, fx)
             if side == "long":
-                broke, returned = l < price * (1 - config.BREAK_PCT), c > price
+                broke, returned = l < price - depth, c > price
             else:
-                broke, returned = h > price * (1 + config.BREAK_PCT), c < price
+                broke, returned = h > price + depth, c < price
             if not broke:
                 continue
             if not returned:
@@ -386,6 +440,9 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
         "resistances": near("resistance", above=True),
         "supports": near("support", above=False),
         "filters": {"MAX_ENTRY_DIST_ATR": max_entry_dist, "MAX_RISK_ATR": max_risk_atr},
+        # fx=True — разбор считался по валютным порогам (доли ATR), а ATR-фильтры
+        # строгости к инструменту не применялись. Отчёт /analyze это показывает.
+        "fx": fx,
         "sides": sides,
     }
 
