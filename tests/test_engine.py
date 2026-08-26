@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pandas as pd  # noqa: E402
 
+import alerts  # noqa: E402
 import analyzer  # noqa: E402
 import config  # noqa: E402
 import instruments
@@ -619,6 +620,53 @@ def test_fx_without_atr_stays_silent():
     rows = [(1.10000, 1.10000, 1.10000, 1.10000, 100.0) for _ in range(25)]
     rows[23] = (1.10000, 1.10000, 1.10000, 1.10000, 300.0)
     assert pattern_detector.detect_spring(_df(rows), _FX_LEVELS, "up", None, "EURUSD") is None
+
+
+# ── Алерты «касание уровня» ─────────────────────────────────────────────────
+#
+# Смысл проверок: касание ловится ДИАПАЗОНОМ свечей, а не последней ценой. Между
+# двумя проверками проходит 5 минут, и цена успевает сходить к уровню и вернуться —
+# по одной точке такое не увидеть, поэтому именно это и проверяем отдельно.
+
+
+def test_alert_fires_on_wick_touch_without_close():
+    # Цена сходила к 100 фитилём и вернулась: last по-прежнему ниже уровня, сторона
+    # не менялась. Точечная проверка это пропустила бы, диапазон — нет.
+    assert alerts.hit(low=98.0, high=100.5, last=99.0, threshold=100.0, start_above=0)
+
+
+def test_alert_silent_when_level_out_of_range():
+    assert not alerts.hit(low=98.0, high=99.5, last=99.0, threshold=100.0, start_above=0)
+
+
+def test_alert_fires_on_gap_over_level():
+    # Уровня диапазон НЕ накрыл (разрыв через выходные у валютной пары), но цена
+    # оказалась по другую сторону — это тоже срабатывание.
+    assert alerts.hit(low=101.0, high=102.0, last=101.5, threshold=100.0, start_above=0)
+
+
+def test_alert_from_above_fires_on_touch():
+    # Зеркально: алерт ставили, когда цена была ВЫШЕ уровня.
+    assert alerts.hit(low=99.5, high=103.0, last=101.0, threshold=100.0, start_above=1)
+
+
+def test_alert_side_of_counts_level_itself_as_above():
+    assert alerts.side_of(100.0, 100.0) == 1
+    assert alerts.side_of(99.99, 100.0) == 0
+
+
+def test_alert_window_takes_extremes_of_whole_period():
+    # Окно должно смотреть на ВЕСЬ кусок свечей, а не на последнюю: иначе поход к
+    # уровню в середине периода между проверками потеряется.
+    df = _df([
+        (100.0, 101.0, 99.0, 100.0, 10.0),
+        (100.0, 105.0, 97.0, 100.0, 10.0),
+        (100.0, 101.0, 99.5, 100.7, 10.0),
+    ])
+    window = alerts.window_from_candles(df)
+    assert window["high"] == 105.0
+    assert window["low"] == 97.0
+    assert window["last"] == 100.7
 
 
 if __name__ == "__main__":

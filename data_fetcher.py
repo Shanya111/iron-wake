@@ -55,6 +55,39 @@ def _get_exchange(name: str):
     return ex
 
 
+async def find_symbol(query: str, exchange: str = "bingx") -> str | None:
+    """Ищет бессрочный контракт по тому, что человек написал: «wif» → «WIF/USDT:USDT».
+
+    Нужно для «своей пары». В реестре бота 21 инструмент, а на бирже их 874, и человек
+    вправе назвать любой — раньше эту роль играл произвольный тикер Yahoo, теперь её
+    играет биржа. Возвращает символ ccxt или None, если такого контракта нет.
+
+    Порядок попыток фиксированный, чтобы результат был предсказуем и объясним:
+      1. написали символ целиком («WIF/USDT:USDT») — просто проверяем, что он живой;
+      2. монета к USDT — так торгуется основная масса контрактов (825 из 874);
+      3. монета к USDC — их полсотни, и часть монет есть только там;
+      4. мем-коины с множителем («PEPE» → «1000PEPE/USDT:USDT»): на бирже они идут
+         пачками по 1000/10000/1000000 монет, и человек об этом знать не обязан.
+
+    Берём только active swap: спот нам не нужен (там другие цена и объём), а мёртвые
+    записи в списке рынков у BingX встречаются — см. историю с TON/TONCOIN/GRAM.
+    """
+    q = (query or "").strip().upper()
+    if not q:
+        return None
+    ex = _get_exchange(exchange)
+    markets = await ex.load_markets()   # ccxt держит их в памяти после первой загрузки
+    live = {sym for sym, m in markets.items() if m.get("swap") and m.get("active")}
+    if q in live:
+        return q
+    variants = [f"{q}/USDT:USDT", f"{q}/USDC:USDC"]
+    variants += [f"{mult}{q}/USDT:USDT" for mult in ("1000", "10000", "1000000")]
+    for variant in variants:
+        if variant in live:
+            return variant
+    return None
+
+
 async def get_candles(
     symbol: str, timeframe: str, limit: int, exchange: str = "bingx"
 ) -> pd.DataFrame:

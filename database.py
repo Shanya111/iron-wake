@@ -2,20 +2,43 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-import pandas as pd
-import yfinance as yf
-
-from instruments import infer_decimals
-
 DB_PATH = Path(__file__).parent / "bot.db"
 
 
 def init_db() -> None:
-    # Таблицы alerts здесь больше нет. Простые алерты «касание уровня» убраны из бота
-    # 20 августа 2026 — остался только торговый движок. В БОЕВОЙ базе таблица цела
-    # (её намеренно не удаляли: DROP необратим, а места она не занимает) — просто
-    # никто в неё больше не пишет и не читает. На свежей базе она не создаётся вовсе.
     with sqlite3.connect(DB_PATH) as conn:
+        # Алерты «касание уровня». Убирались из бота 20 августа 2026 и вернулись
+        # 26 августа — уже с проверкой по бирже, а не по Yahoo (см. alerts.py).
+        # Таблицу тогда намеренно НЕ дропали, поэтому в боевой базе она со старыми
+        # записями; IF NOT EXISTS их не трогает. pair — код инструмента из реестра
+        # ИЛИ символ контракта BingX («WIF/USDT:USDT») для своей пары, как в trades.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id      INTEGER NOT NULL,
+                threshold    REAL    NOT NULL,
+                pair         TEXT    NOT NULL DEFAULT 'USDJPY',
+                start_above  INTEGER,
+                created_at   TEXT    NOT NULL,
+                is_triggered INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        # Чистка алертов ДОАВГУСТОВСКОЙ эпохи (решение владельца 26 августа 2026).
+        # Шесть дней их никто не проверял, а сторона цены (start_above) у них записана
+        # ещё по котировкам Yahoo — на биржевой цене половина сработала бы сразу же и
+        # завалила людей уведомлениями по уровням, о которых те давно забыли.
+        #
+        # Гасим, а не удаляем: is_triggered = 1 убирает их из проверки и из /myalerts,
+        # но строки остаются на месте — DELETE необратим, как и DROP таблицы, которую
+        # по той же причине не тронули в августе.
+        #
+        # Условие по дате делает миграцию самоограниченной: она НЕ МОЖЕТ задеть алерт,
+        # поставленный после возврата функции, поэтому безопасно выполняется при каждом
+        # старте бота и не нуждается во флаге «уже отработала».
+        conn.execute("""
+            UPDATE alerts SET is_triggered = 1
+            WHERE is_triggered = 0 AND created_at < '2026-08-26'
+        """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 chat_id    INTEGER PRIMARY KEY,
@@ -110,7 +133,8 @@ def init_db() -> None:
             )
         """)
         # Журнал сделок пользователя (записывается свободным текстом через LLM).
-        # instrument — код инструмента движка ИЛИ сырой тикер Yahoo (своя пара). bar_time —
+        # instrument — код инструмента движка ИЛИ символ контракта BingX (своя пара; до
+        # 26.08.2026 тут были тикеры Yahoo — те записи читаются, но не ведутся). bar_time —
         # момент записи (UTC), якорь для трекинга исхода по свечам. Журнал НЕ истекает
         # сам: сделка висит 'open', пока не дойдёт до цели/стопа или её не закроют вручную.
         conn.execute("""
@@ -232,45 +256,66 @@ def get_all_users() -> list[dict]:
     return [dict(row) for row in rows]
 
 
-def get_price_window(ticker: str, decimals: int | None = None, minutes: int = 7) -> dict:
-    """Минимум, максимум и последняя цена инструмента за последние `minutes` минут
-    по минутным свечам. `ticker` — любой символ Yahoo Finance.
+# ── Алерты «касание уровня» ─────────────────────────────────────────────────
 
-    Осталась от простых алертов, но нужна и без них: ЖУРНАЛ СДЕЛОК разрешает свою
-    пару (любой тикер Yahoo), и эта функция делает две вещи для записи сделки —
-    проверяет, что тикер вообще существует (нет данных → ValueError), и подбирает
-    точность отображения по текущей цене.
+def get_pending_alerts() -> list[dict]:
+    """Все несработавшие алерты (is_triggered = 0) — их проверяет scheduler."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, user_id, threshold, pair, start_above
+            FROM alerts WHERE is_triggered = 0
+        """).fetchall()
+    return [dict(row) for row in rows]
 
-    `decimals=None` (своя пара) — точность подбираем по цене через infer_decimals.
-    Возвращает {low, high, last, decimals}.
-    """
-    tk = yf.Ticker(ticker)
-    df = tk.history(period="1d", interval="1m")
-    if df is None or df.empty:
-        # Фолбэк: минутных свечей нет — пробуем одну текущую цену как точку.
-        try:
-            last = tk.fast_info.last_price
-        except Exception:
-            last = None
-        if last is None:
-            raise ValueError(f"нет данных по тикеру {ticker}")
-        d = decimals if decimals is not None else infer_decimals(last)
-        last = round(float(last), d)
-        return {"low": last, "high": last, "last": last, "decimals": d}
 
-    cutoff = pd.Timestamp.now(tz=df.index.tz) - pd.Timedelta(minutes=minutes)
-    recent = df[df.index >= cutoff]
-    if recent.empty:
-        recent = df.tail(1)
+def set_alert_side(alert_id: int, start_above: int) -> None:
+    """Запоминает, с какой стороны от уровня была цена при первой проверке."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE alerts SET start_above = ? WHERE id = ?", (start_above, alert_id))
+        conn.commit()
 
-    last = float(df["Close"].iloc[-1])
-    d = decimals if decimals is not None else infer_decimals(last)
-    return {
-        "low": round(float(recent["Low"].min()), d),
-        "high": round(float(recent["High"].max()), d),
-        "last": round(last, d),
-        "decimals": d,
-    }
+
+def mark_alert_triggered(alert_id: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE alerts SET is_triggered = 1 WHERE id = ?", (alert_id,))
+        conn.commit()
+
+
+def add_alert(user_id: int, pair: str, threshold: float) -> None:
+    """Добавляет алерт-уровень на инструмент `pair`. Алертов у пользователя может быть
+    много. start_above = NULL — сторону цены проставит первая проверка."""
+    created_at = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT INTO alerts (user_id, threshold, pair, start_above, created_at, is_triggered)
+            VALUES (?, ?, ?, NULL, ?, 0)
+        """, (user_id, threshold, pair, created_at))
+        conn.commit()
+
+
+def get_user_alerts(user_id: int, pair: str | None = None) -> list[dict]:
+    """Активные (несработавшие) алерты пользователя. pair — только по одному
+    инструменту (нужно /analyze: отметить уровни, на которые алерт уже стоит)."""
+    sql = "SELECT id, threshold, pair FROM alerts WHERE user_id = ? AND is_triggered = 0"
+    args: list = [user_id]
+    if pair is not None:
+        sql += " AND pair = ?"
+        args.append(pair)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(sql + " ORDER BY pair, threshold", args).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_alert(alert_id: int, user_id: int) -> bool:
+    """Удаляет алерт пользователя по id. True — если что-то удалилось."""
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "DELETE FROM alerts WHERE id = ? AND user_id = ?", (alert_id, user_id)
+        )
+        conn.commit()
+        return cur.rowcount > 0
 
 
 # ── Уровни (контекстный анализ, стратегия №1) ───────────────────────────────
@@ -560,39 +605,3 @@ def close_trade(trade_id: int, user_id: int) -> bool:
         """, (closed_at, trade_id, user_id))
         conn.commit()
         return cur.rowcount > 0
-
-
-def get_hourly_candles(ticker: str, lookback_days: int = 7) -> pd.DataFrame:
-    """Часовые свечи по тикеру Yahoo в том же формате, что и биржевые свечи движка:
-    столбцы open/high/low/close/volume и индекс — время в UTC.
-
-    Нужно для трекинга сделок журнала по инструментам без биржевого объёма (золото,
-    нефть, своя пара): у них нет CCXT, но Yahoo отдаёт часовые свечи. Бросает
-    ValueError, если данных нет.
-    """
-    df = yf.Ticker(ticker).history(period=f"{lookback_days}d", interval="1h")
-    return _normalize_yahoo(df, ticker, "часовых")
-
-
-def get_daily_candles(ticker: str, lookback_days: int = 90) -> pd.DataFrame:
-    """Дневные свечи по тикеру Yahoo в том же формате, что и биржевые свечи движка
-    (open/high/low/close/volume, индекс — UTC). Нужно для движка по золоту/нефти
-    (источник 'yahoo'): контекстный анализ D1 + тренд. Бросает ValueError, если нет данных."""
-    df = yf.Ticker(ticker).history(period=f"{lookback_days}d", interval="1d")
-    return _normalize_yahoo(df, ticker, "дневных")
-
-
-def _normalize_yahoo(df: pd.DataFrame, ticker: str, kind: str) -> pd.DataFrame:
-    """Приводит свечи yfinance к формату движка: столбцы open/high/low/close/volume,
-    индекс — время в UTC. kind — для текста ошибки ('часовых'/'дневных')."""
-    if df is None or df.empty:
-        raise ValueError(f"нет {kind} свечей по тикеру {ticker}")
-    df = df.rename(columns={
-        "Open": "open", "High": "high", "Low": "low",
-        "Close": "close", "Volume": "volume",
-    })
-    if df.index.tz is None:
-        df.index = df.index.tz_localize("UTC")
-    else:
-        df.index = df.index.tz_convert("UTC")
-    return df[["open", "high", "low", "close", "volume"]]

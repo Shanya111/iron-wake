@@ -1,13 +1,15 @@
-"""Реестр инструментов для алертов.
+"""Реестр инструментов бота.
 
-Единый источник правды: какие пары показываем кнопками, какой у них тикер Yahoo
-и с какой точностью отображаем цену. Импортируется и в bot.py (UI/клавиатуры),
-и в database.py (получение котировок).
+Единый источник правды: какие пары показываем кнопками, под каким символом они
+торгуются на бирже и с какой точностью отображаем цену.
+
+Источник данных в боте ровно один — БИРЖА BingX. Yahoo Finance убран 26 августа
+2026 целиком: движок и так весь на бирже, а «своя пара» (любой инструмент вне этого
+реестра) переехала с тикеров Yahoo на бессрочные контракты BingX — их там 874 против
+21 здесь, и у всех настоящий объём и стакан. Поле "ticker" из реестра удалено вместе
+с ним: оно больше ничего не значило.
 """
 
-# Код пары → отображаемое имя, тикер Yahoo Finance, число знаков после запятой.
-# Тикеры проверены на живых данных (все отдают минутные свечи для логики касания).
-#
 # Поле "ccxt" — это {символ, биржа} для торгового движка (анализ VSA + Spring): у пары
 # есть настоящий биржевой объём. ВСЕ инструменты движка — БЕССРОЧНЫЕ ФЬЮЧЕРСЫ BingX
 # (символы вида "BTC/USDT:USDT", тип swap).
@@ -62,55 +64,57 @@
 # есть, но API на них отвечает "symbol is not found" — это мёртвые записи. Код
 # инструмента остаётся TON: на него уже ссылаются подписки, сигналы и сделки в БД.
 #
-# Простые алерты «касание уровня» работают по всем парам через yfinance (ticker)
-# независимо от движка.
+# «Своя пара» — любой инструмент вне этого реестра. Отдельным полем она не хранится:
+# в базу пишется сразу символ контракта («WIF/USDT:USDT»), а находит его по
+# человеческому вводу data_fetcher.find_symbol. Реестр нужен для другого — кнопки,
+# подписки, красивые имена и курируемая точность отображения.
 INSTRUMENTS = {
     # ── Форекс: синтетические бессрочные фьючерсы BingX (NCFX*). Флаг "fx" включает
     #    отдельные пороги детектора и отключает ATR-фильтры из /settings (см. выше).
     #    Точность 5 знаков — котировки приходят вида 1.16702; у иены 3 (159.071).
-    "EURUSD": {"name": "EUR/USD",       "ticker": "EURUSD=X",     "decimals": 5, "fx": True,
+    "EURUSD": {"name": "EUR/USD",       "decimals": 5, "fx": True,
                "ccxt": {"symbol": "NCFXEUR2USD/USDT:USDT", "exchange": "bingx"}},
-    "GBPUSD": {"name": "GBP/USD",       "ticker": "GBPUSD=X",     "decimals": 5, "fx": True,
+    "GBPUSD": {"name": "GBP/USD",       "decimals": 5, "fx": True,
                "ccxt": {"symbol": "NCFXGBP2USD/USDT:USDT", "exchange": "bingx"}},
-    "AUDUSD": {"name": "AUD/USD",       "ticker": "AUDUSD=X",     "decimals": 5, "fx": True,
+    "AUDUSD": {"name": "AUD/USD",       "decimals": 5, "fx": True,
                "ccxt": {"symbol": "NCFXAUD2USD/USDT:USDT", "exchange": "bingx"}},
-    "USDCAD": {"name": "USD/CAD",       "ticker": "USDCAD=X",     "decimals": 5, "fx": True,
+    "USDCAD": {"name": "USD/CAD",       "decimals": 5, "fx": True,
                "ccxt": {"symbol": "NCFXUSD2CAD/USDT:USDT", "exchange": "bingx"}},
-    "USDJPY": {"name": "USD/JPY",       "ticker": "USDJPY=X",     "decimals": 3, "fx": True,
+    "USDJPY": {"name": "USD/JPY",       "decimals": 3, "fx": True,
                "ccxt": {"symbol": "NCFXUSD2JPY/USDT:USDT", "exchange": "bingx"}},
     # ── Товары: бессрочные фьючерсы BingX (синтетика на золото и Brent) ────────
-    "GOLD":   {"name": "Золото",        "ticker": "GC=F",         "decimals": 2,
+    "GOLD":   {"name": "Золото",        "decimals": 2,
                "ccxt": {"symbol": "NCCOGOLD2USD/USDT:USDT", "exchange": "bingx"}},
-    "BRENT":  {"name": "Нефть Brent",   "ticker": "BZ=F",         "decimals": 2,
+    "BRENT":  {"name": "Нефть Brent",   "decimals": 2,
                "ccxt": {"symbol": "NCCO1OILBRENT2USD/USDT:USDT", "exchange": "bingx"}},
     # ── Крипта: бессрочные фьючерсы BingX ─────────────────────────────────────
-    "BTC":    {"name": "Bitcoin",        "ticker": "BTC-USD",      "decimals": 2,
+    "BTC":    {"name": "Bitcoin",        "decimals": 2,
                "ccxt": {"symbol": "BTC/USDT:USDT", "exchange": "bingx"}},
-    "ETH":    {"name": "Ethereum",       "ticker": "ETH-USD",      "decimals": 2,
+    "ETH":    {"name": "Ethereum",       "decimals": 2,
                "ccxt": {"symbol": "ETH/USDT:USDT", "exchange": "bingx"}},
-    "SOL":    {"name": "Solana",         "ticker": "SOL-USD",      "decimals": 2,
+    "SOL":    {"name": "Solana",         "decimals": 2,
                "ccxt": {"symbol": "SOL/USDT:USDT", "exchange": "bingx"}},
-    "TON":    {"name": "Toncoin (GRAM)", "ticker": "TON11419-USD", "decimals": 4,
+    "TON":    {"name": "Toncoin (GRAM)", "decimals": 4,
                "ccxt": {"symbol": "GRAMTON/USDT:USDT", "exchange": "bingx"}},
-    "XRP":    {"name": "XRP",            "ticker": "XRP-USD",      "decimals": 4,
+    "XRP":    {"name": "XRP",            "decimals": 4,
                "ccxt": {"symbol": "XRP/USDT:USDT", "exchange": "bingx"}},
-    "ADA":    {"name": "Cardano",        "ticker": "ADA-USD",      "decimals": 4,
+    "ADA":    {"name": "Cardano",        "decimals": 4,
                "ccxt": {"symbol": "ADA/USDT:USDT", "exchange": "bingx"}},
-    "XLM":    {"name": "Stellar",        "ticker": "XLM-USD",      "decimals": 4,
+    "XLM":    {"name": "Stellar",        "decimals": 4,
                "ccxt": {"symbol": "XLM/USDT:USDT", "exchange": "bingx"}},
-    "AVAX":   {"name": "Avalanche",      "ticker": "AVAX-USD",     "decimals": 2,
+    "AVAX":   {"name": "Avalanche",      "decimals": 2,
                "ccxt": {"symbol": "AVAX/USDT:USDT", "exchange": "bingx"}},
-    "SUI":    {"name": "Sui",            "ticker": "SUI20947-USD", "decimals": 4,
+    "SUI":    {"name": "Sui",            "decimals": 4,
                "ccxt": {"symbol": "SUI/USDT:USDT", "exchange": "bingx"}},
-    "UNI":    {"name": "Uniswap",        "ticker": "UNI7083-USD",  "decimals": 4,
+    "UNI":    {"name": "Uniswap",        "decimals": 4,
                "ccxt": {"symbol": "UNI/USDT:USDT", "exchange": "bingx"}},
-    "LTC":    {"name": "Litecoin",       "ticker": "LTC-USD",      "decimals": 2,
+    "LTC":    {"name": "Litecoin",       "decimals": 2,
                "ccxt": {"symbol": "LTC/USDT:USDT", "exchange": "bingx"}},
-    "AAVE":   {"name": "Aave",           "ticker": "AAVE-USD",     "decimals": 2,
+    "AAVE":   {"name": "Aave",           "decimals": 2,
                "ccxt": {"symbol": "AAVE/USDT:USDT", "exchange": "bingx"}},
-    "DOGE":   {"name": "Dogecoin",       "ticker": "DOGE-USD",     "decimals": 5,
+    "DOGE":   {"name": "Dogecoin",       "decimals": 5,
                "ccxt": {"symbol": "DOGE/USDT:USDT", "exchange": "bingx"}},
-    "LINK":   {"name": "Chainlink",      "ticker": "LINK-USD",     "decimals": 2,
+    "LINK":   {"name": "Chainlink",      "decimals": 2,
                "ccxt": {"symbol": "LINK/USDT:USDT", "exchange": "bingx"}},
 }
 
@@ -130,17 +134,37 @@ def infer_decimals(price: float) -> int:
     return 6
 
 
+def short(pair: str) -> str:
+    """Биржевая аббревиатура — то, что человек видит в сигналах, отчётах и кнопках.
+
+    Для реестра это сам код (BTC, GOLD, EURUSD): он и есть тикер, под которым
+    инструмент известен на бирже. Для своей пары — монета из символа контракта
+    («WIF/USDT:USDT» → «WIF»).
+
+    Полное имя («Bitcoin», «Золото») никуда не делось, оно осталось в поле "name" —
+    но нужно ровно там, где текст читает МОДЕЛЬ, а не человек: по русскому слову
+    «золото» NL-роутер находит код GOLD (см. llm._instrument_catalog). Показывать
+    человеку два разных обозначения одного инструмента — верный способ запутать.
+    """
+    return pair if pair in INSTRUMENTS else (pair or "").split("/")[0]
+
+
 def resolve(pair: str) -> dict:
-    """Данные инструмента по сохранённому значению `pair`.
+    """Имя и точность отображения по сохранённому значению `pair`.
+
+    Ключей три: "short" — биржевая аббревиатура, ЕЁ И ПОКАЗЫВАЕМ человеку; "name" —
+    полное имя, оно для промптов LLM; "decimals" — точность отображения.
 
     Реестровый код (BTC, GOLD...) — берём из INSTRUMENTS.
-    Иначе это своя пара: `pair` — сырой тикер Yahoo, имя = тикер,
-    точность не фиксирована (decimals=None → подбор по цене через infer_decimals).
+    Иначе это своя пара: `pair` — символ контракта BingX («WIF/USDT:USDT»), человеку
+    показываем только монету, точность подбираем по цене (decimals=None →
+    infer_decimals). Старые записи журнала с тикерами Yahoo сюда тоже попадают и
+    отображаются как есть — читаются они по-прежнему, а вот вести их больше не по чему.
     """
     info = INSTRUMENTS.get(pair)
     if info is not None:
-        return {"name": info["name"], "ticker": info["ticker"], "decimals": info["decimals"]}
-    return {"name": pair, "ticker": pair, "decimals": None}
+        return {"name": info["name"], "short": short(pair), "decimals": info["decimals"]}
+    return {"name": short(pair), "short": short(pair), "decimals": None}
 
 
 def engine_codes() -> list[str]:
@@ -151,22 +175,13 @@ def engine_codes() -> list[str]:
 
 
 def data_source(code: str) -> str | None:
-    """Откуда движок берёт свечи с объёмом по инструменту:
-    'ccxt' — биржа BingX (фьючерсы), 'yahoo' — свечи Yahoo,
-    None — инструмент в движок не входит (форекс, своя пара).
+    """'ccxt' — у инструмента есть биржевой источник свечей, None — нет.
 
-    Ветка 'yahoo' сохранена намеренно, хотя сейчас на неё никто не попадает: она
-    нужна журналу сделок (scheduler.track_trades ведёт сделки по своим тикерам
-    Yahoo) и на случай возврата инструмента без биржевого источника.
+    Источник в боте остался один, поэтому и значений два. Ветка 'yahoo' убрана
+    26 августа 2026 вместе с самим Yahoo: держать её «на всякий случай» — значит
+    держать код, который никто не проверяет, но который однажды тихо сработает.
     """
-    info = INSTRUMENTS.get(code)
-    if not info:
-        return None
-    if "ccxt" in info:
-        return "ccxt"
-    if info.get("source") == "yahoo":
-        return "yahoo"
-    return None
+    return "ccxt" if ccxt_symbol(code) else None
 
 
 def is_fx(code: str | None) -> bool:
@@ -183,7 +198,15 @@ def is_fx(code: str | None) -> bool:
 
 
 def ccxt_symbol(code: str) -> dict | None:
-    """{'symbol': 'BTC/USDT:USDT', 'exchange': 'bingx'} или None, если у пары нет
-    биржевого источника (форекс, своя пара)."""
+    """{'symbol': 'BTC/USDT:USDT', 'exchange': 'bingx'} — где брать свечи по инструменту.
+
+    Реестровый код — из INSTRUMENTS. Своя пара хранится сразу символом ccxt (в нём
+    есть «/»), его и отдаём. None — источника нет: так выглядят старые записи журнала
+    с тикерами Yahoo, оставшиеся с прежних времён.
+    """
     info = INSTRUMENTS.get(code)
-    return info.get("ccxt") if info else None
+    if info is not None:
+        return info.get("ccxt")
+    if "/" in (code or ""):
+        return {"symbol": code, "exchange": "bingx"}
+    return None

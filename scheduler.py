@@ -1,59 +1,52 @@
-"""Фоновые задачи торгового движка: контекстный анализ и мониторинг паттернов.
+"""Фоновые задачи бота. Планировщик в проекте ровно один — этот.
 
-Использует тот же AsyncIOScheduler, что и простые алерты (см. bot.py). Три задачи:
+Пять задач:
   • run_analysis  (раз в час) — пересчитывает тренд/уровни/зоны и пишет в БД (levels);
   • monitor_signals (каждые 5 мин) — ищет Spring/Upthrust по свежим H1-свечам, пишет
     в signals и рассылает подписчикам;
   • track_signals (каждые 5 мин) — ведёт сигнал по двум ступеням: исполнилась ли
-    лимитная заявка, а потом — дошла ли сделка до цели/стопа; сообщает владельцу.
+    лимитная заявка, а потом — дошла ли сделка до цели/стопа; сообщает владельцу;
+  • track_trades (каждые 5 мин) — исход сделок журнала;
+  • check_alerts (каждые 5 мин) — алерты «касание уровня» (правило — в alerts.py).
 
 Анализируются инструменты движка (есть источник объёма) из числа подписанных —
-лишние пары не дёргаем. Источник свечей зависит от инструмента (instruments.data_source):
-все инструменты движка — бессрочные фьючерсы BingX (CCXT), см. fetch_candles.
+лишние пары не дёргаем. Источник данных в боте ровно один — БИРЖА BingX: и движок,
+и журнал сделок, и алерты берут свечи через fetch_candles. Yahoo убран 26 августа 2026.
 """
 
-import asyncio
 from datetime import datetime, timedelta
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import alerts
 import analyzer
 import config
 import data_fetcher
 import database
 import llm
 import pattern_detector
-from instruments import ccxt_symbol, data_source, fmt, infer_decimals, resolve
-
-
-def _yahoo_days(timeframe: str, limit: int) -> int:
-    """Сколько календарных дней истории просить у Yahoo, чтобы вышло ~limit свечей
-    (с запасом на выходные). H1: у фьючерсов ~16–18 торговых часов в сутки."""
-    if timeframe == config.H1_TIMEFRAME:
-        return max(7, limit // 12 + 5)   # 120 H1 → ~15 дней
-    return limit * 2 + 10                 # 30 D1 → ~70 дней
+from instruments import ccxt_symbol, data_source, fmt, infer_decimals, resolve, short
 
 
 async def fetch_candles(code: str, timeframe: str, limit: int):
-    """Свечи инструмента движка из его источника (см. instruments.data_source):
-    'ccxt' — биржа BingX, фьючерсы (весь движок), 'yahoo' — свечи Yahoo (сейчас
-    на неё никто не попадает, но ветка нужна журналу сделок по своим тикерам).
-    Возвращает DataFrame OHLCV с UTC-индексом — единый формат для аналитики."""
-    src = data_source(code)
-    if src == "ccxt":
-        sym = ccxt_symbol(code)
-        return await data_fetcher.get_candles(sym["symbol"], timeframe, limit, sym["exchange"])
-    if src == "yahoo":
-        ticker = resolve(code)["ticker"]
-        days = _yahoo_days(timeframe, limit)
-        fn = database.get_hourly_candles if timeframe == config.H1_TIMEFRAME else database.get_daily_candles
-        df = await asyncio.to_thread(fn, ticker, days)
-        return df.tail(limit)
-    raise ValueError(f"нет источника свечей для {code}")
+    """Свечи инструмента с биржи: DataFrame OHLCV с UTC-индексом.
+
+    Работает и по реестровому коду (BTC, GOLD…), и по своей паре — она хранится
+    сразу символом контракта («WIF/USDT:USDT»), см. instruments.ccxt_symbol. Источник
+    один на весь бот, поэтому и ветка одна: развилку по data_source убрали вместе
+    с Yahoo 26 августа 2026.
+
+    ValueError — если источника нет. Так выглядят старые записи журнала с тикерами
+    Yahoo: читаться они читаются, а вот вести их больше не по чему.
+    """
+    sym = ccxt_symbol(code)
+    if sym is None:
+        raise ValueError(f"нет биржевого источника для {code}")
+    return await data_fetcher.get_candles(sym["symbol"], timeframe, limit, sym["exchange"])
 
 
 def _subscribed_engine() -> list[str]:
-    """Инструменты с подпиской, входящие в движок (есть источник объёма: ccxt/yahoo)."""
+    """Инструменты с подпиской, входящие в движок (есть биржевой источник)."""
     return [c for c in database.get_subscribed_instruments() if data_source(c)]
 
 
@@ -206,7 +199,7 @@ async def _notify_unfilled(bot, signal: dict) -> None:
     info = resolve(signal["instrument"])
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
     await _send_to_owner(bot, signal, (
-        f"⏹ Заявка снята — {info['name']}\n"
+        f"⏹ Заявка снята — {info['short']}\n"
         f"Цена так и не дошла до {fmt(signal['entry_price'], d)} "
         f"за {config.ENTRY_WAIT_BARS} ч. Сделки не было.\n"
         "Если заявка ещё стоит в терминале — сними её."
@@ -219,7 +212,7 @@ async def _notify_filled(bot, signal: dict) -> None:
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
     arrow = "🟢 ЛОНГ" if signal["direction"] == "long" else "🔴 ШОРТ"
     await _send_to_owner(bot, signal, (
-        f"▶️ Заявка исполнена — {info['name']} ({arrow})\n"
+        f"▶️ Заявка исполнена — {info['short']} ({arrow})\n"
         f"Вход {fmt(signal['entry_price'], d)}, "
         f"стоп {fmt(signal['stop_loss'], d)}, цель {fmt(signal['take_profit'], d)}.\n"
         "Дальше веду её сам — сообщу, когда дойдёт до цели или стопа."
@@ -229,10 +222,14 @@ async def _notify_filled(bot, signal: dict) -> None:
 async def track_trades(bot) -> None:
     """Каждые N минут: проверяем сделки журнала — дошли ли до цели/стопа.
 
-    Источник свечей по инструменту: движковые (BTC, GOLD…) — BingX H1 (общий кеш
-    с сигналами), остальные (своя пара) — часовые свечи Yahoo. Журнал
-    НЕ истекает: 'expired' трактуем как 'ещё открыта' — держим до цели/стопа/ручного
-    закрытия. Внутри свечи при двусмысленности pattern_detector считает стоп раньше.
+    Свечи — BingX H1 для всех: и для реестровых инструментов (общий кеш с сигналами),
+    и для своей пары, которая теперь хранится символом контракта. Журнал НЕ истекает:
+    'expired' трактуем как 'ещё открыта' — держим до цели/стопа/ручного закрытия.
+    Внутри свечи при двусмысленности pattern_detector считает стоп раньше.
+
+    Сделка по инструменту без биржевого источника (запись с тикером Yahoo, оставшаяся
+    в журнале с прежних времён) просто не ведётся: в лог уйдёт строка, сама сделка
+    останется открытой и закрывается кнопкой в /trades.
     """
     trades = database.get_open_trades()
     if not trades:
@@ -240,11 +237,7 @@ async def track_trades(bot) -> None:
     candles: dict[str, object] = {}
     for code in {t["instrument"] for t in trades}:
         try:
-            if ccxt_symbol(code):
-                candles[code] = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
-            else:
-                ticker = resolve(code)["ticker"]
-                candles[code] = await asyncio.to_thread(database.get_hourly_candles, ticker)
+            candles[code] = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
         except Exception as e:
             print(f"[track_trades] {code}: ошибка данных: {e}")
     for t in trades:
@@ -274,7 +267,7 @@ async def _notify_trade_outcome(bot, trade: dict, outcome: str) -> None:
         head, price = "🛑 Сработал стоп", trade["stop_loss"]
     text = (
         f"📒 Сделка из журнала — {head}\n"
-        f"{info['name']} ({arrow})\n"
+        f"{info['short']} ({arrow})\n"
         f"Вход был {fmt(trade['entry_price'], d)}, цена дошла до {fmt(price, d)}.\n\n"
         "Журнал ведётся для статистики, это не финсовет."
     )
@@ -293,7 +286,7 @@ async def _notify_outcome(bot, signal: dict, outcome: str) -> None:
     else:
         head, price = "🛑 Сработал стоп", signal["stop_loss"]
     text = (
-        f"{head} — {info['name']} ({arrow})\n"
+        f"{head} — {info['short']} ({arrow})\n"
         f"Вход был {fmt(signal['entry_price'], d)}, цена дошла до {fmt(price, d)}.\n\n"
         "Это итог подсказки, не финсовет."
     )
@@ -326,7 +319,7 @@ async def _signal_comment(code: str, signal: dict, trend: str) -> str | None:
            if signal["pattern"] == "spring"
            else "Upthrust — ложный пробой сопротивления вверх с возвратом (шорт)")
     summary = (
-        f"Инструмент: {info['name']}\n"
+        f"Инструмент: {info['short']}\n"
         f"Паттерн: {pat}\n"
         f"Тренд D1: {trend_ru}\n"
         f"Сила пробитого уровня: {strength}\n"
@@ -360,7 +353,7 @@ async def _notify(bot, code: str, signal: dict, user_id: int, comment: str | Non
     if sig_price and abs(sig_price - signal["entry_price"]) > 1e-12:
         was = f"Сигнал был по {fmt(sig_price, d)} — заявка ставится ближе к уровню.\n"
     text = (
-        f"{star}{arrow} — {info['name']}\n"
+        f"{star}{arrow} — {info['short']}\n"
         f"Паттерн: {name}\n"
         f"📥 ЛИМИТНАЯ заявка на {side}: {fmt(signal['entry_price'], d)}\n"
         f"Стоп: {fmt(signal['stop_loss'], d)}\n"
@@ -379,12 +372,82 @@ async def _notify(bot, code: str, signal: dict, user_id: int, comment: str | Non
         print(f"[monitor_signals] не отправить {user_id}: {e}")
 
 
+async def alert_window(pair: str) -> dict:
+    """Куда цена заходила за последние минуты: {low, high, last, decimals}.
+
+    Источник — тот же, что у уровней в /analyze: минутные свечи БИРЖИ. Это и было
+    главным при возврате алертов — считать уровень по одному графику, а касание
+    проверять по другому нельзя. С уходом Yahoo развилка исчезла совсем: своя пара
+    тоже биржевая, просто контракт не из реестра.
+    """
+    info = resolve(pair)
+    df = await fetch_candles(pair, config.ALERT_TIMEFRAME, config.ALERT_LOOKBACK)
+    window = alerts.window_from_candles(df.tail(config.ALERT_LOOKBACK))
+    window["decimals"] = (info["decimals"] if info["decimals"] is not None
+                          else infer_decimals(window["last"]))
+    return window
+
+
+async def check_alerts(bot) -> None:
+    """Алерты «касание уровня» (каждые 5 минут): дошла ли цена до уровня пользователя.
+
+    По одному запросу цены на инструмент за цикл, а не на алерт: на одной паре у разных
+    людей могут стоять свои уровни. Правило срабатывания — alerts.hit (диапазон свечей,
+    а не одна точка), поэтому касание фитилём между проверками не теряется.
+    """
+    pending = database.get_pending_alerts()
+    print(f"[check_alerts] активных алертов: {len(pending)}")
+    if not pending:
+        return
+
+    windows: dict[str, dict] = {}
+    for pair in {a["pair"] for a in pending}:
+        try:
+            windows[pair] = await alert_window(pair)
+        except Exception as e:
+            print(f"[check_alerts] {pair}: цену не получили — {e}")
+
+    for a in pending:
+        window = windows.get(a["pair"])
+        if window is None:
+            continue  # по этой паре цены в этом цикле нет — ждём следующего
+        info = resolve(a["pair"])
+        low, high, last, d = window["low"], window["high"], window["last"], window["decimals"]
+
+        # Первая проверка ВЗВОДИТ алерт: запоминаем сторону цены и в этом цикле не
+        # срабатываем. Это не задержка ради задержки — окно свечей смотрит назад, и без
+        # такого шага свежий алерт сработал бы на диапазоне, который был ДО его
+        # постановки. Цена расплаты — касание в первые 5 минут жизни алерта не поймается.
+        if a["start_above"] is None:
+            database.set_alert_side(a["id"], alerts.side_of(last, a["threshold"]))
+            print(f"  • взведён id={a['id']} {info['short']} {fmt(a['threshold'], d)}")
+            continue
+
+        if not alerts.hit(low, high, last, a["threshold"], a["start_above"]):
+            continue
+
+        print(f"  [!] СРАБОТАЛ id={a['id']} user={a['user_id']} {info['short']} "
+              f"{fmt(a['threshold'], d)} диапазон=[{fmt(low, d)}; {fmt(high, d)}]")
+        database.mark_alert_triggered(a["id"])
+        try:
+            await bot.send_message(
+                a["user_id"],
+                f"🔔 {info['short']} дошёл до твоего уровня {fmt(a['threshold'], d)}.\n"
+                f"Сейчас {fmt(last, d)} (за последние минуты ходил "
+                f"{fmt(low, d)}–{fmt(high, d)}).\n"
+                "Алерт снят. Поставить новый — /alert, список — /myalerts."
+            )
+        except Exception as e:
+            print(f"[check_alerts] не отправилось {a['user_id']}: {e}")
+
+
 def setup(bot) -> AsyncIOScheduler:
-    """Создаёт и запускает планировщик движка (анализ + мониторинг сигналов)."""
+    """Создаёт и запускает единственный планировщик бота (пять задач, см. модуль)."""
     sched = AsyncIOScheduler()
     sched.add_job(run_analysis, "interval", minutes=config.ANALYZE_EVERY_MIN, args=[bot])
     sched.add_job(monitor_signals, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
     sched.add_job(track_signals, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
     sched.add_job(track_trades, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
+    sched.add_job(check_alerts, "interval", minutes=config.ALERT_EVERY_MIN, args=[bot])
     sched.start()
     return sched

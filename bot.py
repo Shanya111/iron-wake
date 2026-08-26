@@ -40,6 +40,7 @@ from instruments import (
     fmt,
     infer_decimals,
     resolve,
+    short,
 )
 
 load_dotenv()
@@ -110,6 +111,14 @@ class NLConfirm(StatesGroup):
     waiting = State()
 
 
+class AlertStates(StatesGroup):
+    """Ручная постановка алерта: инструмент → (своя монета с биржи) → уровень → подтверждение."""
+    waiting_pair = State()
+    waiting_custom_pair = State()
+    waiting_rate = State()
+    waiting_confirm = State()
+
+
 def start_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -172,11 +181,12 @@ async def cmd_start(message: Message):
         return
 
     await message.answer(
-        f"Привет, {user.first_name}! Я iron-wake — торговый ассистент по 16 фьючерсам "
-        "BingX (крипта, золото, нефть). Разбираю расклад по методике VSA и присылаю "
-        "сигналы ложного пробоя (Spring/Upthrust) с ценой заявки, стопом и целью.\n\n"
+        f"Привет, {user.first_name}! Я iron-wake — торговый ассистент по 21 фьючерсу "
+        "BingX (крипта, золото, нефть, валютные пары). Разбираю расклад по методике VSA "
+        "и присылаю сигналы ложного пробоя (Spring/Upthrust) с ценой заявки, стопом и "
+        "целью.\n\n"
         "Разбор инструмента — /analyze. Подписка на сигналы — /subscribe. "
-        "Написать админу — /write.\n\n"
+        "Уведомить при касании уровня — /alert. Написать админу — /write.\n\n"
         "Выбери действие:",
         reply_markup=start_keyboard(),
     )
@@ -386,6 +396,8 @@ HELP_TEXT = (
     "/unsubscribe — отписаться от уведомлений\n"
     "/myid — узнать свой Telegram ID\n"
     "/write — написать администратору\n"
+    "/alert — алерт: уведомлю, когда цена коснётся уровня\n"
+    "/myalerts — мои алерты (посмотреть и удалить)\n"
     "/analyze — разбор инструмента глазами движка: что видит, чего не хватает\n"
     "/subscribe — подписка на торговые сигналы (Spring/Upthrust)\n"
     "/signals — последние сигналы\n"
@@ -398,6 +410,7 @@ HELP_TEXT = (
     "• «подпиши на эфир» / «мои сигналы» — подписка и список\n"
     "• «статистика за месяц» — сводка по сигналам (винрейт, итог в R)\n"
     "• «взял золото по 2390, стоп 2380, цель 2410» — запишу сделку в журнал\n"
+    "• «алерт золото 2400» / «мои алерты» — поставлю алерт и покажу список\n"
     "Остальное (вопросы, разбор пересланного анализа) — отвечу как ассистент."
 )
 
@@ -407,25 +420,30 @@ async def cmd_help(message: Message):
     await message.answer(HELP_TEXT)
 
 
+ABOUT_TEXT = (
+    "iron-wake — торговый ассистент по 21 бессрочному фьючерсу BingX "
+    "(14 крипто-пар, золото, нефть Brent, 5 валютных пар).\n\n"
+    "Разбирает рынок по методике VSA: тренд дневки, уровни, объём, стакан заявок. "
+    "Ищет ложные пробои Spring и Upthrust и присылает сигнал с ценой лимитной "
+    "заявки, стопом и целью — а потом сам доводит его до исхода.\n\n"
+    "Умеет алерты: скажет, когда цена дойдёт до уровня, который выбрал ты.\n\n"
+    "Это подсказка, а не авто-торговля. Решение и риск — на трейдере.\n\n"
+    "Автор: Аким."
+)
+
+
 @dp.message(Command("about"))
 async def cmd_about(message: Message):
-    await message.answer(
-        "iron-wake — торговый ассистент по 16 бессрочным фьючерсам BingX "
-        "(14 крипто-пар, золото, нефть Brent).\n\n"
-        "Разбирает рынок по методике VSA: тренд дневки, уровни, объём, стакан заявок. "
-        "Ищет ложные пробои Spring и Upthrust и присылает сигнал с ценой лимитной "
-        "заявки, стопом и целью — а потом сам доводит его до исхода.\n\n"
-        "Это подсказка, а не авто-торговля. Решение и риск — на трейдере.\n\n"
-        "Автор: Аким."
-    )
+    await message.answer(ABOUT_TEXT)
 
 
 @dp.message(Command("privacy"))
 async def cmd_privacy(message: Message):
     await message.answer(
         "Политика конфиденциальности: бот iron-wake хранит chat_id, подписки на "
-        "инструменты, личные пороги отбора сигналов и записанные тобой сделки — "
-        "исключительно чтобы присылать сигналы и вести их исход. "
+        "инструменты, личные пороги отбора сигналов, поставленные алерты и "
+        "записанные тобой сделки — исключительно чтобы присылать сигналы и алерты "
+        "и вести исход сделок. "
         "Данные не передаются третьим лицам. "
         "Для отключения — /unsubscribe."
     )
@@ -502,15 +520,7 @@ async def cmd_broadcast(message: Message):
 # Обработчики inline-кнопок
 @dp.callback_query(F.data == "about")
 async def cb_about(call: CallbackQuery):
-    await call.message.answer(
-        "iron-wake — торговый ассистент по 16 бессрочным фьючерсам BingX "
-        "(14 крипто-пар, золото, нефть Brent).\n\n"
-        "Разбирает рынок по методике VSA: тренд дневки, уровни, объём, стакан заявок. "
-        "Ищет ложные пробои Spring и Upthrust и присылает сигнал с ценой лимитной "
-        "заявки, стопом и целью — а потом сам доводит его до исхода.\n\n"
-        "Это подсказка, а не авто-торговля. Решение и риск — на трейдере.\n\n"
-        "Автор: Аким."
-    )
+    await call.message.answer(ABOUT_TEXT)
     await call.answer()
 
 
@@ -527,6 +537,218 @@ async def cmd_cancel(message: Message, state: FSMContext):
         return
     await state.clear()
     await message.answer("Отменено.", reply_markup=start_keyboard())
+
+
+# ── Алерты «касание уровня» ──────────────────────────────────────────────────
+#
+# Алерт — это «скажи, когда цена дойдёт сюда». Он ничего не советует и ни во что не
+# вмешивается: движок со своими сигналами живёт отдельно. Поставить можно двумя
+# путями — кнопкой-колокольчиком прямо в отчёте /analyze (уровни движок уже посчитал,
+# вводить число руками не надо) и вручную через /alert (любой уровень, любая пара —
+# хоть из 21 кнопки реестра, хоть любой из 874 бессрочных контрактов BingX). Проверяет
+# их scheduler.check_alerts по биржевой цене, правило срабатывания — в alerts.py.
+
+
+def alert_confirm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Сохранить", callback_data="alert_save"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="alert_cancel"),
+    ]])
+
+
+def alert_pairs_keyboard() -> InlineKeyboardMarkup:
+    """Инструменты кнопками (по 2 в ряд) + своя пара + отмена. Цены здесь НЕ
+    запрашиваем — только названия, чтобы не дёргать биржу зря."""
+    codes = list(INSTRUMENTS.keys())
+    rows = [
+        [InlineKeyboardButton(text=short(c), callback_data=f"alertpair_{c}")
+         for c in codes[i:i + 2]]
+        for i in range(0, len(codes), 2)
+    ]
+    rows.append([InlineKeyboardButton(text="✏️ Своя пара", callback_data="alertpair_custom")])
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="alertpair_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _same_price(a: float, b: float) -> bool:
+    """Один и тот же уровень? Сравниваем с относительным допуском: цена теряет
+    последние знаки при переносе через callback_data, и точное равенство float'ов
+    на таком пути ловить нельзя."""
+    return abs(a - b) <= max(abs(a), abs(b), 1.0) * 1e-9
+
+
+async def _ask_alert_level(target: Message, state: FSMContext, pair: str) -> None:
+    """Шаг «введи уровень»: показываем текущую цену и переводим FSM дальше.
+
+    Цену берём тем же путём, что и проверка алертов (engine.alert_window) — с биржи.
+    Показать одну цену, а сработать по другой было бы враньём.
+    """
+    info = resolve(pair)
+    window = await engine.alert_window(pair)
+    price = fmt(window["last"], window["decimals"])
+    await state.update_data(pair=pair, decimals=window["decimals"])
+    await state.set_state(AlertStates.waiting_rate)
+    await target.answer(
+        f"{info['short']} — сейчас {price}.\n\n"
+        f"Введи уровень, на котором уведомить (например: {price}):"
+    )
+
+
+@dp.message(Command("alert"))
+async def cmd_alert(message: Message, state: FSMContext):
+    await state.set_state(AlertStates.waiting_pair)
+    await message.answer("Выбери инструмент для алерта:", reply_markup=alert_pairs_keyboard())
+
+
+@dp.callback_query(F.data == "alertpair_cancel", StateFilter(AlertStates.waiting_pair))
+async def alert_pair_cancel_cb(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("Настройка алерта отменена.", reply_markup=start_keyboard())
+    await call.answer()
+
+
+@dp.callback_query(F.data == "alertpair_custom", StateFilter(AlertStates.waiting_pair))
+async def alert_pair_custom_cb(call: CallbackQuery, state: FSMContext):
+    await state.set_state(AlertStates.waiting_custom_pair)
+    await call.message.answer(
+        "Введи монету или символ контракта BingX.\n"
+        "Примеры: WIF, ARB, PEPE, ETH/USDC:USDC.\n"
+        "Подойдёт любой из 874 бессрочных контрактов биржи — не только те 21, что "
+        "на кнопках. Отмена — /cancel."
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("alertpair_"), StateFilter(AlertStates.waiting_pair))
+async def alert_pair_cb(call: CallbackQuery, state: FSMContext):
+    code = call.data.removeprefix("alertpair_")
+    if code not in INSTRUMENTS:  # на случай устаревшей кнопки из старого сообщения
+        await call.answer()
+        return
+    try:
+        await _ask_alert_level(call.message, state, code)
+    except Exception:
+        await call.message.answer("Не удалось получить цену сейчас, попробуй позже или /cancel.")
+    await call.answer()
+
+
+@dp.message(AlertStates.waiting_custom_pair)
+async def alert_custom_pair_input(message: Message, state: FSMContext):
+    """Своя пара: ищем контракт на бирже и запоминаем ЕГО символ, а не то, что ввели.
+
+    Так алерт хранится в том же виде, в каком его потом будет читать проверка, и по
+    нему сразу видно, откуда берётся цена."""
+    query = (message.text or "").strip()
+    if not query:
+        await message.answer("Введи монету, например WIF, или /cancel.")
+        return
+    symbol = await data_fetcher.find_symbol(query)
+    if symbol is None:
+        await message.answer(
+            f"Не нашёл «{query}» среди бессрочных контрактов BingX. Проверь написание "
+            "или попробуй другую монету, например WIF или ARB. Отмена — /cancel."
+        )
+        return
+    try:
+        await _ask_alert_level(message, state, symbol)
+    except Exception:
+        await message.answer("Не удалось получить цену сейчас, попробуй позже или /cancel.")
+
+
+@dp.message(AlertStates.waiting_rate)
+async def alert_rate_input(message: Message, state: FSMContext):
+    try:
+        rate = float((message.text or "").replace(",", "."))
+        if rate <= 0:
+            raise ValueError
+    except (ValueError, AttributeError):
+        await message.answer("Введи корректное число, например 155.00:")
+        return
+    data = await state.get_data()
+    info = resolve(data["pair"])
+    await state.update_data(rate=rate)
+    await state.set_state(AlertStates.waiting_confirm)
+    await message.answer(
+        f"Алерт — {info['short']} {fmt(rate, data['decimals'])}\n\n"
+        "Уведомлю, как только цена коснётся этого уровня. Сохранить?",
+        reply_markup=alert_confirm_kb(),
+    )
+
+
+@dp.message(AlertStates.waiting_confirm)
+async def alert_confirm_text(message: Message):
+    await message.answer("Нажми одну из кнопок:", reply_markup=alert_confirm_kb())
+
+
+@dp.callback_query(F.data == "alert_save", StateFilter(AlertStates.waiting_confirm))
+async def alert_save_cb(call: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    await state.clear()
+    pair, rate, d = data["pair"], data["rate"], data["decimals"]
+    database.add_alert(call.from_user.id, pair, rate)
+    info = resolve(pair)
+    print(f"Новый алерт: {info['short']} {fmt(rate, d)} (user_id={call.from_user.id})")
+    await call.message.answer(
+        f"🔔 Алерт сохранён.\nУведомлю, когда {info['short']} коснётся {fmt(rate, d)}.\n"
+        "Свои алерты — /myalerts.",
+        reply_markup=start_keyboard(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data == "alert_cancel", StateFilter(AlertStates.waiting_confirm))
+async def alert_cancel_cb(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.answer("Настройка алерта отменена.", reply_markup=start_keyboard())
+    await call.answer()
+
+
+# ── Список и удаление алертов ───────────────────────────────────────────────
+
+def _alert_label(a: dict) -> str:
+    """«Bitcoin 79200.00» — имя пары и уровень. Точность: фиксированная для реестра,
+    для своей пары — по величине уровня (цену тут не запрашиваем, чтобы /myalerts не
+    ходил в сеть на каждую строку)."""
+    info = resolve(a["pair"])
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(a["threshold"])
+    return f"{info['short']} {fmt(a['threshold'], d)}"
+
+
+def alerts_keyboard(rows: list[dict]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🗑 Удалить {_alert_label(a)}",
+                              callback_data=f"delalert_{a['id']}")]
+        for a in rows
+    ])
+
+
+def render_alerts(user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    """Текст списка алертов и клавиатура удаления (или None, если алертов нет)."""
+    rows = database.get_user_alerts(user_id)
+    if not rows:
+        return ("У тебя нет активных алертов.\n"
+                "Поставить: /alert или колокольчиком в отчёте /analyze."), None
+    lines = "\n".join(f"• {_alert_label(a)}" for a in rows)
+    return (f"🔔 Твои активные алерты:\n{lines}\n\n"
+            "Сработавший алерт снимается сам."), alerts_keyboard(rows)
+
+
+@dp.message(Command("myalerts"))
+async def cmd_myalerts(message: Message):
+    text, keyboard = render_alerts(message.from_user.id)
+    await message.answer(text, reply_markup=keyboard)
+
+
+@dp.callback_query(F.data.startswith("delalert_"))
+async def cb_delete_alert(call: CallbackQuery):
+    alert_id = int(call.data.removeprefix("delalert_"))
+    deleted = database.delete_alert(alert_id, call.from_user.id)
+    await call.answer("Удалён" if deleted else "Уже удалён")
+    text, keyboard = render_alerts(call.from_user.id)
+    try:
+        await call.message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest:
+        pass
 
 
 # ── Журнал сделок ────────────────────────────────────────────────────────────
@@ -550,12 +772,12 @@ def render_trades(user_id: int) -> tuple[str, InlineKeyboardMarkup | None]:
         arrow = "🟢" if t["direction"] == "long" else "🔴"
         label = TRADE_STATUS_LABEL.get(t["status"], t["status"])
         lines.append(
-            f"{arrow} {info['name']} — вход {fmt(t['entry_price'], d)}, "
+            f"{arrow} {info['short']} — вход {fmt(t['entry_price'], d)}, "
             f"стоп {fmt(t['stop_loss'], d)}, цель {fmt(t['take_profit'], d)} [{label}]"
         )
         if t["status"] == "open":
             rows.append([InlineKeyboardButton(
-                text=f"☑️ Закрыть {info['name']} {fmt(t['entry_price'], d)}",
+                text=f"☑️ Закрыть {info['short']} {fmt(t['entry_price'], d)}",
                 callback_data=f"closetrade_{t['id']}",
             )])
     kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
@@ -580,7 +802,7 @@ async def cb_close_trade(call: CallbackQuery):
 # ── Торговый движок: анализ, подписки, сигналы, настройки ───────────────────────
 
 def engine_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKeyboardMarkup:
-    """Кнопки инструментов движка — 16 фьючерсов BingX (по 2 в ряд). prefix — начало
+    """Кнопки инструментов движка — 21 фьючерс BingX (по 2 в ряд). prefix — начало
     callback_data. Если передан subscribed — отмечает галочкой подписанные (для /subscribe)."""
     codes = engine_codes()
     rows = []
@@ -589,7 +811,7 @@ def engine_keyboard(prefix: str, subscribed: set[str] | None = None) -> InlineKe
         for c in codes[i:i + 2]:
             mark = "✅ " if subscribed and c in subscribed else ""
             row.append(InlineKeyboardButton(
-                text=f"{mark}{INSTRUMENTS[c]['name']}", callback_data=f"{prefix}{c}"
+                text=f"{mark}{short(c)}", callback_data=f"{prefix}{c}"
             ))
         rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -648,8 +870,24 @@ def _format_orderbook(ob: dict, d: int) -> list[str]:
     return lines
 
 
-def _level_row(lvl: dict, d: int, above: bool) -> str:
-    """Строка уровня в отчёте: цена, сила, таймфрейм и расстояние в ATR."""
+def _alert_levels(ex: dict) -> list[tuple[dict, bool]]:
+    """Уровни отчёта в порядке показа: (уровень, выше ли он цены).
+
+    Один список и на текст, и на кнопки-колокольчики — чтобы строка в отчёте и
+    кнопка под ним не разъехались: пользователь ставит алерт на то число, которое
+    только что прочитал.
+    """
+    return ([(lvl, True) for lvl in reversed(ex["resistances"])]
+            + [(lvl, False) for lvl in ex["supports"]])
+
+
+def _level_row(lvl: dict, d: int, above: bool, bell: str = "") -> str:
+    """Строка уровня в отчёте: цена, сила, таймфрейм и расстояние в ATR.
+
+    bell — пометка перед ценой: 🔔 «на этот уровень можно поставить алерт кнопкой
+    ниже», ✅ «алерт уже стоит». Стоит именно у числа, потому что алерт ставится
+    ровно на это число.
+    """
     emoji = "🟥" if above else "🟩"
     word = "сопротивление" if above else "поддержка"
     star = " ⭐" if lvl["strength"] == "strong" else ""
@@ -658,15 +896,37 @@ def _level_row(lvl: dict, d: int, above: bool) -> str:
     side = "выше" if above else "ниже"
     dist = (f"{lvl['dist_atr']:.2f} ATR" if lvl.get("dist_atr") is not None
             else fmt(lvl["dist"], d))
-    return (f"  {emoji} {word} {fmt(lvl['price'], d)}{star}{tf} — {side} на {dist} "
+    return (f"  {emoji} {word} {bell}{fmt(lvl['price'], d)}{star}{tf} — {side} на {dist} "
             f"({lvl['dist_pct'] * 100:.2f}%)")
+
+
+def alert_levels_kb(code: str, prices: list[float], user_id: int,
+                    d: int) -> InlineKeyboardMarkup | None:
+    """Колокольчики под отчётом /analyze — по кнопке на каждый показанный уровень.
+
+    На кнопке только число: подпись должна оставаться короткой (урок /settings —
+    длинная обрезается на телефоне посреди цифр), а что это за уровень, написано
+    строкой выше в самом отчёте. ✅ — алерт уже стоит, нажатие его снимет.
+    """
+    if not prices:
+        return None
+    have = [a["threshold"] for a in database.get_user_alerts(user_id, code)]
+    buttons = [
+        InlineKeyboardButton(
+            text=("✅ " if any(_same_price(p, t) for t in have) else "🔔 ") + fmt(p, d),
+            callback_data=f"alrt:{code}:{p:.10g}",
+        )
+        for p in prices
+    ]
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 SIDE_WORD = {"long": "🟢 лонг", "short": "🔴 шорт"}
 
 
-def _format_engine_view(info: dict, ex: dict, zones: list[dict],
-                        ob: dict | None, signals: dict) -> str:
+def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None,
+                        signals: dict, alerted: list[float] | None = None) -> str:
     """Отчёт /analyze: те же пять условий, по которым движок принимает решение.
 
     Смысл не в описании рынка вообще, а в ответе на вопрос «что здесь происходит
@@ -684,7 +944,7 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict],
     live = [s for s in ("long", "short") if ex["sides"][s]["trend_ok"]]
 
     lines = [
-        f"📊 {info['name']} — что видит движок",
+        f"📊 {info['short']} — что видит движок",
         f"Цена (закрытие часовой свечи {ex['bar_time'][:16]} UTC): {fmt(c, d)}",
         f"Средний размах свечи (ATR): {fmt(ex['atr'], d)} — это {ex['atr_pct'] * 100:.2f}% цены",
         "",
@@ -692,9 +952,18 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict],
         "",
         "2. Ближайшие уровни (расстояние — в ATR, единой мерке для всех инструментов):",
     ]
-    rows = [_level_row(l, d, above=True) for l in reversed(ex["resistances"])]
-    rows += [_level_row(l, d, above=False) for l in ex["supports"]]
+    # Колокольчик у каждой цены — на неё можно повесить алерт кнопкой под отчётом.
+    have = alerted or []
+    rows = [
+        _level_row(lvl, d, above=above,
+                   bell=("✅ " if any(_same_price(t, lvl["price"]) for t in have)
+                         else "🔔 "))
+        for lvl, above in _alert_levels(ex)
+    ]
     lines += rows or ["  — уровней рядом нет"]
+    if rows:
+        lines.append("  🔔 — кнопкой под отчётом поставлю алерт на этот уровень "
+                     "(✅ — уже стоит, нажатие снимет).")
 
     mark = "✅" if ex["sides"][live[0]]["vol_ok"] else "❌"
     lines += [
@@ -794,7 +1063,7 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
         return f"{word}: " + ", ".join(parts)
 
     out = [
-        f"Инструмент: {info['name']}",
+        f"Инструмент: {info['short']}",
         f"Цена (закрытие H1): {fmt(c, d)}; ATR {fmt(ex['atr'], d)} "
         f"({ex['atr_pct'] * 100:.2f}% цены)",
         f"Тренд D1: {ex['trend']} (разрешает: {', '.join(live)})",
@@ -831,7 +1100,7 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
 
 async def _do_analyze(message: Message, code: str, user_id: int):
     info = resolve(code)
-    waiting = await message.answer(f"Анализирую {info['name']}...")
+    waiting = await message.answer(f"Анализирую {info['short']}...")
     try:
         # Свечи берём из источника инструмента — для всего движка это фьючерсы BingX.
         d1 = await engine.fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
@@ -871,7 +1140,15 @@ async def _do_analyze(message: Message, code: str, user_id: int):
             ob = None
 
     await waiting.delete()
-    await message.answer(_format_engine_view(info, ex, zones, ob, signals))
+    # Колокольчики: уровни отчёта кнопками. Уже поставленные алерты по этому
+    # инструменту отмечаем и в тексте, и на кнопке — одним запросом к базе.
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(ex["close"])
+    have = [a["threshold"] for a in database.get_user_alerts(user_id, code)]
+    prices = [lvl["price"] for lvl, _ in _alert_levels(ex)]
+    await message.answer(
+        _format_engine_view(info, ex, zones, ob, signals, alerted=have),
+        reply_markup=alert_levels_kb(code, prices, user_id, d),
+    )
 
     # Гибрид: AI комментирует РАСКЛАД, а не пересказывает числа. Ошибка LLM не критична.
     try:
@@ -880,8 +1157,60 @@ async def _do_analyze(message: Message, code: str, user_id: int):
         )
         # Подписываем, по какому инструменту разбор — сообщения в ленте отрываются
         # от заголовка, и без имени непонятно, о чём речь.
-        await message.answer(f"🤖 {info['name']} — разбор:\n\n{comment}")
+        await message.answer(f"🤖 {info['short']} — разбор:\n\n{comment}")
     except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("alrt:"))
+async def cb_alert_level(call: CallbackQuery):
+    """Колокольчик под /analyze: ставит алерт на уровень, повторное нажатие — снимает.
+
+    Уровень движок уже посчитал, поэтому число не вводится руками — оно едет в
+    callback_data кнопки. Оттуда же берутся цены для перерисовки клавиатуры: считать
+    весь отчёт заново ради одной галочки незачем.
+    """
+    try:
+        _, code, raw = call.data.split(":")
+        price = float(raw)
+    except ValueError:
+        await call.answer("Кнопка устарела — открой /analyze заново", show_alert=True)
+        return
+    user_id = call.from_user.id
+    info = resolve(code)
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(price)
+
+    same = [a for a in database.get_user_alerts(user_id, code)
+            if _same_price(a["threshold"], price)]
+    if same:
+        for a in same:
+            database.delete_alert(a["id"], user_id)
+        await call.answer(f"Алерт на {fmt(price, d)} снят")
+    else:
+        database.add_alert(user_id, code, price)
+        await call.answer(f"🔔 {fmt(price, d)} — напишу, когда цена дойдёт")
+
+    markup = call.message.reply_markup
+    prices = [float(b.callback_data.split(":")[2])
+              for row in (markup.inline_keyboard if markup else [])
+              for b in row if (b.callback_data or "").startswith("alrt:")]
+    keyboard = alert_levels_kb(code, prices, user_id, d)
+
+    # Пометку в самом отчёте переставляем тоже: колокольчик стоит у числа, и если
+    # оставить его прежним, текст начнёт спорить с кнопкой. Правим ровно одну строку —
+    # ту, где стоит эта цена, — вместо пересчёта всего отчёта ради одной галочки.
+    # Строка-пояснение («🔔 — кнопкой под отчётом…») не заденется: ищем пометку
+    # вместе с числом.
+    was, now = ("✅ ", "🔔 ") if same else ("🔔 ", "✅ ")
+    label = fmt(price, d)
+    text = call.message.text or ""
+    try:
+        if was + label in text:
+            await call.message.edit_text(text.replace(was + label, now + label, 1),
+                                         reply_markup=keyboard)
+        else:
+            await call.message.edit_reply_markup(reply_markup=keyboard)
+    except TelegramBadRequest:
         pass
 
 
@@ -963,7 +1292,7 @@ async def cmd_signals(message: Message):
         rr = abs(s["take_profit"] - s["entry_price"]) / risk if risk else 0
         word = "заявка" if s["status"] == "waiting_fill" else "вход"
         lines.append(
-            f"{arrow}{star} {info['name']} {pat} — {word} {fmt(s['entry_price'], d)}, "
+            f"{arrow}{star} {info['short']} {pat} — {word} {fmt(s['entry_price'], d)}, "
             f"стоп {fmt(s['stop_loss'], d)}, цель {fmt(s['take_profit'], d)} "
             f"(1:{rr:.1f}) [{label}]"
         )
@@ -1092,7 +1421,7 @@ def render_stats(user_id: int, period: str) -> tuple[str, InlineKeyboardMarkup]:
         for code, d in sorted(st["by_instrument"].items(),
                               key=lambda kv: kv[1]["net"], reverse=True):
             info = resolve(code)
-            lines.append(f"  • {info['name']}: {d['net']:+.1f}R "
+            lines.append(f"  • {info['short']}: {d['net']:+.1f}R "
                          f"({d['tp']}✅/{d['sl']}🛑)")
 
     return "\n".join(lines), keyboard
@@ -1433,23 +1762,68 @@ async def _nl_log_trade(message: Message, state: FSMContext, intent: dict) -> No
         await message.answer("Не понял направление: стоп должен быть по одну сторону от "
                              "входа, а цель — по другую. Проверь числа.")
         return
-    info = resolve(raw)
-    in_registry = raw in INSTRUMENTS
-    try:
-        window = await asyncio.to_thread(database.get_price_window, info["ticker"], info["decimals"])
-        decimals = window["decimals"]
-    except Exception:
-        if not in_registry:
-            await message.answer(f"Не нашёл инструмент «{raw}». Уточни тикер.")
+    pair = raw
+    if raw not in INSTRUMENTS:
+        # Своя пара: ищем контракт на бирже и храним его символ. Не нашли — записывать
+        # нечего: вести сделку до цели/стопа будет не по чему.
+        pair = await data_fetcher.find_symbol(raw)
+        if pair is None:
+            await message.answer(
+                f"Не нашёл «{raw}» среди бессрочных контрактов BingX. Журнал ведёт "
+                "сделку по биржевым свечам, поэтому нужен контракт с биржи."
+            )
             return
-        decimals = info["decimals"] if info["decimals"] is not None else infer_decimals(entry)
+    info = resolve(pair)
+    decimals = info["decimals"] if info["decimals"] is not None else infer_decimals(entry)
     await state.set_state(NLConfirm.waiting)
-    await state.update_data(kind="trade", pair=raw, direction=direction,
+    await state.update_data(kind="trade", pair=pair, direction=direction,
                             entry=entry, stop=stop, target=target, decimals=decimals)
     arrow = "🟢 лонг" if direction == "long" else "🔴 шорт"
     await message.answer(
-        f"Записать сделку в журнал: {info['name']} {arrow}\n"
+        f"Записать сделку в журнал: {info['short']} {arrow}\n"
         f"вход {fmt(entry, decimals)}, стоп {fmt(stop, decimals)}, цель {fmt(target, decimals)}?",
+        reply_markup=nl_confirm_kb(),
+    )
+
+
+async def _nl_set_alert(message: Message, state: FSMContext, intent: dict) -> None:
+    """Намерение «поставить алерт» из текста: проверяем уровень и инструмент, просим
+    подтвердить кнопкой — на случай, если модель не так расслышала число."""
+    raw = str(intent.get("instrument") or "").strip().upper()
+    try:
+        level = float(str(intent.get("level")).replace(",", "."))
+        if level <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        await message.answer("Понял, что нужен алерт, но не разобрал уровень. "
+                             "Напиши, например: «алерт золото 2400».")
+        return
+    if not raw:
+        await message.answer("На какой инструмент ставим алерт? "
+                             "Например: «алерт биткоин 70000».")
+        return
+    pair = raw
+    if raw not in INSTRUMENTS:
+        pair = await data_fetcher.find_symbol(raw)
+        if pair is None:
+            await message.answer(f"Не нашёл «{raw}» среди контрактов BingX. Уточни "
+                                 "название или поставь алерт через /alert.")
+            return
+    info = resolve(pair)
+    try:
+        # Той же дорогой, что и проверка алертов, — с биржи. Заодно проверяем, что
+        # контракт живой и цена по нему идёт.
+        window = await engine.alert_window(pair)
+    except Exception:
+        await message.answer(f"Цена по «{info['short']}» сейчас не приходит. Попробуй "
+                             "позже или поставь алерт через /alert.")
+        return
+    d = window["decimals"]
+    await state.set_state(NLConfirm.waiting)
+    await state.update_data(kind="alert", pair=pair, level=level, decimals=d)
+    await message.answer(
+        f"Поставить алерт: {info['short']} {fmt(level, d)}? "
+        f"(сейчас {fmt(window['last'], d)})",
         reply_markup=nl_confirm_kb(),
     )
 
@@ -1457,24 +1831,23 @@ async def _nl_log_trade(message: Message, state: FSMContext, intent: dict) -> No
 async def _nl_subscribe(message: Message, intent: dict, action: str) -> None:
     code = str(intent.get("instrument") or "").strip().upper()
     if code not in engine_codes():
-        await message.answer("Подписка на сигналы — по крипте, золоту и нефти "
-                             "(фьючерсы BingX). Открой /subscribe и выбери инструмент.")
+        await message.answer("Подписка на сигналы — по крипте, золоту, нефти и валютным "
+                             "парам (фьючерсы BingX). Открой /subscribe и выбери инструмент.")
         return
     info = resolve(code)
     if action == "subscribe":
         database.add_subscription(message.from_user.id, code)
-        await message.answer(f"Подписал на сигналы по {info['name']}. Управление — /subscribe.")
+        await message.answer(f"Подписал на сигналы по {info['short']}. Управление — /subscribe.")
     else:
         database.remove_subscription(message.from_user.id, code)
-        await message.answer(f"Отписал от сигналов по {info['name']}.")
+        await message.answer(f"Отписал от сигналов по {info['short']}.")
 
 
 async def _nl_analyze(message: Message, intent: dict) -> None:
     code = str(intent.get("instrument") or "").strip().upper()
     if code not in engine_codes():
-        await message.answer("Анализ — по инструментам движка: BTC, ETH, SOL, TON, XRP, ADA, "
-                             "XLM, AVAX, SUI, UNI, LTC, AAVE, DOGE, LINK, Золото, Нефть. "
-                             "Выбрать — /analyze.")
+        await message.answer("Анализ — по инструментам движка: " +
+                             ", ".join(engine_codes()) + ".\nВыбрать — /analyze.")
         return
     await _do_analyze(message, code, message.from_user.id)
 
@@ -1485,7 +1858,11 @@ async def free_text(message: Message, state: FSMContext):
     Любая осечка роутера безопасно сводится к чату (см. llm.classify_intent)."""
     intent = await classify_intent(message.text or "")
     action = intent.get("action")
-    if action == "log_trade":
+    if action == "set_alert":
+        await _nl_set_alert(message, state, intent)
+    elif action == "my_alerts":
+        await cmd_myalerts(message)
+    elif action == "log_trade":
         await _nl_log_trade(message, state, intent)
     elif action == "analyze":
         await _nl_analyze(message, intent)
@@ -1507,13 +1884,19 @@ async def cb_nl_ok(call: CallbackQuery, state: FSMContext):
     await state.clear()
     info = resolve(data["pair"])
     d = data["decimals"]
-    if data.get("kind") == "trade":
+    if data.get("kind") == "alert":
+        database.add_alert(call.from_user.id, data["pair"], data["level"])
+        await call.message.edit_text(
+            f"🔔 Алерт сохранён: {info['short']} {fmt(data['level'], d)}. "
+            "Уведомлю при касании. Список — /myalerts."
+        )
+    elif data.get("kind") == "trade":
         bar_time = datetime.now(timezone.utc).isoformat(timespec="seconds")
         database.add_trade(call.from_user.id, data["pair"], data["direction"],
                            data["entry"], data["stop"], data["target"], bar_time)
         arrow = "🟢 лонг" if data["direction"] == "long" else "🔴 шорт"
         await call.message.edit_text(
-            f"Записал в журнал: {info['name']} {arrow}, вход {fmt(data['entry'], d)}, "
+            f"Записал в журнал: {info['short']} {arrow}, вход {fmt(data['entry'], d)}, "
             f"стоп {fmt(data['stop'], d)}, цель {fmt(data['target'], d)}.\n"
             "Напишу, когда цена дойдёт до цели или стопа. Журнал — /trades."
         )
@@ -1545,6 +1928,8 @@ async def main():
     # она доступна всем — подписчик крутит там СВОЮ строгость отбора, админ — общий дефолт.
     await bot.set_my_commands([
         BotCommand(command="start",       description="Главное меню"),
+        BotCommand(command="alert",       description="Алерт: уведомить при касании уровня"),
+        BotCommand(command="myalerts",    description="Мои алерты"),
         BotCommand(command="analyze",     description="Разбор инструмента глазами движка"),
         BotCommand(command="subscribe",   description="Подписка на торговые сигналы"),
         BotCommand(command="signals",     description="Последние сигналы"),
@@ -1572,6 +1957,8 @@ async def main():
                 BotCommand(command="broadcast", description="Рассылка всем: /broadcast текст"),
                 BotCommand(command="settings",  description="Строгость отбора сигналов"),
                 BotCommand(command="start",     description="Главное меню"),
+                BotCommand(command="alert",     description="Алерт: уведомить при касании уровня"),
+                BotCommand(command="myalerts",  description="Мои алерты"),
                 BotCommand(command="analyze",   description="Разбор инструмента глазами движка"),
                 BotCommand(command="subscribe", description="Подписка на торговые сигналы"),
                 BotCommand(command="signals",   description="Последние сигналы"),
