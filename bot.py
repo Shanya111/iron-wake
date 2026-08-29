@@ -181,8 +181,8 @@ async def cmd_start(message: Message):
         return
 
     await message.answer(
-        f"Привет, {user.first_name}! Я iron-wake — торговый ассистент по 21 фьючерсу "
-        "BingX (крипта, золото, нефть, валютные пары). Разбираю расклад по методике VSA "
+        f"Привет, {user.first_name}! Я iron-wake — торговый ассистент по 16 фьючерсам "
+        "BingX (14 крипто-пар, золото, нефть). Разбираю расклад по методике VSA "
         "и присылаю сигналы ложного пробоя (Spring/Upthrust) с ценой заявки, стопом и "
         "целью.\n\n"
         "Разбор инструмента — /analyze. Подписка на сигналы — /subscribe. "
@@ -421,8 +421,8 @@ async def cmd_help(message: Message):
 
 
 ABOUT_TEXT = (
-    "iron-wake — торговый ассистент по 21 бессрочному фьючерсу BingX "
-    "(14 крипто-пар, золото, нефть Brent, 5 валютных пар).\n\n"
+    "iron-wake — торговый ассистент по 16 бессрочным фьючерсам BingX "
+    "(14 крипто-пар, золото, нефть Brent).\n\n"
     "Разбирает рынок по методике VSA: тренд дневки, уровни, объём, стакан заявок. "
     "Ищет ложные пробои Spring и Upthrust и присылает сигнал с ценой лимитной "
     "заявки, стопом и целью — а потом сам доводит его до исхода.\n\n"
@@ -984,17 +984,19 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
             what = (s["break_note"] or "нет") + " ❌"
         lines.append(f"  {SIDE_WORD[side]}: {what}")
 
-    lines += ["", "5. Профит/риск, если бы входили прямо сейчас:"]
+    lines += ["", "5. Профит/риск, если бы входили прямо сейчас (справка, не порог):"]
     for side in live:
         s = ex["sides"][side]
         if s["rr"] is None:
             lines.append(f"  {SIDE_WORD[side]}: не посчитать (свеча без размаха)")
             continue
-        ok = "✅" if s["rr"] >= config.MIN_RR else "❌"
+        # Ни галочки, ни слова «нужно»: порога R:R больше нет, сигнал берётся с
+        # любым встречным уровнем. Число оставлено как справка — по нему видно,
+        # тесно впереди или просторно.
         tgt = (f"цель {fmt(s['target'], d)}" if s["target"] is not None
-               else f"цели впереди нет — ставится на {config.MIN_RR:g} риска")
+               else f"цели впереди нет — ставится на {config.FALLBACK_RR:g} риска")
         lines.append(
-            f"  {SIDE_WORD[side]}: 1:{s['rr']:.1f} (нужно 1:{config.MIN_RR:g}) {ok} — "
+            f"  {SIDE_WORD[side]}: 1:{s['rr']:.1f} — "
             f"риск {fmt(s['risk'], d)} ({s['risk_atr']:.2f} ATR), {tgt}")
 
     # Итог: что мешает — по каждой разрешённой трендом стороне.
@@ -1014,22 +1016,13 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
     if not fired:
         lines.append("  Ждём: сигнал родится на той свече, которая закроет все пункты выше.")
 
-    if ex.get("fx"):
-        # У валютных пар свои пороги детектора, а фильтры строгости к ним не
-        # применяются (см. config.FX_BREAK_ATR). Сказать это обязательно: иначе
-        # пользователь читает про отбор, которого на этой паре не происходит.
-        lines += ["", "⚙️ Валютная пара — пороги свои: глубина пробоя "
-                  f"{config.FX_BREAK_ATR:g} ATR, запас стопа {config.FX_STOP_ATR:g} ATR.",
-                  "     Фильтры из /settings к валютным парам НЕ применяются — они "
-                  "настроены на крипту и забраковали бы такой сигнал всегда.",
-                  "     ⚠️ Замер этой конфигурации отрицательный: сигналов много, но "
-                  "издержки съедают больше, чем сделка приносит."]
-    else:
-        f = ex["filters"]
-        fl = ["вход у уровня " + (f"≤ {f['MAX_ENTRY_DIST_ATR']:g} ATR"
-                                  if f["MAX_ENTRY_DIST_ATR"] else "выкл"),
-              "вдогонку " + (f"≤ {f['MAX_RISK_ATR']:g} ATR" if f["MAX_RISK_ATR"] else "выкл")]
-        lines += ["", f"⚙️ Твои фильтры отбора: {', '.join(fl)} (меняются в /settings)"]
+    f = ex["filters"]
+    fl = ["вход у уровня " + (f"≤ {f['MAX_ENTRY_DIST_ATR']:g} ATR"
+                              if f["MAX_ENTRY_DIST_ATR"] else "выкл"),
+          "вдогонку " + (f"≤ {f['MAX_RISK_ATR']:g} ATR" if f["MAX_RISK_ATR"] else "выкл")]
+    lines += ["", f"⚙️ Твои фильтры отбора: {', '.join(fl)} (меняются в /settings)",
+              f"     Пороги движка: прокол ≥ {config.BREAK_ATR:g} ATR, "
+              f"запас стопа {config.STOP_ATR:g} ATR, объём ×{config.VOL_MULT:g}"]
 
     if zones:
         near = sorted(zones, key=lambda z: abs(z["price"] - c))[:6]
@@ -1079,8 +1072,9 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
         else:
             out.append(f"{side}: сигнала нет, мешает — " + "; ".join(s["blockers"]))
         if s["rr"] is not None:
-            out.append(f"{side}: профит/риск при входе сейчас 1:{s['rr']:.1f} "
-                       f"(порог 1:{config.MIN_RR:g})")
+            # Порога R:R у движка нет — модели даём число без слова «порог», иначе
+            # она начнёт объяснять отбраковку, которой не происходит.
+            out.append(f"{side}: профит/риск при входе сейчас 1:{s['rr']:.1f}")
     if zones:
         out.append("Зоны ликвидности: " + ", ".join(
             fmt(z["price"], d)
@@ -1116,7 +1110,7 @@ async def _do_analyze(message: Message, code: str, user_id: int):
 
     # Разбор — по ЛИЧНЫМ фильтрам пользователя: он должен видеть свой отбор, а не чужой.
     settings = config.effective(database.get_user_settings(user_id))
-    ex = pattern_detector.explain(h1, levels, trend, settings, code)
+    ex = pattern_detector.explain(h1, levels, trend, settings)
     if not ex.get("enough_history"):
         await waiting.delete()
         await message.answer("Слишком мало часовых свечей для разбора, попробуй позже.")
@@ -1124,8 +1118,8 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     # Сам детектор гоняем тоже: если сигнал есть, показываем ЕГО числа, а не свои
     # пересчёты. Заодно это страховка от расхождения explain() и _detect.
     signals = {
-        "long": pattern_detector.detect_spring(h1, levels, trend, settings, code),
-        "short": pattern_detector.detect_upthrust(h1, levels, trend, settings, code),
+        "long": pattern_detector.detect_spring(h1, levels, trend, settings),
+        "short": pattern_detector.detect_upthrust(h1, levels, trend, settings),
     }
 
     # Стакан (DOM) есть у всех инструментов движка (BingX), включая золото и нефть —
@@ -1534,9 +1528,8 @@ def settings_text(user_id: int, is_admin: bool) -> str:
         "• «вдогонку» — не берём, если сам риск сделки (вход → стоп) великоват.\n"
         "Меряется в ATR (средний размах свечи): «0.1% от цены» у биткоина и у золота "
         "значит разное, а «0.1 ATR» — одно и то же.\n"
-        "⚠️ К валютным парам (EUR/USD, GBP/USD, AUD/USD, USD/CAD, USD/JPY) эти фильтры "
-        "НЕ применяются: у форекса свои пороги, а эти настроены на крипту и "
-        "забраковали бы форекс-сигнал всегда.\n\n"
+        "Фильтры действуют на все 16 инструментов движка одинаково — валютных пар "
+        "в движке больше нет.\n\n"
         "На кнопке — что ты получишь по замеру за 833 дня на 14 инструментах BingX: "
         "сколько сигналов в месяц и какая выходит средняя сделка (в R, округлённо). "
         "Работает ровно ОДНА кнопка: нажал новую — прежняя выключилась.\n"
@@ -1831,8 +1824,8 @@ async def _nl_set_alert(message: Message, state: FSMContext, intent: dict) -> No
 async def _nl_subscribe(message: Message, intent: dict, action: str) -> None:
     code = str(intent.get("instrument") or "").strip().upper()
     if code not in engine_codes():
-        await message.answer("Подписка на сигналы — по крипте, золоту, нефти и валютным "
-                             "парам (фьючерсы BingX). Открой /subscribe и выбери инструмент.")
+        await message.answer("Подписка на сигналы — по крипте, золоту и нефти "
+                             "(фьючерсы BingX). Открой /subscribe и выбери инструмент.")
         return
     info = resolve(code)
     if action == "subscribe":

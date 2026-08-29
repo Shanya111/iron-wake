@@ -9,8 +9,9 @@
   • track_trades (каждые 5 мин) — исход сделок журнала;
   • check_alerts (каждые 5 мин) — алерты «касание уровня» (правило — в alerts.py).
 
-Анализируются инструменты движка (есть источник объёма) из числа подписанных —
-лишние пары не дёргаем. Источник данных в боте ровно один — БИРЖА BingX: и движок,
+Анализируются инструменты движка (16: крипта + золото + нефть) из числа подписанных —
+лишние пары не дёргаем. Валютные пары в движок не входят, но алерты и журнал по ним
+работают: у них есть биржевой источник, просто сигналов по ним нет. Источник данных в боте ровно один — БИРЖА BingX: и движок,
 и журнал сделок, и алерты берут свечи через fetch_candles. Yahoo убран 26 августа 2026.
 """
 
@@ -25,7 +26,7 @@ import data_fetcher
 import database
 import llm
 import pattern_detector
-from instruments import ccxt_symbol, data_source, fmt, infer_decimals, resolve, short
+from instruments import ccxt_symbol, engine_codes, fmt, infer_decimals, resolve, short
 
 
 async def fetch_candles(code: str, timeframe: str, limit: int):
@@ -46,8 +47,16 @@ async def fetch_candles(code: str, timeframe: str, limit: int):
 
 
 def _subscribed_engine() -> list[str]:
-    """Инструменты с подпиской, входящие в движок (есть биржевой источник)."""
-    return [c for c in database.get_subscribed_instruments() if data_source(c)]
+    """Инструменты с подпиской, входящие в движок.
+
+    Спрашиваем именно engine_codes(), а не «есть ли источник данных»: с 29 августа
+    2026 у валютных пар источник есть (он нужен алертам и журналу), но в движок они
+    не входят. Проверка по источнику продолжила бы их сканировать.
+
+    Старые подписки на форекс в базе от этого не ломаются — они просто перестают
+    давать сигналы."""
+    engine = set(engine_codes())
+    return [c for c in database.get_subscribed_instruments() if c in engine]
 
 
 async def run_analysis(bot=None) -> None:
@@ -108,8 +117,7 @@ async def monitor_signals(bot) -> None:
         for user_id in subscribers:
             settings = config.effective(database.get_user_settings(user_id))
             for detector in (pattern_detector.detect_spring, pattern_detector.detect_upthrust):
-                # code обязателен: у валютных пар свои пороги детектора.
-                signal = detector(h1, levels, trend, settings, code)
+                signal = detector(h1, levels, trend, settings)
                 if signal is None:
                     continue
                 # Дедуп персональный: тот же паттерн тому же пользователю не чаще,
