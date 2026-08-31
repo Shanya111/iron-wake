@@ -455,7 +455,13 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
 
 def evaluate_fill(signal: dict, df: pd.DataFrame, wait_bars: int | None = None,
                   optimistic: bool = False) -> dict:
-    """Исполнилась ли лимитная заявка. {'status', 'fill_time', 'stopped_at_fill'}.
+    """Исполнилась ли лимитная заявка.
+
+    Возвращает {'status', 'fill_time', 'stopped_at_fill', 'reason'}. `reason` заполняется
+    только при 'expired_unfilled' и говорит, ПОЧЕМУ сделки не было: 'target' — цена ушла
+    к цели, не задев заявку; 'timeout' — за отведённые часы до заявки не дошла; 'stale' —
+    свеча пробоя старше всего окна свечей (бот лежал). Причины разные по смыслу, и
+    сообщение пользователю обязано их различать.
 
     status:
       • 'waiting_fill'     — время ещё есть, цена до заявки не дошла, ждём;
@@ -487,7 +493,7 @@ def evaluate_fill(signal: dict, df: pd.DataFrame, wait_bars: int | None = None,
     # снимаем её, а не гадаем.
     if len(df) and pd.Timestamp(bar_time) < df.index[0]:
         return {"status": "expired_unfilled", "fill_time": None,
-                "stopped_at_fill": False}
+                "stopped_at_fill": False, "reason": "stale"}
     after = df[df.index > pd.Timestamp(bar_time)]
 
     for n, (ts, c) in enumerate(after.iloc[:wait_bars].iterrows(), start=1):
@@ -497,13 +503,13 @@ def evaluate_fill(signal: dict, df: pd.DataFrame, wait_bars: int | None = None,
         hit_stop = lo <= stop if long else hi >= stop
         if hit_tp and not (hit_limit and optimistic):
             return {"status": "expired_unfilled", "fill_time": None,
-                    "stopped_at_fill": False}
+                    "stopped_at_fill": False, "reason": "target"}
         if hit_limit:
             return {"status": "filled", "fill_time": str(ts),
                     "stopped_at_fill": bool(hit_stop)}
     if len(after) >= wait_bars:
         return {"status": "expired_unfilled", "fill_time": None,
-                "stopped_at_fill": False}
+                "stopped_at_fill": False, "reason": "timeout"}
     return {"status": "waiting_fill", "fill_time": None, "stopped_at_fill": False}
 
 

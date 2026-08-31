@@ -173,6 +173,7 @@ async def track_signals(bot) -> None:
             if fill["status"] == "waiting_fill":
                 continue
             if fill["status"] == "expired_unfilled":
+                s["fill_reason"] = fill.get("reason")
                 database.update_signal_status(s["id"], "expired_unfilled")
                 print(f"[track_signals] {s['instrument']} #{s['id']} → заявка не исполнена")
                 await _notify_unfilled(bot, s)
@@ -208,10 +209,20 @@ async def _notify_unfilled(bot, signal: dict) -> None:
     так и провисит в терминале и однажды сработает не вовремя."""
     info = resolve(signal["instrument"])
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(signal["entry_price"])
+    # Причина важна: «ушла к цели без нас» и «не дошла за N часов» — разные события.
+    # При заявке по закрытию свечи (ENTRY_PULLBACK = 0) преобладает первое.
+    if signal.get("fill_reason") == "target":
+        why = (f"Цена ушла к цели, не задев {fmt(signal['entry_price'], d)}. "
+               "Сделки не было — движение случилось без нас.")
+    elif signal.get("fill_reason") == "stale":
+        why = (f"Заявка по {fmt(signal['entry_price'], d)} протухла: я не видел свечей "
+               "с момента сигнала. Сделки не было.")
+    else:
+        why = (f"Цена так и не дошла до {fmt(signal['entry_price'], d)} "
+               f"за {config.ENTRY_WAIT_BARS} ч. Сделки не было.")
     await _send_to_owner(bot, signal, (
         f"⏹ Заявка снята — {info['short']}\n"
-        f"Цена так и не дошла до {fmt(signal['entry_price'], d)} "
-        f"за {config.ENTRY_WAIT_BARS} ч. Сделки не было.\n"
+        f"{why}\n"
         "Если заявка ещё стоит в терминале — сними её."
     ))
 

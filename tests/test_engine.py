@@ -341,12 +341,16 @@ def test_unfilled_when_price_runs_to_target():
     df = _df([(105, 105.5, 104, 105, 10), (105, 107, 104, 106, 10)])
     res = pattern_detector.evaluate_fill(_limit_signal(), df, wait_bars=4)
     assert res["status"] == "expired_unfilled"
+    # Причину бот называет вслух («ушла к цели» вместо «не дошла за 4 ч»), поэтому
+    # она обязана быть верной — иначе сообщение врёт о том, что случилось.
+    assert res["reason"] == "target"
 
 
 def test_unfilled_when_time_runs_out():
     df = _df([(105, 105.5, 104, 105, 10)] * 5)
     res = pattern_detector.evaluate_fill(_limit_signal(), df, wait_bars=4)
     assert res["status"] == "expired_unfilled"
+    assert res["reason"] == "timeout"
 
 
 def test_unfilled_when_breakout_older_than_window():
@@ -357,6 +361,7 @@ def test_unfilled_when_breakout_older_than_window():
     s["bar_time"] = "2023-12-25 00:00:00+00:00"     # сильно раньше окна
     res = pattern_detector.evaluate_fill(s, df, wait_bars=4)
     assert res["status"] == "expired_unfilled"
+    assert res["reason"] == "stale"
 
 
 def test_outcome_counted_from_fill_not_breakout():
