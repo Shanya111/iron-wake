@@ -16,6 +16,12 @@ Upthrust — зеркало по сопротивлению (пробой вве
 Отсюда следствие для кода: ATR нужен ВСЕГДА, а не только когда включён хоть один
 фильтр строгости. Нет ATR (плоские свечи) — сигнала нет.
 
+── Стоп за ДАЛЬНИМ из двух часовых экстремумов (29 августа 2026) ────────────────
+Стоп уходит не за экстремум одной только свечи свипа, а за дальний из неё и предыдущей
+(config.STOP_STRUCT_BARS), плюс запас в долях ATR. Сетап — это пара свечей: свип выносит
+стопы фитилём, структура образована соседним баром. Стоп внутри пары сносится
+собственным шумом сетапа.
+
 ── Фильтра R:R больше НЕТ (29 августа 2026) ─────────────────────────────────────
 Цель — ближайший встречный уровень, какой есть. Прежний порог 1:2 отбрасывал сигнал,
 если до уровня было мало места; он срезал около 80% сетапов, и снят по решению
@@ -86,6 +92,24 @@ def _atr(df: pd.DataFrame, pos: int, period: int | None = None) -> float:
         (window["low"] - prev_close).abs(),
     ], axis=1).max(axis=1)
     return float(tr.mean())
+
+
+def _stop_extreme(df: pd.DataFrame, pos: int, side: str, bars: int | None = None) -> float:
+    """Экстремум, ЗА который уходит стоп: дальний из свечи свипа и `bars` предыдущих.
+
+    Для лонга это минимум окна, для шорта — максимум. При bars=0 возвращается экстремум
+    самой свечи свипа, то есть прежнее поведение.
+
+    Смысл в том, что сетап — это не одна свеча. Свип выносит стопы фитилём, а сама
+    структура (уровень, с которого пошло движение) обычно образована парой соседних
+    баров. Стоп внутри этой пары стоит там, где его снесёт собственный шум сетапа.
+
+    Общая для _detect и explain намеренно, как _stop_buffer и _break_depth: разъедутся —
+    и /analyze покажет не тот риск, по которому движок принимает решение.
+    """
+    bars = config.STOP_STRUCT_BARS if bars is None else bars
+    window = df.iloc[max(0, pos - bars):pos + 1]
+    return float(window["low"].min()) if side == "long" else float(window["high"].max())
 
 
 def _stop_buffer(atr: float) -> float:
@@ -186,9 +210,11 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     # большой — тогда вход по её закрытию оказывается в конце размашистого бара, а
     # пружина торгуется ОТ уровня, а не вдогонку. Риск от УРОВНЯ не зависит (вход —
     # закрытие, стоп — экстремум той же свечи), поэтому считаем один раз до перебора.
+    # Экстремум для стопа берём ОДИН РАЗ: он зависит только от свечей, не от уровня.
+    extreme = _stop_extreme(df, pos, side)
     if max_risk_atr:
         buffer = _stop_buffer(atr)
-        risk_now = (c - l + buffer) if side == "long" else (h - c + buffer)
+        risk_now = (c - extreme + buffer) if side == "long" else (extreme - c + buffer)
         if risk_now > atr * max_risk_atr:
             return None
 
@@ -228,12 +254,12 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
         # цену входа, а какие сетапы вообще берём, решает та же логика. Иначе замер
         # «что даёт лимитный вход» смешал бы эффект входа с эффектом отбора.
         if side == "long":
-            stop = l - _stop_buffer(atr)
+            stop = extreme - _stop_buffer(atr)
             risk = c - stop
             target = _nearest(levels, "resistance", c, above=True)
             tp = target if target is not None else c + risk * config.FALLBACK_RR
         else:
-            stop = h + _stop_buffer(atr)
+            stop = extreme + _stop_buffer(atr)
             risk = stop - c
             target = _nearest(levels, "support", c, above=False)
             tp = target if target is not None else c - risk * config.FALLBACK_RR
@@ -338,7 +364,8 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
         risk_atr_now = None
         if atr > 0:
             buffer = _stop_buffer(atr)
-            risk_now = (c - l + buffer) if side == "long" else (h - c + buffer)
+            extreme = _stop_extreme(df, pos, side)
+            risk_now = (c - extreme + buffer) if side == "long" else (extreme - c + buffer)
             risk_atr_now = risk_now / atr
             if max_risk_atr and risk_atr_now > max_risk_atr:
                 blockers.append(

@@ -597,6 +597,70 @@ def test_stop_buffer_in_atr():
     assert sig["stop_loss"] > 1.09980 * (1 - 0.001)
 
 
+# ── Стоп за ДАЛЬНИМ из двух часовых экстремумов ─────────────────────────────
+#
+# Смысл: сетап — это пара свечей, а не одна. Бывает, что стопы вынесло свечой ПЕРЕД
+# свипом, и она ушла глубже. Стоп за экстремумом одной только свечи свипа оказался бы
+# внутри уже случившегося прокола — там его сносит собственным шумом сетапа.
+#
+# Фикстура ниже построена ровно под этот случай и НИЧЕМ другим не отличается: если
+# правило подменить обратно на «экстремум свечи свипа», тест упадёт.
+
+
+def _double_probe_df() -> pd.DataFrame:
+    """Два прокола подряд: первый глубже (98.5), второй закрывается обратно (99.0)."""
+    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
+    rows[22] = (100.4, 100.6, 98.5, 100.3, 120.0)   # вынесло по стопам — глубже свипа
+    rows[23] = (100.3, 100.7, 99.0, 100.5, 300.0)   # свеча свипа: объём, возврат выше
+    rows[24] = (100.5, 100.8, 100.3, 100.6, 50.0)   # текущая, не закрыта
+    return _df(rows)
+
+
+_PROBE_LEVELS = [
+    {"price": 100.0, "type": "support", "strength": "strong"},
+    {"price": 110.0, "type": "resistance", "strength": "weak"},
+]
+
+
+def test_stop_goes_behind_deeper_previous_candle():
+    df = _double_probe_df()
+    sig = pattern_detector.detect_spring(df, _PROBE_LEVELS, trend="up")
+    assert sig is not None
+    atr = pattern_detector._atr(df, len(df) - 2)
+    # Стоп обязан уйти за 98.5 (дальний из двух), а не за 99.0 (свеча свипа).
+    assert abs(sig["stop_loss"] - (98.5 - atr * config.STOP_ATR)) < 1e-9
+    assert sig["stop_loss"] < 98.5
+
+
+def test_stop_struct_bars_zero_is_old_behaviour():
+    # Прежнее правило — экстремум одной свечи свипа — никуда не делось, оно просто
+    # выключено. Проверяем ЧЕРЕЗ помощника, чтобы не трогать глобальный config.
+    df = _double_probe_df()
+    pos = len(df) - 2
+    assert pattern_detector._stop_extreme(df, pos, "long", bars=0) == 99.0
+    assert pattern_detector._stop_extreme(df, pos, "long", bars=1) == 98.5
+    # Шорт — зеркально: берём максимум окна, а не минимум.
+    assert pattern_detector._stop_extreme(df, pos, "short", bars=1) == 100.7
+
+
+def test_explain_risk_matches_wider_stop():
+    # /analyze обязан показывать ТОТ ЖЕ риск, по которому движок принимает решение.
+    df = _double_probe_df()
+    ex = pattern_detector.explain(df, _PROBE_LEVELS, "up")
+    sig = pattern_detector.detect_spring(df, _PROBE_LEVELS, "up")
+    risk_from_signal = sig["signal_price"] - sig["stop_loss"]
+    assert abs(ex["sides"]["long"]["risk"] - risk_from_signal) < 1e-9
+
+
+def test_explain_agrees_with_detector_on_double_probe():
+    df = _double_probe_df()
+    for settings in ({}, {"MAX_RISK_ATR": 0.5}, {"MAX_ENTRY_DIST_ATR": 0.05},
+                     {"MAX_ENTRY_DIST_ATR": 2.0, "MAX_RISK_ATR": 5.0}):
+        ex = pattern_detector.explain(df, _PROBE_LEVELS, "up", settings)
+        sig = pattern_detector.detect_spring(df, _PROBE_LEVELS, "up", settings)
+        assert ex["sides"]["long"]["ready"] == (sig is not None), settings
+
+
 def test_strictness_filters_apply_to_every_instrument():
     # Фильтры строгости больше ни для кого не отключаются: раньше форекс их обходил.
     strict = {"MAX_ENTRY_DIST_ATR": 0.01, "MAX_RISK_ATR": 0.05}
