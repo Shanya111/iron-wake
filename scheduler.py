@@ -127,12 +127,19 @@ async def monitor_signals(bot) -> None:
                 since = (datetime.now() - timedelta(minutes=config.SIGNAL_DEDUP_MIN)).isoformat(timespec="seconds")
                 if database.recent_signal_exists(code, signal["pattern"], signal["direction"], since, user_id):
                     continue
-                database.add_signal(
+                sig_id = database.add_signal(
                     code, signal["pattern"], signal["direction"],
                     signal["entry_price"], signal["stop_loss"], signal["take_profit"],
                     priority=signal["priority"], bar_time=signal.get("bar_time"),
                     user_id=user_id, signal_price=signal.get("signal_price"),
                 )
+                # При нулевом откате заявка стоит по цене закрытия, то есть там, где
+                # рынок и так стоит: ждать нечего, сделка открыта. Помечаем сразу, иначе
+                # трекинг стал бы гадать по часовым свечам, успела ли заявка исполниться
+                # раньше, чем цена ушла к цели, — и с близкой целью отвечал бы «не
+                # успела» по сделкам, которые открылись.
+                if not config.ENTRY_PULLBACK:
+                    database.mark_signal_filled(sig_id, signal.get("bar_time"))
                 print(f"[monitor_signals] СИГНАЛ {code} {signal['pattern']} {signal['direction']} → {user_id}")
                 key = (signal["pattern"], signal["direction"], round(signal["take_profit"], 10))
                 if key not in comment_cache:
@@ -143,7 +150,11 @@ async def monitor_signals(bot) -> None:
 async def track_signals(bot) -> None:
     """Каждые N минут: ведём сигнал по двум ступеням — сначала ВХОД, потом ИСХОД.
 
-    Вход теперь лимитной заявкой, поэтому сделки может не случиться вовсе. Порядок:
+    При НУЛЕВОМ откате (ENTRY_PULLBACK = 0, как сейчас) первой ступени фактически нет:
+    сигнал рождается уже исполненным, см. monitor_signals. Ступень 1 остаётся рабочей для
+    сигналов, созданных при ненулевом откате, и для старых записей в базе.
+
+    Вход лимитной заявкой, поэтому при ненулевом откате сделки может не случиться вовсе:
       1. status='waiting_fill' — дошла ли цена до заявки (pattern_detector.evaluate_fill).
          Не дошла за ENTRY_WAIT_BARS часов или ушла к цели без нас → 'expired_unfilled',
          сделки не было. Дошла → 'filled', запоминаем момент исполнения.
