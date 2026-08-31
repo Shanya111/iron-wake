@@ -1020,9 +1020,14 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
     fl = ["вход у уровня " + (f"≤ {f['MAX_ENTRY_DIST_ATR']:g} ATR"
                               if f["MAX_ENTRY_DIST_ATR"] else "выкл"),
           "вдогонку " + (f"≤ {f['MAX_RISK_ATR']:g} ATR" if f["MAX_RISK_ATR"] else "выкл")]
+    # Правило стопа называем словами: он уходит за экстремум ПАРЫ свечей, поэтому
+    # бывает заметно дальше, чем «под свечой сигнала», и это удивляет.
+    stop_rule = ("за дальним экстремумом свечи сигнала и предыдущей"
+                 if config.STOP_STRUCT_BARS else "за экстремумом свечи сигнала")
     lines += ["", f"⚙️ Твои фильтры отбора: {', '.join(fl)} (меняются в /settings)",
-              f"     Пороги движка: прокол ≥ {config.BREAK_ATR:g} ATR, "
-              f"запас стопа {config.STOP_ATR:g} ATR, объём ×{config.VOL_MULT:g}"]
+              f"     Пороги движка: прокол ≥ {config.BREAK_ATR:g} ATR, объём "
+              f"×{config.VOL_MULT:g}",
+              f"     Стоп — {stop_rule}, плюс запас {config.STOP_ATR:g} ATR"]
 
     if zones:
         near = sorted(zones, key=lambda z: abs(z["price"] - c))[:6]
