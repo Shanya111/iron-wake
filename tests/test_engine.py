@@ -118,6 +118,64 @@ def test_spring_needs_abnormal_volume():
     assert pattern_detector.detect_spring(df, levels, trend="up") is None
 
 
+def _weak_rebound_spring_df() -> pd.DataFrame:
+    """Тот же Spring, но прокол выкупили ВЯЛО: закрытие в нижней половине размаха.
+
+    Свеча сходила на 101.5, проколола поддержку 100 до 99.0 и закрылась на 100.2 —
+    формально «вернулась за уровень», но отбоя как такового нет: до 2 сентября 2026
+    движок такой сигнал брал, теперь бракует (config.MIN_CLOSE_POS).
+    """
+    df = _spring_df()
+    for col, val in (("open", 100.4), ("high", 101.5), ("low", 99.0), ("close", 100.2)):
+        df.iloc[23, df.columns.get_loc(col)] = val
+    return df
+
+
+def test_spring_needs_decisive_rebound():
+    # Отбой (100.2 − 99.0) / 2.5 = 0.48 при пороге 0.6 — сигнала быть не должно.
+    df = _weak_rebound_spring_df()
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"},
+              {"price": 110.0, "type": "resistance", "strength": "weak"}]
+    assert pattern_detector.detect_spring(df, levels, trend="up") is None
+    # Двигаем ТОЛЬКО закрытие вверх, всё остальное оставляем: 0.76 размаха — сигнал.
+    df.iloc[23, df.columns.get_loc("close")] = 100.9
+    assert pattern_detector.detect_spring(df, levels, trend="up") is not None
+
+
+def test_upthrust_needs_decisive_rebound():
+    # Зеркало: шорту нужно закрытие у МИНИМУМА свечи, а не у максимума.
+    df = _upthrust_df()
+    for col, val in (("open", 99.6), ("high", 101.0), ("low", 98.5), ("close", 99.8)):
+        df.iloc[23, df.columns.get_loc(col)] = val
+    levels = [{"price": 100.0, "type": "resistance", "strength": "strong"},
+              {"price": 90.0, "type": "support", "strength": "weak"}]
+    # Отбой (101.0 − 99.8) / 2.5 = 0.48 — мало.
+    assert pattern_detector.detect_upthrust(df, levels, trend="down") is None
+    df.iloc[23, df.columns.get_loc("close")] = 98.9   # 0.84 размаха — достаточно
+    assert pattern_detector.detect_upthrust(df, levels, trend="down") is not None
+
+
+def test_close_pos_needs_range():
+    # Свеча без размаха: судить не по чему, и функция обязана сказать это явно,
+    # а не вернуть 0 или 1 — иначе одна сторона молча получала бы сигнал.
+    assert pattern_detector._close_pos(100.0, 100.0, 100.0, "long") is None
+    assert abs(pattern_detector._close_pos(102.0, 100.0, 101.5, "long") - 0.75) < 1e-9
+    assert abs(pattern_detector._close_pos(102.0, 100.0, 101.5, "short") - 0.25) < 1e-9
+
+
+def test_explain_reports_weak_rebound():
+    # /analyze обязан назвать ИМЕННО эту причину, а не молчать про неё: иначе отчёт
+    # скажет «условия сложились» там, где движок бракует сигнал.
+    df = _weak_rebound_spring_df()
+    ex = pattern_detector.explain(df, _EX_LEVELS, trend="up")
+    long = ex["sides"]["long"]
+    assert long["rebound_ok"] is False
+    assert abs(long["rebound"] - 0.48) < 0.01
+    assert any("отбой" in b for b in long["blockers"])
+    # И то же самое, ради чего вообще существует explain: вердикт совпадает с детектором.
+    assert long["ready"] == (pattern_detector.detect_spring(df, _EX_LEVELS, "up") is not None)
+
+
 def test_spring_takes_close_target_without_rr_filter():
     # Ближайшее сопротивление 101.5 совсем рядом: риск ~1.6, до цели всего ~1.0,
     # то есть R:R примерно 1:0.6. ДО 2 сентября 2026 такой сигнал отбрасывался
