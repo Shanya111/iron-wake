@@ -1043,6 +1043,11 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
               f"     Стоп — {stop_rule}, плюс запас {config.STOP_ATR:g} ATR",
               f"     Цель — ближайший встречный уровень не ближе "
               f"{config.MIN_TARGET_ATR:g} ATR от входа"]
+    # Скользящий час меняет не правила, а МОМЕНТ проверки, и человеку это надо
+    # сказать: иначе он будет искать сигнальную свечу на круглом часе и не найдёт.
+    if config.ROLLING_HOUR:
+        lines.append("     Свеча — часовая, но пересчитывается каждые 15 минут: "
+                     "сигнал не ждёт круглого часа")
 
     if zones:
         near = sorted(zones, key=lambda z: abs(z["price"] - c))[:6]
@@ -1124,15 +1129,19 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     waiting = await message.answer(f"Анализирую {info['short']}...")
     try:
         # Свечи берём из источника инструмента — для всего движка это фьючерсы BingX.
+        # Уровни считаем по обычным часовым свечам, а разбор — по тем же свечам, по
+        # которым решает движок (при ROLLING_HOUR это скользящий час). Иначе отчёт
+        # рассказывал бы про одну свечу, а сигнал приходил по другой.
         d1 = await engine.fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
-        h1 = await engine.fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+        hourly = await engine.fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+        h1 = await engine.engine_candles(code)
     except Exception:
         await waiting.delete()
         await message.answer("Не удалось получить данные сейчас, попробуй позже.")
         return
 
     trend = analyzer.get_trend(d1)
-    levels = engine.analyze_and_store(code, d1, h1)  # считает и сохраняет уровни в БД
+    levels = engine.analyze_and_store(code, d1, hourly)  # считает и сохраняет уровни в БД
     zones = analyzer.find_liquidity_zones(d1)
 
     # Разбор — по ЛИЧНЫМ фильтрам пользователя: он должен видеть свой отбор, а не чужой.

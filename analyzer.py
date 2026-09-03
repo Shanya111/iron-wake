@@ -35,6 +35,51 @@ def get_trend(df: pd.DataFrame) -> str:
     return "sideways"
 
 
+def rolling_hours(m15: pd.DataFrame, limit: int | None = None) -> pd.DataFrame:
+    """Часовые свечи со СКОЛЬЗЯЩЕЙ границей: час кончается на последней закрытой
+    пятнадцатиминутке, а не на круглом часе.
+
+    Смысл рычага и его цена — в комментарии к config.ROLLING_HOUR. Здесь важно
+    только одно: свеча остаётся ЧАСОВОЙ. Меняется не длина, а момент, в который
+    её можно посчитать закрытой.
+
+    КАК СОБИРАЕТСЯ. Последняя строка `m15` — ещё формирующаяся четверть часа
+    (так отдаёт биржа), поэтому последний ЗАКРЫТЫЙ час кончается на предпоследней.
+    Дальше шаг назад ровно по четыре бара: соседние часы НЕ ПЕРЕКРЫВАЮТСЯ, и
+    средний объём с ATR считаются по непересекающимся свечам — иначе это были бы
+    уже не часы, а размазанное скользящее среднее, и все пороги движка поехали бы.
+
+    Последней строкой добавляется формирующийся час: детектор берёт свечу сигнала
+    как df.iloc[-2] и ждёт, что последняя ещё не закрыта. Собираем её честной
+    (тем, что реально набежало), а не копией предыдущей: читать её сейчас никто
+    не читает, но копия была бы тихой ложью.
+
+    Индекс строки — время ОТКРЫТИЯ часа, как у обычных часовых свечей: на него
+    опирается bar_time сигнала и весь трекинг.
+    """
+    if len(m15) < 5:
+        return m15.iloc[0:0]
+
+    def bar(window: pd.DataFrame) -> dict:
+        return {"open": float(window["open"].iloc[0]),
+                "high": float(window["high"].max()),
+                "low": float(window["low"].min()),
+                "close": float(window["close"].iloc[-1]),
+                "volume": float(window["volume"].sum())}
+
+    last_closed = len(m15) - 2
+    ends = list(range(last_closed, 2, -4))[::-1]
+    if limit:
+        ends = ends[-limit:]
+    rows = [bar(m15.iloc[e - 3:e + 1]) for e in ends]
+    index = [m15.index[e - 3] for e in ends]
+    forming = m15.iloc[last_closed + 1:]
+    if len(forming):
+        rows.append(bar(forming))
+        index.append(forming.index[0])
+    return pd.DataFrame(rows, index=pd.DatetimeIndex(index, name=m15.index.name))
+
+
 def find_levels(df: pd.DataFrame, window: int, timeframe: str) -> list[dict]:
     """Локальные пики (resistance) и впадины (support) — фракталы шириной `window`.
 

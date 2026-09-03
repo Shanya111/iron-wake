@@ -19,6 +19,7 @@
 
 from datetime import datetime, timedelta
 
+import pandas as pd
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import alerts
@@ -46,6 +47,24 @@ async def fetch_candles(code: str, timeframe: str, limit: int):
     if sym is None:
         raise ValueError(f"нет биржевого источника для {code}")
     return await data_fetcher.get_candles(sym["symbol"], timeframe, limit, sym["exchange"])
+
+
+async def engine_candles(code: str):
+    """Свечи, по которым движок ищет сигнал.
+
+    При config.ROLLING_HOUR это СКОЛЬЗЯЩИЙ ЧАС, собранный из пятнадцатиминуток:
+    свеча той же длины, но пересчитанная заново каждые 15 минут, а не раз в час.
+    Иначе — обычные часовые свечи биржи, как было до 3 сентября 2026.
+
+    Уровни и тренд считаются НЕ отсюда, а по обычным часовым и дневным свечам
+    (run_analysis). Так и мерилось: отдельный арм замера гонял скользящий час с
+    уровнями с календарного часа и совпал с основным. Держать уровни на круглом
+    часе проще и честнее по отношению к человеку — на графике он видит именно их.
+    """
+    if not config.ROLLING_HOUR:
+        return await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+    m15 = await fetch_candles(code, config.M15_TIMEFRAME, config.M15_LIMIT)
+    return analyzer.rolling_hours(m15, config.H1_LIMIT)
 
 
 def _subscribed_engine() -> list[str]:
@@ -106,10 +125,12 @@ async def monitor_signals(bot) -> None:
         if not subscribers:
             continue
         try:
-            h1 = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+            h1 = await engine_candles(code)
             d1 = await fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
         except Exception as e:
             print(f"[monitor_signals] {code}: ошибка данных: {e}")
+            continue
+        if len(h1) < config.VOL_LOOKBACK + 3:
             continue
         trend = analyzer.get_trend(d1)
         levels = database.get_levels(code)
@@ -147,6 +168,42 @@ async def monitor_signals(bot) -> None:
                 await _notify(bot, code, signal, user_id, comment_cache[key])
 
 
+def _tracked(signal: dict) -> dict:
+    """Сигнал с якорем, пригодным для трекинга ПО ПЯТНАДЦАТИМИНУТКАМ.
+
+    evaluate_signal берёт свечи строго правее якоря. На часовых свечах якорем
+    служит время открытия сигнальной свечи (bar_time) — и это в точности даёт
+    «свечи после входа», потому что вход у движка по её закрытию.
+
+    На M15 то же самое правило звучит так: якорь — открытие ПОСЛЕДНЕЙ
+    пятнадцатиминутки сигнальной свечи, то есть bar_time + 45 минут. Свечи правее
+    него начинаются ровно в момент входа. Без этой поправки трекинг заглянул бы
+    внутрь самой сигнальной свечи и записал бы её собственный ход как исход
+    сделки — а там по построению лежит и прокол уровня, и возврат.
+
+    Правило одно на все записи, включая старые: у них bar_time на круглом часе,
+    и bar_time + 45 минут даёт ту же точку отсчёта, что и раньше. Настоящее
+    время исполнения (ненулевой откат) якорь не двигает назад — берём позднее.
+    """
+    if not config.ROLLING_HOUR:
+        return signal
+    bar = signal.get("bar_time")
+    if not bar:
+        return signal
+    floor = pd.Timestamp(bar) + timedelta(minutes=45)
+    fill = signal.get("fill_time")
+    anchor = floor
+    if fill:
+        # Сравнивать «с часовым поясом» и «без» pandas не умеет и падает. Такой
+        # записи взяться неоткуда (оба поля пишутся из одного индекса свечей), но
+        # ронять из-за неё весь трекинг нельзя: берём заведомо верный bar_time.
+        try:
+            anchor = max(pd.Timestamp(fill), floor)
+        except TypeError:
+            pass
+    return {**signal, "fill_time": str(anchor)}
+
+
 async def track_signals(bot) -> None:
     """Каждые N минут: ведём сигнал по двум ступеням — сначала ВХОД, потом ИСХОД.
 
@@ -162,8 +219,19 @@ async def track_signals(bot) -> None:
          Отсчёт идёт от fill_time, а не от свечи пробоя: между сигналом и входом
          проходит до нескольких часов, и приписывать себе то, что случилось до входа,
          нельзя.
-    Свечи берём по разу на инструмент (кеш H1 общий с monitor_signals, так что
-    лишних запросов к бирже нет).
+    Свечи берём по разу на инструмент, из общего кеша с monitor_signals, так что
+    лишних запросов к бирже нет.
+
+    ИСХОД СЧИТАЕТСЯ ПО ПЯТНАДЦАТИМИНУТКАМ (с 3 сентября 2026, вместе со
+    скользящим часом). Это не украшение, а необходимость: сигнальная свеча теперь
+    может кончаться на :15, и по ЧАСОВЫМ свечам первая же свеча «после входа»
+    захватила бы кусок ДО него — то есть приписала бы сделке движение, которого
+    она не застала. На M15 такой ошибки нет, а заодно вчетверо уменьшается
+    неоднозначность «что было раньше внутри бара, стоп или цель».
+
+    Ступень 1 осталась на ЧАСОВЫХ свечах: она работает только для старых записей
+    с ненулевым откатом, и её срок жизни заявки (ENTRY_WAIT_BARS) задан в часах —
+    на M15 те же четыре бара означали бы час вместо четырёх.
     """
     open_signals = database.get_open_signals()
     if not open_signals:
@@ -171,16 +239,31 @@ async def track_signals(bot) -> None:
     candles: dict[str, object] = {}
     for code in {s["instrument"] for s in open_signals}:
         try:
-            candles[code] = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+            candles[code] = (
+                await fetch_candles(code, config.M15_TIMEFRAME, config.M15_LIMIT)
+                if config.ROLLING_HOUR
+                else await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT))
         except Exception as e:
             print(f"[track_signals] {code}: ошибка данных: {e}")
+    # Часовые свечи нужны только ступени 1 — тянем их лишь для тех инструментов,
+    # где действительно висит неисполненная заявка.
+    hourly: dict[str, object] = {}
+    for code in {s["instrument"] for s in open_signals
+                 if s.get("status") == "waiting_fill"}:
+        try:
+            hourly[code] = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+        except Exception as e:
+            print(f"[track_signals] {code}: ошибка часовых данных: {e}")
     for s in open_signals:
         df = candles.get(s["instrument"])
         if df is None:
             continue
         # Ступень 1 — исполнение заявки.
         if s.get("status") == "waiting_fill":
-            fill = pattern_detector.evaluate_fill(s, df)
+            h1 = hourly.get(s["instrument"])
+            if h1 is None:
+                continue
+            fill = pattern_detector.evaluate_fill(s, h1)
             if fill["status"] == "waiting_fill":
                 continue
             if fill["status"] == "expired_unfilled":
@@ -194,7 +277,7 @@ async def track_signals(bot) -> None:
             print(f"[track_signals] {s['instrument']} #{s['id']} → вход состоялся")
             await _notify_filled(bot, s)
         # Ступень 2 — исход уже открытой сделки.
-        outcome = pattern_detector.evaluate_signal(s, df)
+        outcome = pattern_detector.evaluate_signal(_tracked(s), df)
         if outcome == "pending":
             continue
         database.update_signal_status(s["id"], outcome)

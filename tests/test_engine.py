@@ -865,6 +865,71 @@ def test_alert_window_takes_extremes_of_whole_period():
     assert window["last"] == 100.7
 
 
+# ── Скользящий час ───────────────────────────────────────────────────────────
+# Сборка часа из пятнадцатиминуток — это фундамент всего движка при
+# config.ROLLING_HOUR: ошибись в ней, и поедут объём, ATR, размах и стоп разом,
+# причём молча. В лаборатории она проверялась сверкой с часовыми свечами биржи
+# свеча в свечу; здесь то же самое на синтетике.
+
+def _m15(rows: list[tuple]) -> pd.DataFrame:
+    idx = pd.date_range("2024-01-01", periods=len(rows), freq="15min", tz="UTC")
+    return pd.DataFrame(rows, columns=["open", "high", "low", "close", "volume"], index=idx)
+
+
+def test_rolling_hour_aggregates_four_bars():
+    """Час собирается из ЧЕТЫРЁХ пятнадцатиминуток: открытие первой, закрытие
+    последней, крайние значения и сумма объёма."""
+    rows = [(10 + i, 20 + i, 5 + i, 12 + i, 100 + i) for i in range(9)]
+    hours = analyzer.rolling_hours(_m15(rows))
+    # Последняя строка — формирующийся час, предпоследняя — последний закрытый.
+    closed = hours.iloc[-2]
+    assert closed["open"] == rows[4][0]      # бары 4..7
+    assert closed["close"] == rows[7][3]
+    assert closed["high"] == max(r[1] for r in rows[4:8])
+    assert closed["low"] == min(r[2] for r in rows[4:8])
+    assert closed["volume"] == sum(r[4] for r in rows[4:8])
+
+
+def test_rolling_hour_bars_do_not_overlap():
+    """Соседние часы НЕ перекрываются — иначе объём и ATR считались бы по
+    размазанному скользящему среднему, а не по часовым свечам."""
+    rows = [(10, 11, 9, 10, 100) for _ in range(21)]
+    hours = analyzer.rolling_hours(_m15(rows))
+    steps = hours.index[:-1].to_series().diff().dropna()
+    assert (steps == pd.Timedelta(hours=1)).all()
+
+
+def test_rolling_hour_ends_on_last_closed_m15():
+    """Последний ЗАКРЫТЫЙ час кончается на предпоследней пятнадцатиминутке:
+    последняя ещё формируется, и брать её закрытой значило бы подглядывать."""
+    rows = [(10, 11, 9, 10, 100) for _ in range(13)]
+    idx = _m15(rows).index
+    hours = analyzer.rolling_hours(_m15(rows))
+    # Свеча сигнала для детектора — hours.iloc[-2]; её час должен кончаться там же,
+    # где кончается предпоследняя пятнадцатиминутка.
+    assert hours.index[-2] + pd.Timedelta(hours=1) == idx[-2] + pd.Timedelta(minutes=15)
+
+
+def test_rolling_hour_matches_clock_hours_when_aligned():
+    """Если данные кончаются ровно на границе часа, скользящий час совпадает с
+    календарным — та же самопроверка, что в лаборатории."""
+    rows = [(10 + i, 20 + i, 5 + i, 12 + i, 100 + i) for i in range(13)]
+    m15 = _m15(rows)          # 00:00…03:00, последняя строка 03:00 — формирующаяся
+    hours = analyzer.rolling_hours(m15)
+    clock = m15.iloc[:-1].resample("1h").agg(
+        {"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+    for ts, row in clock.iterrows():
+        got = hours.loc[ts]
+        assert all(abs(got[c] - row[c]) < 1e-9 for c in
+                   ("open", "high", "low", "close", "volume"))
+
+
+def test_rolling_hour_short_input_is_empty():
+    """На огрызке данных отдаём пустой кадр, а не половину часа: детектор сам
+    отсеет короткую историю, но собирать неполный час нельзя."""
+    assert len(analyzer.rolling_hours(_m15([(10, 11, 9, 10, 100)] * 3))) == 0
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0
