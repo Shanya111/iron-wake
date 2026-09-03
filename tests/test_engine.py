@@ -210,6 +210,70 @@ def test_spring_fallback_target_when_no_level_ahead():
     assert abs(sig["take_profit"] - expected_tp) < 1e-9
 
 
+def test_target_skips_level_closer_than_min_gap():
+    # Порог MIN_TARGET_ATR (3 сентября 2026): уровень 100.6 отстоит от закрытия 100.5
+    # всего на 0.1 при ATR 0.86 — это 0.12 ATR, ближе порога 0.5. Такой уровень целью
+    # быть не может: сделка пошла бы за копейками при полном риске. Цель обязана
+    # встать на СЛЕДУЮЩИЙ уровень 101.5.
+    df = _spring_df()
+    levels = [
+        {"price": 100.0, "type": "support", "strength": "strong"},
+        {"price": 100.6, "type": "resistance", "strength": "weak"},   # слишком близко
+        {"price": 101.5, "type": "resistance", "strength": "weak"},
+    ]
+    sig = pattern_detector.detect_spring(df, levels, trend="up")
+    assert sig is not None
+    assert abs(sig["take_profit"] - 101.5) < 1e-9, "близкий уровень обязан быть пропущен"
+
+
+def test_target_min_gap_does_not_drop_the_signal():
+    # ГЛАВНОЕ отличие порога расстояния от снятого фильтра R:R: тот выбрасывал СИГНАЛ,
+    # этот двигает ЦЕЛЬ. Впереди только слишком близкий уровень — сигнал всё равно
+    # обязан быть, просто с запасной целью. Если этот тест начнёт падать, значит
+    # порог превратился в фильтр отбора, и частота сигналов поехала.
+    df = _spring_df()
+    levels = [
+        {"price": 100.0, "type": "support", "strength": "strong"},
+        {"price": 100.6, "type": "resistance", "strength": "weak"},
+    ]
+    sig = pattern_detector.detect_spring(df, levels, trend="up")
+    assert sig is not None, "порог расстояния не имеет права отбрасывать сигнал"
+    risk = sig["signal_price"] - sig["stop_loss"]
+    assert abs(sig["take_profit"] - (sig["signal_price"] + risk * config.FALLBACK_RR)) < 1e-9
+
+
+def test_upthrust_target_skips_level_closer_than_min_gap():
+    # Зеркало для шорта: поддержка 99.4 в 0.15 ATR от закрытия 99.5 пропускается,
+    # цель встаёт на 98.5. Сторону легко перепутать знаком, поэтому проверяем обе.
+    df = _upthrust_df()
+    levels = [
+        {"price": 100.0, "type": "resistance", "strength": "strong"},
+        {"price": 99.4, "type": "support", "strength": "weak"},       # слишком близко
+        {"price": 98.5, "type": "support", "strength": "weak"},
+    ]
+    sig = pattern_detector.detect_upthrust(df, levels, trend="down")
+    assert sig is not None
+    assert abs(sig["take_profit"] - 98.5) < 1e-9
+
+
+def test_explain_names_same_target_as_detector():
+    # /analyze показывает R:R по своей цели, детектор торгует по своей. Разъедутся —
+    # и отчёт начнёт обещать не ту сделку. Проверяем на данных, где порог расстояния
+    # как раз срабатывает: без общего _target_gap explain назвал бы целью 100.6.
+    df = _spring_df()
+    levels = [
+        {"price": 100.0, "type": "support", "strength": "strong"},
+        {"price": 100.6, "type": "resistance", "strength": "weak"},
+        {"price": 101.5, "type": "resistance", "strength": "weak"},
+    ]
+    sig = pattern_detector.detect_spring(df, levels, trend="up")
+    ex = pattern_detector.explain(df, levels, "up")
+    assert abs(ex["sides"]["long"]["target"] - sig["take_profit"]) < 1e-9
+    # Одного согласия мало: если порог потеряют ОБЕ функции сразу, они останутся
+    # согласованы и тест бы промолчал. Поэтому проверяем и саму величину.
+    assert ex["sides"]["long"]["target"] > 100.6
+
+
 def _upthrust_df() -> pd.DataFrame:
     rows = [(99.5, 99.8, 99.2, 99.5, 100.0) for _ in range(25)]
     # Пробой сопротивления 100 вверх, закрытие обратно ниже, всплеск объёма.

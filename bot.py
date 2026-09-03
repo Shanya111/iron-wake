@@ -1006,7 +1006,8 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
         # любым встречным уровнем. Число оставлено как справка — по нему видно,
         # тесно впереди или просторно.
         tgt = (f"цель {fmt(s['target'], d)}" if s["target"] is not None
-               else f"цели впереди нет — ставится на {config.FALLBACK_RR:g} риска")
+               else f"подходящей цели впереди нет — ставится на "
+                    f"{config.FALLBACK_RR:g} риска")
         lines.append(
             f"  {SIDE_WORD[side]}: 1:{s['rr']:.1f} — "
             f"риск {fmt(s['risk'], d)} ({s['risk_atr']:.2f} ATR), {tgt}")
@@ -1039,7 +1040,9 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
     lines += ["", f"⚙️ Твои фильтры отбора: {', '.join(fl)} (меняются в /settings)",
               f"     Пороги движка: прокол ≥ {config.BREAK_ATR:g} ATR, объём "
               f"×{config.VOL_MULT:g}, отбой ≥ {config.MIN_CLOSE_POS:g} размаха свечи",
-              f"     Стоп — {stop_rule}, плюс запас {config.STOP_ATR:g} ATR"]
+              f"     Стоп — {stop_rule}, плюс запас {config.STOP_ATR:g} ATR",
+              f"     Цель — ближайший встречный уровень не ближе "
+              f"{config.MIN_TARGET_ATR:g} ATR от входа"]
 
     if zones:
         near = sorted(zones, key=lambda z: abs(z["price"] - c))[:6]

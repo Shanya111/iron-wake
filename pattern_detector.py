@@ -144,6 +144,18 @@ def _break_depth(atr: float) -> float:
     return atr * config.BREAK_ATR
 
 
+def _target_gap(atr: float) -> float:
+    """Минимальное расстояние от закрытия до цели, в абсолютных единицах цены.
+
+    Доля ATR (config.MIN_TARGET_ATR). Уровни ближе этого при выборе цели
+    пропускаются — иначе цель встаёт вплотную и сделка идёт за копейками при
+    полном риске (см. комментарий к константе).
+
+    Общая для _detect и explain по той же причине, что и _stop_buffer: разъедутся —
+    и /analyze покажет один R:R, а движок посчитает по другому уровню."""
+    return atr * config.MIN_TARGET_ATR
+
+
 def _close_pos(h: float, l: float, c: float, side: str) -> float | None:
     """Сила отбоя: доля размаха свечи, отделяющая закрытие от НУЖНОГО края.
 
@@ -162,12 +174,22 @@ def _close_pos(h: float, l: float, c: float, side: str) -> float | None:
     return (c - l) / rng if side == "long" else (h - c) / rng
 
 
-def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool):
-    """Ближайший уровень нужного типа выше (above=True) или ниже ref_price."""
+def _nearest(levels: list[dict], level_type: str, ref_price: float, above: bool,
+             min_gap: float = 0.0):
+    """Ближайший уровень нужного типа выше (above=True) или ниже ref_price.
+
+    min_gap — уровни ближе этого расстояния ПРОПУСКАЮТСЯ, берётся следующий за ними
+    (config.MIN_TARGET_ATR, 3 сентября 2026). Так отсекаются вырожденные цели вроде
+    «риск 35 ради 2», которыми обернулось снятие фильтра R:R. Отличие от того фильтра
+    принципиальное: он отбрасывал СИГНАЛ, этот двигает ЦЕЛЬ — число сигналов не
+    меняется. Если дальше нет ни одного уровня, вернётся None, и вызывающий код
+    поставит запасную цель на FALLBACK_RR × риск.
+    """
     prices = [
         l["price"] for l in levels
         if l["type"] == level_type
-        and (l["price"] > ref_price if above else l["price"] < ref_price)
+        and (l["price"] > ref_price + min_gap if above
+             else l["price"] < ref_price - min_gap)
     ]
     if not prices:
         return None
@@ -280,9 +302,12 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             continue
 
         priority = "high" if lvl.get("strength") == "strong" else "normal"
-        # Цель — ближайший противоположный уровень, КАКОЙ ЕСТЬ. Проверки «а даёт ли он
-        # хотя бы 1:2» больше нет: она срезала около 80% сетапов (см. config.FALLBACK_RR,
-        # там же цена решения). Нет уровня впереди — цель на FALLBACK_RR × риск.
+        # Цель — ближайший противоположный уровень, НЕ БЛИЖЕ config.MIN_TARGET_ATR
+        # (3 сентября 2026). Проверки «а даёт ли он хотя бы 1:2» по-прежнему нет: она
+        # срезала около 80% сетапов (см. config.FALLBACK_RR, там же цена решения).
+        # Разница между ними в том, что отбраковывалось: тот фильтр выбрасывал СИГНАЛ,
+        # а порог расстояния двигает ЦЕЛЬ на следующий уровень — сигналов остаётся
+        # столько же. Нет уровня впереди — цель на FALLBACK_RR × риск.
         # Уровень в любом случае лежит по нужную сторону от закрытия (см. _nearest),
         # поэтому вырожденной цели «в ноль или в минус» тут возникнуть не может.
         #
@@ -293,12 +318,14 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
         if side == "long":
             stop = extreme - _stop_buffer(atr)
             risk = c - stop
-            target = _nearest(levels, "resistance", c, above=True)
+            target = _nearest(levels, "resistance", c, above=True,
+                              min_gap=_target_gap(atr))
             tp = target if target is not None else c + risk * config.FALLBACK_RR
         else:
             stop = extreme + _stop_buffer(atr)
             risk = stop - c
-            target = _nearest(levels, "support", c, above=False)
+            target = _nearest(levels, "support", c, above=False,
+                              min_gap=_target_gap(atr))
             tp = target if target is not None else c - risk * config.FALLBACK_RR
 
         entry = limit_price(side, c, price, stop, s.get("ENTRY_PULLBACK"))
@@ -461,9 +488,12 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
         # Какой R:R вышел бы при входе прямо сейчас (вход — закрытие, как в отборе).
         # Это СПРАВКА, а не условие: порога 1:2 больше нет, сигнал берётся с любым
         # встречным уровнем (см. config.FALLBACK_RR). Блокером тут ничего не станет.
+        # Но уровни ближе _target_gap пропускаются ровно так же, как в _detect, —
+        # иначе отчёт назовёт целью уровень, который движок целью не считает.
         if risk_now and risk_now > 0:
             opposite = "resistance" if side == "long" else "support"
-            target = _nearest(levels, opposite, c, above=(side == "long"))
+            target = _nearest(levels, opposite, c, above=(side == "long"),
+                              min_gap=_target_gap(atr))
             if target is not None:
                 rr = (abs(target - c)) / risk_now
             else:
