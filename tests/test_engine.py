@@ -931,6 +931,143 @@ def test_rolling_hour_short_input_is_empty():
     assert len(analyzer.rolling_hours(_m15([(10, 11, 9, 10, 100)] * 3))) == 0
 
 
+# ── СВИП ОБЯЗАН БЫТЬ СВИПОМ, ПУЛЫ И ДВУХСВЕЧНЫЙ СЕТАП (5 сентября 2026) ─────
+#
+# Три правила, добавленные после разбора живых сигналов (GOLD 2 сентября, BTC 6 июля):
+#   1. до прокола цена должна была стоять по другую сторону уровня (_fresh_cross);
+#   2. свипать можно и ПУЛ равных экстремумов, а не только уровень-фрактал (_pools);
+#   3. свип и выкуп могут быть разными свечами, объём мерится на свече СВИПА.
+#
+# Фикстуры подобраны так, чтобы ОТЛИЧАТЬ правило от его отсутствия: каждый тест
+# падает, если соответствующую проверку убрать. Проверено снятием правил.
+
+_LVL_SUPPORT = {"price": 100.0, "type": "support", "strength": "weak", "timeframe": "H1"}
+_LVL_RESIST = {"price": 110.0, "type": "resistance", "strength": "weak", "timeframe": "H1"}
+
+
+def _below_level_df(fresh: bool) -> pd.DataFrame:
+    """Цена ПОД уровнем 100, последняя свеча выкупает его снизу вверх.
+
+    Ряд убывающий и с шагом 0.3 — специально, чтобы минимумы НЕ оказались равными
+    и пул ликвидности не образовался: иначе тест проверял бы не то правило.
+
+    fresh=True — три свечи перед проколом закрываются ВЫШЕ уровня (свежее
+    пересечение есть, сигнал законен); fresh=False — цена уже жила под уровнем.
+    """
+    rows = [(105 - 0.3 * i, 105 - 0.3 * i + 0.3, 105 - 0.3 * i - 0.3,
+             105 - 0.3 * i, 100.0) for i in range(23)]
+    if fresh:
+        for i in (20, 21, 22):
+            rows[i] = (100.5, 100.8, 100.2, 100.6, 100.0)
+    rows.append((98.4, 100.8, 97.5, 100.7, 300.0))   # 23 — прокол и возврат за уровень
+    rows.append((100.7, 100.9, 100.5, 100.8, 50.0))  # 24 — формирующаяся
+    return _df(rows)
+
+
+def test_sweep_needs_price_above_level_before():
+    """Цена уже стояла ПОД поддержкой — значит ликвидность там не снимали."""
+    sig = pattern_detector.detect_spring(
+        _below_level_df(fresh=False), [_LVL_SUPPORT, _LVL_RESIST], trend="sideways")
+    assert sig is None
+
+
+def test_sweep_from_above_still_signals():
+    """Контроль к предыдущему: те же свечи, но перед проколом цена была НАД уровнем."""
+    sig = pattern_detector.detect_spring(
+        _below_level_df(fresh=True), [_LVL_SUPPORT, _LVL_RESIST], trend="sideways")
+    assert sig is not None
+    assert abs(sig["level_price"] - 100.0) < 1e-9
+
+
+def test_upthrust_needs_price_below_level_before():
+    """Зеркало для шорта: цена жила НАД сопротивлением — это не свип."""
+    rows = [(95 + 0.3 * i, 95 + 0.3 * i + 0.3, 95 + 0.3 * i - 0.3,
+             95 + 0.3 * i, 100.0) for i in range(23)]
+    rows.append((101.6, 102.5, 99.2, 99.3, 300.0))   # прокол вверх и возврат вниз
+    rows.append((99.3, 99.5, 99.1, 99.2, 50.0))
+    levels = [{"price": 100.0, "type": "resistance", "strength": "weak", "timeframe": "H1"},
+              {"price": 90.0, "type": "support", "strength": "weak", "timeframe": "H1"}]
+    assert pattern_detector.detect_upthrust(_df(rows), levels, trend="sideways") is None
+
+
+def test_explain_names_not_a_sweep():
+    """/analyze обязан назвать ИМЕННО эту причину, а не «свеча не заходила за уровень»."""
+    ex = pattern_detector.explain(_below_level_df(fresh=False),
+                                  [_LVL_SUPPORT, _LVL_RESIST], trend="sideways")
+    note = ex["sides"]["long"]["break_note"] or ""
+    assert "не свип" in note, note
+    assert not ex["sides"]["long"]["ready"]
+
+
+def _two_candle_df(engulfing: bool) -> pd.DataFrame:
+    """Свип на свече А, выкуп на свече B — сетап из двух свечей.
+
+    Объём стоит на свече СВИПА (300), у свечи выкупа он МЕНЬШЕ среднего (50).
+    Так тест отличает «объём на свипе» от «объём на сигнальной свече»: если
+    вернуть прежнее правило, сетап перестанет находиться.
+    """
+    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
+    rows[22] = (100.5, 100.6, 99.0, 99.5, 300.0)     # А: ушла под уровень и там закрылась
+    open_b = 99.5 if engulfing else 99.8             # B: поглощает тело А (или нет)
+    rows[23] = (open_b, 100.8, 99.4, 100.7, 50.0)
+    rows[24] = (100.7, 100.9, 100.6, 100.8, 50.0)    # формирующаяся
+    return _df(rows)
+
+
+def test_two_candle_sweep_with_engulfing():
+    """Свип и выкуп разными свечами: сигнал по закрытию свечи поглощения."""
+    df = _two_candle_df(engulfing=True)
+    sig = pattern_detector.detect_spring(df, [_LVL_SUPPORT, _LVL_RESIST], trend="sideways")
+    assert sig is not None
+    # Сигнальная свеча — та, что выкупила; свип — предыдущая.
+    assert sig["bar_time"] == str(df.index[23])
+    assert sig["sweep_bar_time"] == str(df.index[22])
+    # Вход по закрытию свечи выкупа, стоп — за минимумом всего сетапа (99.0) с запасом.
+    assert abs(sig["signal_price"] - 100.7) < 1e-9
+    assert sig["stop_loss"] < 99.0
+
+
+def test_two_candle_sweep_needs_engulfing():
+    """Без поглощения «две свечи» превратились бы в «любой возврат» — не берём."""
+    assert pattern_detector.detect_spring(
+        _two_candle_df(engulfing=False), [_LVL_SUPPORT, _LVL_RESIST],
+        trend="sideways") is None
+
+
+def test_explain_agrees_with_detector_on_two_candle_sweep():
+    """Разбор не должен расходиться с детектором и на двухсвечном сетапе."""
+    for engulfing in (True, False):
+        df = _two_candle_df(engulfing)
+        for settings in ({}, {"MAX_RISK_ATR": 3.0}, {"MAX_ENTRY_DIST_ATR": 0.05}):
+            ex = pattern_detector.explain(df, [_LVL_SUPPORT, _LVL_RESIST],
+                                          "sideways", settings)
+            sig = pattern_detector.detect_spring(df, [_LVL_SUPPORT, _LVL_RESIST],
+                                                 "sideways", settings)
+            assert ex["sides"]["long"]["ready"] == (sig is not None), (engulfing, settings)
+
+
+def test_pool_of_equal_lows_works_as_level():
+    """Равные минимумы — уровень для свипа, даже когда фрактала там ещё нет.
+
+    Уровень-фрактал подтверждается только через три свечи справа, и на момент
+    свипа его в базе нет. В списке уровней тут вообще нет ни одной поддержки —
+    сигнал обязан родиться на пуле 100.2.
+    """
+    sig = pattern_detector.detect_spring(_spring_df(), [_LVL_RESIST], trend="up")
+    assert sig is not None
+    assert abs(sig["level_price"] - 100.2) < 1e-9   # равные минимумы фикстуры
+
+
+def test_pool_needs_equal_extremes():
+    """Минимумы разные — пула нет, и свипать нечего."""
+    rows = [(105 - 0.3 * i, 105 - 0.3 * i + 0.3, 105 - 0.3 * i - 0.3,
+             105 - 0.3 * i, 100.0) for i in range(23)]
+    rows.append((98.4, 100.8, 97.5, 100.7, 300.0))
+    rows.append((100.7, 100.9, 100.5, 100.8, 50.0))
+    assert pattern_detector._pools(_df(rows), 23, atr=0.8, side="long") == []
+    assert pattern_detector.detect_spring(_df(rows), [_LVL_RESIST], trend="sideways") is None
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

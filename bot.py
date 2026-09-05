@@ -964,12 +964,26 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
     if rows:
         lines.append("  🔔 — кнопкой под отчётом поставлю алерт на этот уровень "
                      "(✅ — уже стоит, нажатие снимет).")
+    # Пулы ликвидности — равные экстремумы, которые движок свипает наравне с
+    # уровнями. В списке выше их нет намеренно (они пересчитываются каждый раз и
+    # алерты на них не вешаются), но человек должен видеть, за чем движок охотится.
+    if ex.get("pools"):
+        near_pools = sorted(ex["pools"], key=lambda x: abs(x - c))[:3]
+        lines.append("  💧 Пулы ликвидности (равные экстремумы — там стоят чужие "
+                     "стопы): " + ", ".join(fmt(x, d) for x in near_pools))
 
-    mark = "✅" if ex["sides"][live[0]]["vol_ok"] else "❌"
+    # Объём — свойство свечи СВИПА, а не свечи выкупа, и свеча свипа может быть
+    # предыдущей (тогда последняя её поглотила). Поэтому число печатаем по сторонам:
+    # у лонга и шорта кандидат на свип бывает разный.
+    lines += ["", f"3. Объём свечи СВИПА — той, что снимает ликвидность "
+                  f"(нужно ×{ex['vol_mult']:g}):"]
+    for side in live:
+        s = ex["sides"][side]
+        whose = ("эта же свеча" if s["sweep_offset"] == 0
+                 else "предыдущая свеча, эта её поглотила")
+        lines.append(f"  {SIDE_WORD[side]}: {s['vol_ratio']:.1f}× среднего "
+                     f"({whose}) {'✅' if s['vol_ok'] else '❌'}")
     lines += [
-        "",
-        f"3. Объём последней закрытой свечи: {ex['vol_ratio']:.1f}× среднего "
-        f"(нужно ×{ex['vol_mult']:g}) {mark}",
         "",
         f"4. Сила отбоя — где свеча закрылась внутри своего размаха "
         f"(нужно от {config.MIN_CLOSE_POS:g}):",
@@ -1039,7 +1053,10 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
                  if config.STOP_STRUCT_BARS else "за экстремумом свечи сигнала")
     lines += ["", f"⚙️ Твои фильтры отбора: {', '.join(fl)} (меняются в /settings)",
               f"     Пороги движка: прокол ≥ {config.BREAK_ATR:g} ATR, объём "
-              f"×{config.VOL_MULT:g}, отбой ≥ {config.MIN_CLOSE_POS:g} размаха свечи",
+              f"×{config.VOL_MULT:g} на свече свипа, отбой ≥ {config.MIN_CLOSE_POS:g} "
+              f"размаха свечи",
+              "     Свип засчитывается, только если до прокола цена была по другую "
+              "сторону уровня — выкуп уровня снизу это не свип",
               f"     Стоп — {stop_rule}, плюс запас {config.STOP_ATR:g} ATR",
               f"     Цель — ближайший встречный уровень не ближе "
               f"{config.MIN_TARGET_ATR:g} ATR от входа"]
@@ -1088,8 +1105,12 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
         lvls(ex["resistances"], "Сопротивления сверху"),
         lvls(ex["supports"], "Поддержки снизу"),
         f"Объём последней закрытой свечи: {ex['vol_ratio']:.1f}× среднего, "
-        f"порог ×{ex['vol_mult']:g}",
+        f"порог ×{ex['vol_mult']:g} (движок мерит его на свече СВИПА)",
     ]
+    if ex.get("pools"):
+        near_pools = sorted(ex["pools"], key=lambda x: abs(x - c))[:3]
+        out.append("Пулы ликвидности (равные экстремумы, движок свипает их наравне "
+                   "с уровнями): " + ", ".join(fmt(x, d) for x in near_pools))
     # Сила отбоя — условие про ту же свечу, и оно у сторон разное. Без него модель
     # видела бы блокер «отбой 0.31 — порог 0.6» без всякого контекста.
     for side in live:
