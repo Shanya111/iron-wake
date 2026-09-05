@@ -663,7 +663,7 @@ def test_explain_break_note_is_about_breakout_only():
 # правило молчало, а новое сигналит; если тест начнёт падать — правило подменили.
 #
 # До 2 сентября 2026 такие пороги были только у валютных пар, и этот же набор свечей
-# проверял именно их. Теперь мерка общая, а форекс из движка выведен вовсе.
+# проверял именно их. Теперь мерка общая для всех, а форекс с 3 сентября снова в движке.
 
 _LOWVOL_LEVELS = [
     {"price": 1.10000, "type": "support", "strength": "strong", "timeframe": "D1"},
@@ -681,20 +681,21 @@ def _lowvol_df() -> pd.DataFrame:
     return _df(rows)
 
 
-def test_fx_pairs_are_not_in_engine():
-    # Валютные пары остались в реестре и с источником данных — алерты и журнал по
-    # ним работают. Но в движок они не входят: сигналов по форексу нет.
+def test_fx_pairs_are_in_engine():
+    # С 3 сентября 2026 валютные пары СНОВА в движке (решение владельца). Проверяем
+    # с двух сторон: флаг "fx" на них по-прежнему стоит (он про расписание сессии),
+    # но членство в движке от него больше не зависит.
+    engine = instruments.engine_codes()
     for code in ("EURUSD", "GBPUSD", "AUDUSD", "USDCAD", "USDJPY"):
         assert instruments.is_fx(code), code
         assert instruments.data_source(code) == "ccxt", code
         assert instruments.ccxt_symbol(code) is not None, code
-        assert code not in instruments.engine_codes(), code
-    # А крипта и товары — входят, и их ровно шестнадцать.
-    engine = instruments.engine_codes()
+        assert code in engine, code
+    # Крипта и товары, само собой, тоже — в движке весь реестр, все 21 инструмент.
     for code in ("BTC", "ETH", "GOLD", "BRENT"):
         assert not instruments.is_fx(code), code
         assert code in engine, code
-    assert len(engine) == 16
+    assert len(engine) == len(instruments.INSTRUMENTS) == 21
     assert not instruments.is_fx(None)
     assert not instruments.is_fx("WIF/USDT:USDT")   # своя пара — не форекс реестра
 
