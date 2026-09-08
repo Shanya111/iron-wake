@@ -340,6 +340,52 @@ def limit_price(side: str, close: float, level: float, stop: float,
     return price
 
 
+def _compose(df: pd.DataFrame, pos: int, sweep_pos: int, side: str, c: float,
+             lvl: dict, extreme: float, atr: float, levels: list[dict],
+             pullback: float | None) -> dict:
+    """Собрать готовый сигнал: стоп, цель, цена заявки и все поля.
+
+    Общая для ОБОИХ путей детектора — «ловушка в одну свечу» и «ловушка,
+    растянутая на несколько часов» (config.SWEEP_WAIT_BARS). Вынесено намеренно:
+    пути отличаются только тем, ГДЕ найден прокол, а геометрия сделки у них
+    обязана быть одна. Разъедутся — и два сигнала одного движка станут считать
+    стоп и цель по-разному.
+
+    Стоп — за экстремум всего сетапа плюс запас в долях ATR. Цель — ближайший
+    встречный уровень не ближе config.MIN_TARGET_ATR, иначе запасная на
+    FALLBACK_RR × риск. И риск, и цель считаются ОТ ЗАКРЫТИЯ свечи, а не от цены
+    заявки: набор сигналов не должен зависеть от того, куда поставлена заявка.
+    """
+    price = lvl["price"]
+    if side == "long":
+        stop = extreme - _stop_buffer(atr)
+        risk = c - stop
+        target = _nearest(levels, "resistance", c, above=True, min_gap=_target_gap(atr))
+        tp = target if target is not None else c + risk * config.FALLBACK_RR
+    else:
+        stop = extreme + _stop_buffer(atr)
+        risk = stop - c
+        target = _nearest(levels, "support", c, above=False, min_gap=_target_gap(atr))
+        tp = target if target is not None else c - risk * config.FALLBACK_RR
+    return {
+        "pattern": "spring" if side == "long" else "upthrust",
+        "direction": "long" if side == "long" else "short",
+        "level_price": price,
+        "priority": "high" if lvl.get("strength") == "strong" else "normal",
+        # entry_price — цена ЛИМИТНОЙ ЗАЯВКИ (её и ставит пользователь),
+        # signal_price — закрытие свечи пробоя, от которого считался отбор.
+        "entry_price": limit_price(side, c, price, stop, pullback),
+        "signal_price": c,
+        "stop_loss": stop,
+        "take_profit": tp,
+        # bar_time — СИГНАЛЬНАЯ свеча: по её закрытию вход, от неё считает
+        # трекинг. sweep_bar_time — свеча, снявшая ликвидность (совпадает с
+        # сигнальной, когда ловушка захлопнулась за один час).
+        "bar_time": str(df.index[pos]),
+        "sweep_bar_time": str(df.index[sweep_pos]),
+    }
+
+
 def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             settings: dict | None = None) -> dict | None:
     # Пороги отбора (объём, глубина пробоя, запас стопа) — обычные константы: с 20
@@ -371,11 +417,12 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     if rebound is None or rebound < config.MIN_CLOSE_POS:
         return None
 
-    # Условие №2: аномальный объём. Это свойство свечи СВИПА, а не свечи выкупа —
-    # ликвидность снимают на объёме, выкупают не обязательно (GOLD 2 сентября: свип
-    # x1.81, поглощение x0.82). Кандидатов может быть двое: сама сигнальная свеча
-    # (сетап в одну свечу, как было всегда) и предыдущая, если сигнальная её
-    # ПОГЛОТИЛА — см. config.SWEEP_WINDOW.
+    # Условие №2: аномальный объём НА СВЕЧЕ ПРОБОЯ — той, что снимает ликвидность.
+    # При боевом config.SWEEP_WINDOW = 0 кандидат ровно один: сама сигнальная свеча,
+    # то есть правило первого движка («аномальный объём на свече пробоя») и всех
+    # замеров проекта. Окно 1 добавляет вторым кандидатом предыдущую свечу, если
+    # сигнальная её поглотила; так было с 5 по 7 сентября 2026, см. SWEEP_WINDOW —
+    # там же, почему откатили.
     sweeps = _sweep_bars(df, pos, side, vol_mult)
     if not sweeps:
         return None
@@ -441,51 +488,64 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
             if max_entry_dist and abs(c - price) > atr * max_entry_dist:
                 continue
 
-            priority = "high" if lvl.get("strength") == "strong" else "normal"
             # Цель — ближайший противоположный уровень, НЕ БЛИЖЕ config.MIN_TARGET_ATR
             # (3 сентября 2026). Проверки «а даёт ли он хотя бы 1:2» по-прежнему нет: она
             # срезала около 80% сетапов (см. config.FALLBACK_RR, там же цена решения).
             # Разница между ними в том, что отбраковывалось: тот фильтр выбрасывал СИГНАЛ,
             # а порог расстояния двигает ЦЕЛЬ на следующий уровень — сигналов остаётся
-            # столько же. Нет уровня впереди — цель на FALLBACK_RR x риск.
-            # Уровень в любом случае лежит по нужную сторону от закрытия (см. _nearest),
-            # поэтому вырожденной цели «в ноль или в минус» тут возникнуть не может.
-            #
-            # ВАЖНО: и риск, и цель считаются ОТ ЗАКРЫТИЯ свечи, а не от цены лимитной
-            # заявки. Так набор сигналов не зависит от ENTRY_PULLBACK — заявка меняет только
-            # цену входа, а какие сетапы вообще берём, решает та же логика. Иначе замер
-            # «что даёт лимитный вход» смешал бы эффект входа с эффектом отбора.
-            if side == "long":
-                stop = extreme - _stop_buffer(atr)
-                risk = c - stop
-                target = _nearest(levels, "resistance", c, above=True,
-                                  min_gap=_target_gap(atr))
-                tp = target if target is not None else c + risk * config.FALLBACK_RR
-            else:
-                stop = extreme + _stop_buffer(atr)
-                risk = stop - c
-                target = _nearest(levels, "support", c, above=False,
-                                  min_gap=_target_gap(atr))
-                tp = target if target is not None else c - risk * config.FALLBACK_RR
+            # столько же. Всё это, вместе со стопом и ценой заявки, собирает _compose —
+            # общий помощник обоих путей детектора.
+            return _compose(df, pos, sw, side, c, lvl, extreme, atr, levels,
+                            s.get("ENTRY_PULLBACK"))
 
-            entry = limit_price(side, c, price, stop, s.get("ENTRY_PULLBACK"))
-            return {
-                "pattern": "spring" if side == "long" else "upthrust",
-                "direction": "long" if side == "long" else "short",
-                "level_price": price,
-                "priority": priority,
-                # entry_price — цена ЛИМИТНОЙ ЗАЯВКИ (её и ставит пользователь),
-                # signal_price — закрытие свечи пробоя, от которого считался отбор.
-                "entry_price": entry,
-                "signal_price": c,
-                "stop_loss": stop,
-                "take_profit": tp,
-                # bar_time — СИГНАЛЬНАЯ свеча: по её закрытию вход, от неё считает
-                # трекинг. sweep_bar_time — свеча, снявшая ликвидность (совпадает с
-                # сигнальной, когда сетап уложился в одну свечу).
-                "bar_time": str(df.index[pos]),
-                "sweep_bar_time": str(df.index[sw]),
-            }
+    # ── ЛОВУШКА, РАСТЯНУТАЯ НА НЕСКОЛЬКО ЧАСОВ (7 сентября 2026) ─────────────
+    # Сюда попадаем, когда «всё в одной свече» не сложилось. Прокол мог случиться
+    # раньше и в свою свечу обратно НЕ вернуться: свеча ушла за уровень и там же
+    # закрылась. Сигнала тогда не было и быть не могло — ловушка ещё не
+    # захлопнулась. Захлопывается она сейчас: цена вернулась за уровень, и вернулась
+    # решительно и на объёме. Оба этих условия уже проверены ВЫШЕ и относятся к
+    # СИГНАЛЬНОЙ свече — то есть объём мерится там, где принимается решение.
+    #
+    # ПАМЯТИ МЕЖДУ ВЫЗОВАМИ НЕ НУЖНО: прокол ищется взглядом назад по тем же
+    # свечам, что уже переданы детектору. Движок остаётся чистой функцией, никакого
+    # состояния в базе. Цена решения и замер — в комментарии к SWEEP_WAIT_BARS.
+    #
+    # Порядок перебора — от ближней свечи к дальней: чем свежее прокол, тем это
+    # больше похоже на ловушку и тем уже стоп.
+    for j in range(pos - 1, max(-1, pos - 1 - config.SWEEP_WAIT_BARS), -1):
+        if j < 1:
+            break
+        prev = df.iloc[j]
+        pl, ph, pc = float(prev["low"]), float(prev["high"]), float(prev["close"])
+        # Стоп — за экстремум ВСЕГО сетапа: от свечи прокола (плюс STOP_STRUCT_BARS
+        # перед ней) до сигнальной включительно.
+        extreme = _stop_extreme(df, pos, side, bars=pos - j + config.STOP_STRUCT_BARS)
+        if max_risk_atr:
+            buffer = _stop_buffer(atr)
+            risk_now = (c - extreme + buffer) if side == "long" else (extreme - c + buffer)
+            if risk_now > atr * max_risk_atr:
+                continue
+        relevant = [lvl for lvl in levels if lvl["type"] == level_type]
+        relevant += _pools(df, j, atr, side)
+        for lvl in relevant:
+            price = lvl["price"]
+            if side == "long":
+                broke = pl < price - depth      # проколола поддержку вниз
+                stayed = pc < price             # и ЗАКРЫЛАСЬ под ней — возврата не было
+                returned = c > price            # вернулись только сейчас
+            else:
+                broke = ph > price + depth
+                stayed = pc > price
+                returned = c < price
+            if not (broke and stayed and returned):
+                continue
+            # Свип обязан быть свежим — считаем от свечи ПРОКОЛА, как и в первом пути.
+            if not _fresh_cross(df, j, price, side):
+                continue
+            if max_entry_dist and abs(c - price) > atr * max_entry_dist:
+                continue
+            return _compose(df, pos, j, side, c, lvl, extreme, atr, levels,
+                            s.get("ENTRY_PULLBACK"))
     return None
 
 
@@ -624,19 +684,31 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
                 return ((c - extreme + buffer) if side == "long"
                         else (extreme - c + buffer))
 
-            def scan(sw: int):
-                """Первый уровень, который свеча `sw` действительно свипнула."""
+            def scan(sw: int, held: bool = False):
+                """Первый уровень, который свеча `sw` действительно свипнула.
+
+                held=True — РАСТЯНУТАЯ ловушка (config.SWEEP_WAIT_BARS): от свечи
+                `sw` дополнительно требуется, чтобы она сама ЗАКРЫЛАСЬ за уровнем,
+                то есть возврата в свою свечу не было. Ровно как во второй ветке
+                _detect; без этого условия «прокол раньше» превратился бы в «любой
+                прокол за последние часы».
+                """
                 nonlocal far_from_level, closed_wrong, not_a_sweep
                 sl, sh = float(df["low"].iloc[sw]), float(df["high"].iloc[sw])
+                sc = float(df["close"].iloc[sw])
                 relevant = [lvl for lvl in levels if lvl["type"] == level_type]
                 relevant += _pools(df, sw, atr, side)
                 for lvl in relevant:
                     price = lvl["price"]
                     if side == "long":
                         broke, returned = sl < price - depth, c > price
+                        stayed = sc < price
                     else:
                         broke, returned = sh > price + depth, c < price
+                        stayed = sc > price
                     if not broke:
+                        continue
+                    if held and not stayed:
                         continue
                     if not returned:
                         closed_wrong = True
@@ -664,6 +736,23 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
                     broken, sweep_used = hit, sw
                     risk_now, risk_atr_now = r, r / atr
                     break
+            # Фаза 1б — РАСТЯНУТАЯ ловушка: прокол случился раньше и в свою свечу
+            # обратно не вернулся. Идёт строго ПОСЛЕ фазы 1 и в том же порядке
+            # (от ближней свечи к дальней), что вторая ветка _detect, — иначе при
+            # включённом фильтре «вдогонку» вердикты разойдутся.
+            if broken is None and config.SWEEP_WAIT_BARS:
+                for j in range(pos - 1, max(-1, pos - 1 - config.SWEEP_WAIT_BARS), -1):
+                    if j < 1:
+                        break
+                    r = risk_of(j)
+                    if max_risk_atr and r / atr > max_risk_atr:
+                        risk_blocked = True
+                        continue
+                    hit = scan(j, held=True)
+                    if hit is not None:
+                        broken, sweep_used = hit, j
+                        risk_now, risk_atr_now = r, r / atr
+                        break
             # Фаза 2 — сигнала нет, и надо объяснить ЧЕЛОВЕКУ почему. Числа берём с
             # предпочтительного кандидата, а пробой ищем БЕЗ фильтра риска: фильтр
             # снимает сигнал, но не отменяет того, что прокол состоялся. Иначе в

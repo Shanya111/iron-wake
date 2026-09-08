@@ -1003,8 +1003,9 @@ def _two_candle_df(engulfing: bool) -> pd.DataFrame:
     """Свип на свече А, выкуп на свече B — сетап из двух свечей.
 
     Объём стоит на свече СВИПА (300), у свечи выкупа он МЕНЬШЕ среднего (50).
-    Так тест отличает «объём на свипе» от «объём на сигнальной свече»: если
-    вернуть прежнее правило, сетап перестанет находиться.
+    Так фикстура ОТЛИЧАЕТ два правила: «объём на свече пробоя» (боевое,
+    config.SWEEP_WINDOW = 0) сетап не берёт, «объём на свече свипа» (окно 1) —
+    берёт. Обе стороны проверяются тестами ниже.
     """
     rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
     rows[22] = (100.5, 100.6, 99.0, 99.5, 300.0)     # А: ушла под уровень и там закрылась
@@ -1014,36 +1015,151 @@ def _two_candle_df(engulfing: bool) -> pd.DataFrame:
     return _df(rows)
 
 
-def test_two_candle_sweep_with_engulfing():
-    """Свип и выкуп разными свечами: сигнал по закрытию свечи поглощения."""
-    df = _two_candle_df(engulfing=True)
+def test_two_candle_sweep_not_taken_by_default():
+    """БОЕВОЕ ПРАВИЛО: аномальный объём требуется на свече ПРОБОЯ.
+
+    Сигнальная свеча здесь выкупила прокол, но её собственный объём ниже
+    среднего (50 против 100) — значит сигнала нет, даже с поглощением. Тест
+    падает, если SWEEP_WINDOW снова станет ненулевым молча.
+    """
+    for engulfing in (True, False):
+        assert pattern_detector.detect_spring(
+            _two_candle_df(engulfing), [_LVL_SUPPORT, _LVL_RESIST],
+            trend="sideways") is None, engulfing
+
+
+def test_two_candle_sweep_works_when_window_open():
+    """Механизм двухсвечного свипа жив и включается одной константой.
+
+    Откат 7 сентября 2026 снял правило, но не выкинул его: тест сторожит, что
+    SWEEP_WINDOW = 1 по-прежнему даёт сетап целиком — сигнал по закрытию свечи
+    выкупа, объём взят со свечи свипа, стоп за минимумом всей пары. И что
+    поглощение при этом обязательно.
+    """
+    saved = config.SWEEP_WINDOW
+    config.SWEEP_WINDOW = 1
+    try:
+        df = _two_candle_df(engulfing=True)
+        sig = pattern_detector.detect_spring(df, [_LVL_SUPPORT, _LVL_RESIST],
+                                             trend="sideways")
+        assert sig is not None
+        # Сигнальная свеча — та, что выкупила; свип — предыдущая.
+        assert sig["bar_time"] == str(df.index[23])
+        assert sig["sweep_bar_time"] == str(df.index[22])
+        # Вход по закрытию свечи выкупа, стоп — за минимумом сетапа (99.0) с запасом.
+        assert abs(sig["signal_price"] - 100.7) < 1e-9
+        assert sig["stop_loss"] < 99.0
+        # Без поглощения «две свечи» превратились бы в «любой возврат» — не берём.
+        assert pattern_detector.detect_spring(
+            _two_candle_df(engulfing=False), [_LVL_SUPPORT, _LVL_RESIST],
+            trend="sideways") is None
+    finally:
+        config.SWEEP_WINDOW = saved
+
+
+def _held_sweep_df(returned_late: bool) -> pd.DataFrame:
+    """Ловушка, растянутая на три часа: цена ушла под уровень и вернулась не сразу.
+
+    Свеча 19 ещё закрывается над поддержкой 100.0. Свечи 20–22 живут ПОД ней
+    (последняя прокалывает глубже всех), а свеча 23 возвращает цену обратно —
+    решительно и на объёме. Объём аномальный именно на свече 23, на СИГНАЛЬНОЙ,
+    как требует ТЗ.
+
+    ПОЧЕМУ ФИКСТУРА ИМЕННО ТАКАЯ. Свеча возврата всегда открывается там, где
+    закрылась предыдущая, то есть под уровнем, — значит она и сама его
+    прокалывает. Поэтому «растянутость» проявляется не в проколе, а в СВЕЖЕСТИ:
+    для свечи 23 предыдущие три (20–22) все под уровнем, и _fresh_cross её
+    отбраковывает. Вторая ветка детектора считает свежесть от свечи ПРОКОЛА (22),
+    перед которой цена ещё стояла выше, — и сетап оживает.
+
+    returned_late=False — свеча 23 закрывается по-прежнему под уровнем, ловушка не
+    захлопнулась, сигнала быть не должно.
+    """
+    rows = [(100.5, 101.0, 100.2, 100.6, 100.0) for _ in range(25)]
+    rows[20] = (100.5, 100.6, 99.2, 99.6, 90.0)      # ушли под уровень
+    rows[21] = (99.6, 99.9, 99.3, 99.5, 90.0)        # держимся под ним
+    rows[22] = (99.5, 99.9, 99.0, 99.5, 90.0)        # прокол глубже, закрылись под
+    close_b = 100.7 if returned_late else 99.7
+    rows[23] = (99.5, close_b + 0.1, 99.4, close_b, 300.0)   # возврат на объёме
+    rows[24] = (close_b, close_b + 0.2, close_b - 0.1, close_b + 0.1, 50.0)
+    return _df(rows)
+
+
+def test_held_sweep_gives_signal_on_return_candle():
+    """ТЗ владельца: прокол помним, сигнал — по свече ВОЗВРАТА.
+
+    Прокол был в свече 22 и в свою свечу не вернулся, значит по старому правилу
+    сигнала нет вовсе. Сигнал обязан появиться на свече 23 — и объём для него
+    берётся с неё же, а не со свечи прокола.
+    """
+    df = _held_sweep_df(returned_late=True)
     sig = pattern_detector.detect_spring(df, [_LVL_SUPPORT, _LVL_RESIST], trend="sideways")
     assert sig is not None
-    # Сигнальная свеча — та, что выкупила; свип — предыдущая.
-    assert sig["bar_time"] == str(df.index[23])
-    assert sig["sweep_bar_time"] == str(df.index[22])
-    # Вход по закрытию свечи выкупа, стоп — за минимумом всего сетапа (99.0) с запасом.
-    assert abs(sig["signal_price"] - 100.7) < 1e-9
+    assert sig["bar_time"] == str(df.index[23])      # сигнальная — свеча возврата
+    assert sig["sweep_bar_time"] == str(df.index[22])  # свип — свеча прокола
+    # Стоп за минимумом ВСЕГО сетапа (99.0) с запасом.
     assert sig["stop_loss"] < 99.0
 
 
-def test_two_candle_sweep_needs_engulfing():
-    """Без поглощения «две свечи» превратились бы в «любой возврат» — не берём."""
+def test_held_sweep_needs_actual_return():
+    """Пока цена не вернулась за уровень, ловушка не захлопнулась — сигнала нет."""
     assert pattern_detector.detect_spring(
-        _two_candle_df(engulfing=False), [_LVL_SUPPORT, _LVL_RESIST],
+        _held_sweep_df(returned_late=False), [_LVL_SUPPORT, _LVL_RESIST],
         trend="sideways") is None
 
 
+def test_held_sweep_respects_wait_window():
+    """За пределами config.SWEEP_WAIT_BARS прокол забывается.
+
+    Тест падает, если окно ожидания перестанут соблюдать: с нулевым окном тот же
+    сетап обязан пропасть, потому что в одну свечу он не укладывается.
+    """
+    df = _held_sweep_df(returned_late=True)
+    saved = config.SWEEP_WAIT_BARS
+    config.SWEEP_WAIT_BARS = 0
+    try:
+        assert pattern_detector.detect_spring(
+            df, [_LVL_SUPPORT, _LVL_RESIST], trend="sideways") is None
+    finally:
+        config.SWEEP_WAIT_BARS = saved
+
+
+def test_explain_agrees_with_detector_on_held_sweep():
+    """Разбор /analyze обязан видеть растянутую ловушку так же, как детектор."""
+    saved = config.SWEEP_WAIT_BARS
+    try:
+        for wait in (0, 3):
+            config.SWEEP_WAIT_BARS = wait
+            for returned_late in (True, False):
+                df = _held_sweep_df(returned_late)
+                for settings in ({}, {"MAX_RISK_ATR": 3.0}, {"MAX_ENTRY_DIST_ATR": 0.05}):
+                    ex = pattern_detector.explain(df, [_LVL_SUPPORT, _LVL_RESIST],
+                                                  "sideways", settings)
+                    sig = pattern_detector.detect_spring(df, [_LVL_SUPPORT, _LVL_RESIST],
+                                                         "sideways", settings)
+                    assert ex["sides"]["long"]["ready"] == (sig is not None), (
+                        wait, returned_late, settings)
+    finally:
+        config.SWEEP_WAIT_BARS = saved
+
+
 def test_explain_agrees_with_detector_on_two_candle_sweep():
-    """Разбор не должен расходиться с детектором и на двухсвечном сетапе."""
-    for engulfing in (True, False):
-        df = _two_candle_df(engulfing)
-        for settings in ({}, {"MAX_RISK_ATR": 3.0}, {"MAX_ENTRY_DIST_ATR": 0.05}):
-            ex = pattern_detector.explain(df, [_LVL_SUPPORT, _LVL_RESIST],
-                                          "sideways", settings)
-            sig = pattern_detector.detect_spring(df, [_LVL_SUPPORT, _LVL_RESIST],
-                                                 "sideways", settings)
-            assert ex["sides"]["long"]["ready"] == (sig is not None), (engulfing, settings)
+    """Разбор не должен расходиться с детектором ни в одном из режимов свипа."""
+    saved = config.SWEEP_WINDOW
+    try:
+        for window in (0, 1):
+            config.SWEEP_WINDOW = window
+            for engulfing in (True, False):
+                df = _two_candle_df(engulfing)
+                for settings in ({}, {"MAX_RISK_ATR": 3.0}, {"MAX_ENTRY_DIST_ATR": 0.05}):
+                    ex = pattern_detector.explain(df, [_LVL_SUPPORT, _LVL_RESIST],
+                                                  "sideways", settings)
+                    sig = pattern_detector.detect_spring(df, [_LVL_SUPPORT, _LVL_RESIST],
+                                                         "sideways", settings)
+                    assert ex["sides"]["long"]["ready"] == (sig is not None), (
+                        window, engulfing, settings)
+    finally:
+        config.SWEEP_WINDOW = saved
 
 
 def test_pool_of_equal_lows_works_as_level():
