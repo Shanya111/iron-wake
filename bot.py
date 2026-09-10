@@ -1055,7 +1055,7 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
                  if config.STOP_STRUCT_BARS else "за экстремумом свечи сигнала")
     lines += ["", f"⚙️ Твои фильтры отбора: {', '.join(fl)} (меняются в /settings)",
               f"     Пороги движка: прокол ≥ {config.BREAK_ATR:g} ATR, объём "
-              f"×{config.VOL_MULT:g} на свече пробоя, отбой ≥ {config.MIN_CLOSE_POS:g} "
+              f"×{config.VOL_MULT:g} на сигнальной свече, отбой ≥ {config.MIN_CLOSE_POS:g} "
               f"размаха свечи",
               "     Свип засчитывается, только если до прокола цена была по другую "
               "сторону уровня — выкуп уровня снизу это не свип",
