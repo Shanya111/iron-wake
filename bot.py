@@ -402,6 +402,7 @@ HELP_TEXT = (
     "/subscribe — подписка на торговые сигналы (Spring/Upthrust)\n"
     "/signals — последние сигналы\n"
     "/stats — статистика сигналов (винрейт, итог в R) за 30 дней / всё время\n"
+    "/trend — тренд по недельному каналу: позиции модели и итог\n"
     "/trades — журнал сделок (статус цель/стоп, закрытие)\n"
     "/settings — строгость отбора сигналов: реже, но качественнее\n"
     "/cancel — отменить текущий сценарий\n\n"
@@ -426,6 +427,8 @@ ABOUT_TEXT = (
     "Разбирает рынок по методике VSA: тренд дневки, уровни, объём, стакан заявок. "
     "Ищет ложные пробои Spring и Upthrust и присылает сигнал с ценой лимитной "
     "заявки, стопом и целью — а потом сам доводит его до исхода.\n\n"
+    "Вторая стратегия — тренд по недельному каналу: вход на пробое недели, выход "
+    "по встречному каналу, без цели (/trend).\n\n"
     "Умеет алерты: скажет, когда цена дойдёт до уровня, который выбрал ты.\n\n"
     "Это подсказка, а не авто-торговля. Решение и риск — на трейдере.\n\n"
     "Автор: Аким."
@@ -1355,6 +1358,13 @@ async def cmd_signals(message: Message):
     await message.answer("Последние сигналы:\n" + "\n".join(lines))
 
 
+@dp.message(Command("trend"))
+async def cmd_trend(message: Message):
+    # Стратегия №4 — тренд по недельному каналу. Позиции модели общие для всех, поэтому
+    # и сводка одна; в /signals и /stats они не попадают — там сигналы Spring/Upthrust.
+    await message.answer(await engine.trend_overview())
+
+
 # ── Сводная статистика по сигналам (/stats) ────────────────────────────────────
 
 def compute_signal_stats(rows: list[dict]) -> dict:
@@ -1996,6 +2006,7 @@ async def main():
         BotCommand(command="subscribe",   description="Подписка на торговые сигналы"),
         BotCommand(command="signals",     description="Последние сигналы"),
         BotCommand(command="stats",       description="Статистика сигналов (винрейт, R)"),
+        BotCommand(command="trend",       description="Тренд по недельному каналу"),
         BotCommand(command="trades",      description="Журнал сделок"),
         BotCommand(command="settings",    description="Строгость отбора сигналов"),
         BotCommand(command="write",       description="Написать администратору"),
@@ -2025,6 +2036,7 @@ async def main():
                 BotCommand(command="subscribe", description="Подписка на торговые сигналы"),
                 BotCommand(command="signals",   description="Последние сигналы"),
                 BotCommand(command="stats",     description="Статистика сигналов (винрейт, R)"),
+                BotCommand(command="trend",     description="Тренд по недельному каналу"),
                 BotCommand(command="trades",    description="Журнал сделок"),
                 BotCommand(command="help",      description="Помощь"),
                 BotCommand(command="cancel",    description="Отмена"),

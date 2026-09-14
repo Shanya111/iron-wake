@@ -164,6 +164,36 @@ def init_db() -> None:
                 UNIQUE(user_id, key)
             )
         """)
+        # ── Стратегия №4 — тренд по недельному каналу (14.09.2026) ────────────
+        # Позиция модели, ОДНА на инструмент и общая для всех (у стратегии нет личных
+        # настроек). В signals не кладём: там цель обязательна, а у тренда её нет —
+        # выход по встречному каналу. status: open | stop | exit. result_r — итог в
+        # рисках по ценам входа и выхода, без комиссии и фандинга.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trend_positions (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                instrument  TEXT    NOT NULL,
+                direction   TEXT    NOT NULL,                 -- 'long' | 'short'
+                entry_price REAL    NOT NULL,
+                stop_loss   REAL    NOT NULL,
+                entry_time  TEXT    NOT NULL,                 -- открытие часа входа, UTC
+                signal_bar  TEXT    NOT NULL,                 -- свеча пробоя недели, UTC
+                status      TEXT    NOT NULL DEFAULT 'open',  -- open | stop | exit
+                exit_price  REAL,
+                exit_time   TEXT,
+                result_r    REAL,
+                created_at  TEXT    NOT NULL,
+                closed_at   TEXT
+            )
+        """)
+        # Последняя обработанная свеча по инструменту. С неё monitor_trend продолжает
+        # после рестарта и простоя, свеча за свечой, ничего не пропуская и не повторяя.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS trend_state (
+                instrument TEXT PRIMARY KEY,
+                last_bar   TEXT
+            )
+        """)
         conn.commit()
 
 
@@ -462,6 +492,68 @@ def get_signals_since(user_id: int, since: str | None = None) -> list[dict]:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(query, params).fetchall()
     return [dict(row) for row in rows]
+
+
+# ── Стратегия №4 — тренд по недельному каналу ───────────────────────────────
+
+def get_trend_state(instrument: str) -> tuple[str | None, dict | None]:
+    """(последняя обработанная свеча, открытая позиция модели или None)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT last_bar FROM trend_state WHERE instrument = ?", (instrument,)
+        ).fetchone()
+        pos = conn.execute("""
+            SELECT id, instrument, direction, entry_price, stop_loss, entry_time, signal_bar
+            FROM trend_positions WHERE instrument = ? AND status = 'open'
+            ORDER BY id DESC LIMIT 1
+        """, (instrument,)).fetchone()
+    return (row["last_bar"] if row else None), (dict(pos) if pos else None)
+
+
+def save_trend_step(instrument: str, last_bar: str | None, events: list[dict],
+                    open_id: int | None) -> None:
+    """Пишет итог одного шага модели ОДНОЙ транзакцией: события и новую last_bar.
+
+    Одной — потому что иначе падение между записью сделки и записью last_bar при
+    следующем запуске повторило бы ту же свечу и открыло бы позицию дважды.
+    open_id — id позиции, открытой до шага: к ней относится первое закрытие.
+    За один шаг бывает несколько событий (после простоя бота: вход, стоп, новый вход)."""
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        current = open_id
+        for ev in events:
+            if ev["type"] == "entry":
+                cur = conn.execute("""
+                    INSERT INTO trend_positions (instrument, direction, entry_price, stop_loss,
+                                                 entry_time, signal_bar, status, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'open', ?)
+                """, (instrument, ev["direction"], ev["entry_price"], ev["stop_loss"],
+                      ev["entry_time"], ev["signal_bar"], now))
+                current = cur.lastrowid
+            elif current is not None:
+                conn.execute("""
+                    UPDATE trend_positions
+                    SET status = ?, exit_price = ?, exit_time = ?, result_r = ?, closed_at = ?
+                    WHERE id = ?
+                """, (ev["type"], ev["exit_price"], ev["exit_time"], ev["result_r"], now, current))
+                current = None
+        if last_bar is not None:
+            conn.execute("INSERT OR REPLACE INTO trend_state (instrument, last_bar) VALUES (?, ?)",
+                         (instrument, last_bar))
+        conn.commit()
+
+
+def get_trend_positions() -> list[dict]:
+    """Все позиции модели тренда, новые первыми (для /trend)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, instrument, direction, entry_price, stop_loss, entry_time, status,
+                   exit_price, exit_time, result_r
+            FROM trend_positions ORDER BY id DESC
+        """).fetchall()
+    return [dict(r) for r in rows]
 
 
 # ── Подписки на сигналы ─────────────────────────────────────────────────────

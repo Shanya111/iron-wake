@@ -1,9 +1,11 @@
 """Фоновые задачи бота. Планировщик в проекте ровно один — этот.
 
-Пять задач:
+Шесть задач:
   • run_analysis  (раз в час) — пересчитывает тренд/уровни/зоны и пишет в БД (levels);
   • monitor_signals (каждые 5 мин) — ищет Spring/Upthrust по свежим H1-свечам, пишет
     в signals и рассылает подписчикам;
+  • monitor_trend (каждые 5 мин) — стратегия №4, тренд по недельному каналу: ведёт
+    общую позицию модели по всем инструментам движка (правила — trend.py);
   • track_signals (каждые 5 мин) — ведёт сигнал по двум ступеням: исполнилась ли
     лимитная заявка, а потом — дошла ли сделка до цели/стопа; сообщает владельцу;
   • track_trades (каждые 5 мин) — исход сделок журнала;
@@ -18,6 +20,7 @@
 и алерты берут свечи через fetch_candles. Yahoo убран 26 августа 2026.
 """
 
+import math
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -30,6 +33,7 @@ import data_fetcher
 import database
 import llm
 import pattern_detector
+import trend as channel_trend  # стратегия №4; имя «trend» занято трендом дневки в monitor_signals
 from instruments import ccxt_symbol, engine_codes, fmt, infer_decimals, resolve, short
 
 
@@ -493,6 +497,156 @@ async def _notify(bot, code: str, signal: dict, user_id: int, comment: str | Non
         print(f"[monitor_signals] не отправить {user_id}: {e}")
 
 
+async def monitor_trend(bot) -> None:
+    """Стратегия №4 — тренд по недельному каналу (каждые 5 минут). Правила — trend.py.
+
+    Идёт по ВСЕМ инструментам движка, а не только по подписанным. Позиция модели одна
+    на инструмент и общая, и вести её надо непрерывно: иначе стоп или выход, случившийся,
+    пока подписчиков не было, потерялся бы, и /trend показывал бы позицию, которой нет.
+
+    Свечи обрабатываются по одной, начиная со следующей после trend_state.last_bar.
+    Поэтому рестарт и простой счёт не ломают: пропущенные часы догоняются по очереди,
+    как их прошёл бы замер. Окно — config.TREND_H1_LIMIT часов; лежал дольше — старые
+    часы уже не восстановить, об этом строка в логе.
+
+    Сообщения уходят подписчикам инструмента из /subscribe — тем же, кто получает
+    Spring/Upthrust (решение владельца 14.09.2026). Валютные пары вне сессии на паузе:
+    запрос свечей падает, инструмент пропускается до следующего раза.
+    """
+    for code in engine_codes():
+        try:
+            df = await fetch_candles(code, config.H1_TIMEFRAME, config.TREND_H1_LIMIT)
+        except Exception as e:
+            print(f"[monitor_trend] {code}: ошибка данных: {e}")
+            continue
+        if len(df) <= channel_trend.WARM + 1:
+            continue
+        last_bar, position = database.get_trend_state(code)
+        if last_bar is not None and pd.Timestamp(last_bar) < df.index[channel_trend.WARM - 1]:
+            print(f"[monitor_trend] {code}: бот не видел рынок дольше окна свечей "
+                  f"(с {last_bar}) — часть часов пропущена")
+        open_id = position["id"] if position else None
+        new_last, _, events = channel_trend.step(df, last_bar, position)
+        if new_last == last_bar and not events:
+            continue
+        database.save_trend_step(code, new_last, events, open_id)
+        for ev in events:
+            print(f"[monitor_trend] {code}: {ev['type']} {ev['direction']} "
+                  f"вход {ev['entry_price']} стоп {ev['stop_loss']}")
+            await _notify_trend(bot, code, ev)
+
+
+async def _notify_trend(bot, code: str, ev: dict) -> None:
+    """Сообщение о входе, стопе или выходе модели тренда — подписчикам инструмента."""
+    info = resolve(code)
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(ev["entry_price"])
+    long_ = ev["direction"] == "long"
+    arrow = "🟢 ЛОНГ" if long_ else "🔴 ШОРТ"
+    when = ev["entry_time"] if ev["type"] == "entry" else ev["exit_time"]
+    late = ""
+    age = pd.Timestamp.now(tz="UTC") - pd.Timestamp(when)
+    if age > timedelta(hours=2):
+        late = (f"⚠️ Сообщение запоздало на {age.total_seconds() / 3600:.0f} ч — "
+                "бот не видел рынок. Цена могла уйти.\n")
+    if ev["type"] == "entry":
+        risk_pct = abs(ev["entry_price"] - ev["stop_loss"]) / ev["entry_price"]
+        # Объём позиции, при котором стоп стоит 1% депозита. У валюты стоп узкий,
+        # и нужный объём больше депозита — тогда называем и плечо.
+        size = 0.01 / risk_pct if risk_pct else 0.0
+        size_txt = (f"объём ≈ {size:.0%} депозита" if size <= 1
+                    else f"объём ≈ {size:.1f} депозита (плечо от x{math.ceil(size)})")
+        edge = "выше максимума" if long_ else "ниже минимума"
+        back = "ниже минимума" if long_ else "выше максимума"
+        text = (
+            f"📈 ТРЕНД — {info['short']} {arrow}\n"
+            f"Час закрылся {edge} недели ({fmt(ev['level'], d)}).\n"
+            f"Вход по рынку ≈ {fmt(ev['entry_price'], d)}\n"
+            f"Стоп: {fmt(ev['stop_loss'], d)} ({risk_pct:.1%} от входа, 3 ATR)\n"
+            f"Цели нет. Выход — когда час закроется {back} последних 42 часов "
+            f"(сейчас {fmt(ev['exit_level'], d)}). Об этом напишу.\n"
+            f"Риск 1% депозита = {size_txt}.\n"
+            f"{late}"
+            f"Замер на истории по {info['short']}: "
+            f"{config.TREND_MEASURED.get(code, 'не мерилась')}.\n\n"
+            "Это подсказка, не приказ. Решение и риск — на тебе."
+        )
+    elif ev["type"] == "stop":
+        text = (
+            f"🛑 ТРЕНД — {info['short']} {arrow}: сработал стоп {fmt(ev['stop_loss'], d)}.\n"
+            f"Вход был {fmt(ev['entry_price'], d)}, закрытие ≈ {fmt(ev['exit_price'], d)} → "
+            f"итог {ev['result_r']:+.1f}R (без комиссии и фандинга).\n"
+            f"{late}"
+            "Позиция закрыта, жду нового пробоя недели."
+        )
+    else:
+        back = "ниже минимума" if long_ else "выше максимума"
+        text = (
+            f"🏁 ТРЕНД — {info['short']} {arrow}: выход по каналу.\n"
+            f"Час закрылся {back} последних 42 часов ({fmt(ev['level'], d)}). "
+            f"Закрывай по рынку ≈ {fmt(ev['exit_price'], d)}.\n"
+            f"Вход был {fmt(ev['entry_price'], d)} → итог {ev['result_r']:+.1f}R "
+            "(без комиссии и фандинга).\n"
+            f"{late}"
+        )
+    for user_id in database.get_subscribers(code):
+        try:
+            await bot.send_message(user_id, text)
+        except Exception as e:
+            print(f"[monitor_trend] не отправить {user_id}: {e}")
+
+
+async def trend_overview() -> str:
+    """Текст /trend: открытые позиции модели с текущим итогом и закрытые сделки."""
+    rows = database.get_trend_positions()
+    opened = [p for p in rows if p["status"] == "open"]
+    closed = [p for p in rows if p["status"] != "open"]
+    lines = [
+        "📈 Тренд по недельному каналу — вторая стратегия бота.",
+        "Вход: час закрылся за максимумом (минимумом) последних 168 ч. Стоп 3 ATR. "
+        "Выход: час закрылся за встречным каналом 42 ч. Цели нет.",
+        "Модель ведёт одну позицию на инструмент по часовым свечам BingX, сигналы "
+        "приходят подписчикам инструмента (/subscribe).",
+        "",
+    ]
+    if opened:
+        lines.append("Открытые позиции:")
+        for p in opened:
+            info = resolve(p["instrument"])
+            d = info["decimals"] if info["decimals"] is not None else infer_decimals(p["entry_price"])
+            arrow = "🟢" if p["direction"] == "long" else "🔴"
+            tail = ""
+            try:
+                df = await fetch_candles(p["instrument"], config.H1_TIMEFRAME, config.TREND_H1_LIMIT)
+                snap = channel_trend.snapshot(df, p)
+                sign = "<" if p["direction"] == "long" else ">"
+                tail = (f" · сейчас {snap['open_r']:+.1f}R · выход при закрытии часа "
+                        f"{sign} {fmt(snap['exit_level'], d)}")
+            except Exception as e:
+                print(f"[trend_overview] {p['instrument']}: {e}")
+            lines.append(f"{arrow} {info['short']} вход {fmt(p['entry_price'], d)} "
+                         f"({p['entry_time'][:16]} UTC) · стоп {fmt(p['stop_loss'], d)}{tail}")
+    else:
+        lines.append("Открытых позиций нет — модель ждёт пробоя недели.")
+    lines.append("")
+    if closed:
+        total = sum(p["result_r"] or 0.0 for p in closed)
+        wins = sum(1 for p in closed if (p["result_r"] or 0.0) > 0)
+        lines.append(f"Закрыто с запуска — сделок: {len(closed)}, в плюсе: {wins}, "
+                     f"итог {total:+.1f}R (без комиссии и фандинга). Последние:")
+        for p in closed[:5]:
+            info = resolve(p["instrument"])
+            arrow = "🟢" if p["direction"] == "long" else "🔴"
+            how = "стоп" if p["status"] == "stop" else "выход"
+            lines.append(f"  {arrow} {info['short']} — {how}, {p['result_r']:+.1f}R "
+                         f"({(p['exit_time'] or '')[:10]})")
+    else:
+        lines.append("Закрытых сделок пока нет — модель запущена 14.09.2026.")
+    lines.append("")
+    lines.append("На истории стратегия в плюсе на ETH и SOL, около нуля на BTC и золоте, "
+                 "в минусе на валюте и нефти. Замер по инструменту — в каждом сигнале.")
+    return "\n".join(lines)
+
+
 async def alert_window(pair: str) -> dict:
     """Куда цена заходила за последние минуты: {low, high, last, decimals}.
 
@@ -563,10 +717,11 @@ async def check_alerts(bot) -> None:
 
 
 def setup(bot) -> AsyncIOScheduler:
-    """Создаёт и запускает единственный планировщик бота (пять задач, см. модуль)."""
+    """Создаёт и запускает единственный планировщик бота (шесть задач, см. модуль)."""
     sched = AsyncIOScheduler()
     sched.add_job(run_analysis, "interval", minutes=config.ANALYZE_EVERY_MIN, args=[bot])
     sched.add_job(monitor_signals, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
+    sched.add_job(monitor_trend, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
     sched.add_job(track_signals, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
     sched.add_job(track_trades, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
     sched.add_job(check_alerts, "interval", minutes=config.ALERT_EVERY_MIN, args=[bot])

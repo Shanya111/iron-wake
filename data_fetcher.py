@@ -32,7 +32,7 @@ _PROXY = os.getenv("CCXT_PROXY", "").strip()
 # Биржи: одна на имя (bingx, ...), создаём при первом обращении.
 _exchanges: dict[str, "ccxt.Exchange"] = {}
 # Кеш свечей: (биржа, символ, таймфрейм) → (время_загрузки, DataFrame).
-_cache: dict[tuple[str, str, str], tuple[float, pd.DataFrame]] = {}
+_cache: dict[tuple[str, str, str, int], tuple[float, pd.DataFrame]] = {}
 # Кеш стакана: (биржа, символ) → (время_загрузки, order_book). Стакан меняется
 # быстро, поэтому отдельный короткий TTL (config.ORDERBOOK_TTL).
 _ob_cache: dict[tuple[str, str], tuple[float, dict]] = {}
@@ -96,7 +96,10 @@ async def get_candles(
     Кеш на config.CACHE_TTL[timeframe]. Бросает исключение, если биржа не отдала
     данных (нет такого символа / сеть) — вызывающий код это ловит и пропускает пару.
     """
-    key = (exchange, symbol, timeframe)
+    # limit входит в ключ: с 14.09.2026 одни и те же часовые свечи берут с разной
+    # глубиной (движку 120, тренду 400). Без него запрос на 400 молча получал бы из
+    # кеша 120 — и недельный канал считался бы по пяти дням.
+    key = (exchange, symbol, timeframe, limit)
     ttl = config.CACHE_TTL.get(timeframe, 300)
     cached = _cache.get(key)
     if cached is not None and time.time() - cached[0] < ttl:

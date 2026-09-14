@@ -17,6 +17,7 @@ import analyzer  # noqa: E402
 import config  # noqa: E402
 import instruments
 import pattern_detector  # noqa: E402
+import trend  # noqa: E402
 
 
 def _df(rows: list[tuple]) -> pd.DataFrame:
@@ -1182,6 +1183,123 @@ def test_pool_needs_equal_extremes():
     rows.append((100.7, 100.9, 100.5, 100.8, 50.0))
     assert pattern_detector._pools(_df(rows), 23, atr=0.8, side="long") == []
     assert pattern_detector.detect_spring(_df(rows), [_LVL_RESIST], trend="sideways") is None
+
+
+# ── Стратегия №4: тренд по недельному каналу (14.09.2026) ────────────────────
+
+def _trend_rows(closes: list[float], wick: float = 0.3) -> list[tuple]:
+    """Свечи без разрывов: открытие = прошлое закрытие, фитили на wick с обеих сторон."""
+    rows, prev = [], closes[0]
+    for c in closes:
+        rows.append((prev, max(prev, c) + wick, min(prev, c) - wick, c, 100.0))
+        prev = c
+    return rows
+
+
+def _long_position(df, entry=100.0, stop=99.0, at=245) -> dict:
+    return {"direction": "long", "entry_price": entry, "stop_loss": stop,
+            "entry_time": str(df.index[at]), "signal_bar": str(df.index[at - 1])}
+
+
+def test_trend_first_run_starts_flat():
+    """Первый запуск ничего не открывает: пробой до запуска — не наш вход."""
+    df = _df(_trend_rows([100.0] * 300))
+    last, pos, events = trend.step(df, None, None)
+    assert last == str(df.index[-2]) and pos is None and events == []
+
+
+def test_trend_long_entry_on_weekly_high():
+    """Закрытие выше максимума недели → лонг на открытии следующего часа, стоп 3 ATR."""
+    df = _df(_trend_rows([100.0] * 250 + [102.0, 102.1]))
+    last, pos, events = trend.step(df, str(df.index[249]), None)
+    atr = trend.channels(df)["atr"][250]
+    assert [e["type"] for e in events] == ["entry"]
+    assert pos["direction"] == "long"
+    assert pos["entry_price"] == df["open"].iloc[251]
+    assert abs(pos["stop_loss"] - (pos["entry_price"] - 3 * atr)) < 1e-9
+    assert abs(events[0]["level"] - 100.3) < 1e-9
+    assert last == str(df.index[250])
+
+
+def test_trend_short_entry_on_weekly_low():
+    df = _df(_trend_rows([100.0] * 250 + [98.0, 97.9]))
+    _, pos, events = trend.step(df, str(df.index[249]), None)
+    atr = trend.channels(df)["atr"][250]
+    assert [e["type"] for e in events] == ["entry"] and pos["direction"] == "short"
+    assert abs(pos["stop_loss"] - (pos["entry_price"] + 3 * atr)) < 1e-9
+    assert abs(events[0]["level"] - 99.7) < 1e-9
+
+
+def test_trend_needs_full_week_high():
+    """Выше максимума 42 часов, но не недели — входа нет: канал входа 168 часов."""
+    closes = [100.0] * 100 + [105.0] + [100.0] * 149 + [102.0, 102.1]
+    df = _df(_trend_rows(closes))
+    _, pos, events = trend.step(df, str(df.index[249]), None)
+    assert events == [] and pos is None
+
+
+def test_trend_stop_then_reverse_on_same_candle():
+    """Стоп внутри свечи, а её закрытие под минимумом недели — сразу шорт (как в замере)."""
+    df = _df(_trend_rows([100.0] * 250 + [98.9, 98.8]))
+    _, pos, events = trend.step(df, str(df.index[249]), _long_position(df))
+    assert [e["type"] for e in events] == ["stop", "entry"]
+    assert events[0]["exit_price"] == 99.0 and abs(events[0]["result_r"] + 1) < 1e-9
+    assert pos["direction"] == "short"
+
+
+def test_trend_stop_gap_fills_at_open():
+    """Открылись уже за стопом — закрытие по цене открытия, итог хуже −1R."""
+    rows = _trend_rows([100.0] * 250 + [98.4, 98.3])
+    rows[250] = (98.5, 98.6, 98.2, 98.4, 100.0)
+    df = _df(rows)
+    _, _, events = trend.step(df, str(df.index[249]), _long_position(df))
+    assert events[0]["type"] == "stop" and events[0]["exit_price"] == 98.5
+    assert abs(events[0]["result_r"] + 1.5) < 1e-9
+
+
+def test_trend_channel_exit_waits_next_candle_to_reenter():
+    """Выход по каналу — на открытии следующего часа, и новый вход не на той же свече."""
+    df = _df(_trend_rows([100.0] * 250 + [99.0, 98.5]))
+    last, pos, events = trend.step(df, str(df.index[249]), _long_position(df, stop=90.0, at=240))
+    assert [e["type"] for e in events] == ["exit"] and pos is None
+    assert events[0]["exit_price"] == df["open"].iloc[251]
+    df2 = _df(_trend_rows([100.0] * 250 + [99.0, 98.5, 98.4]))
+    _, pos2, events2 = trend.step(df2, last, None)
+    assert [e["type"] for e in events2] == ["entry"] and pos2["direction"] == "short"
+
+
+def test_trend_step_is_idempotent():
+    """Повторный шаг на тех же свечах ничего не делает — рестарт не дублирует сделку."""
+    df = _df(_trend_rows([100.0] * 250 + [102.0, 102.1]))
+    last, pos, _ = trend.step(df, str(df.index[249]), None)
+    last2, pos2, events2 = trend.step(df, last, pos)
+    assert events2 == [] and last2 == last and pos2 == pos
+
+
+def test_trend_incremental_matches_one_pass():
+    """Свечи кусками (как каждые 5 минут и после простоя) = вся история одним куском."""
+    import random
+    rnd = random.Random(11)
+    closes, price, drift = [], 100.0, 0.0
+    for i in range(1200):
+        if i % 150 == 0:
+            drift = rnd.choice([-0.08, 0.0, 0.08])
+        price = max(10.0, price + drift + rnd.gauss(0, 0.5))
+        closes.append(price)
+    df = _df(_trend_rows(closes))
+    start = str(df.index[trend.WARM])
+    _, _, batch = trend.step(df, start, None)
+    last, pos, pieces = start, None, []
+    for end in range(trend.WARM + 5, len(df) + 1, 7):
+        last, pos, ev = trend.step(df.iloc[:end], last, pos)
+        pieces += ev
+    last, pos, ev = trend.step(df, last, pos)
+    pieces += ev
+
+    def key(e):
+        return (e["type"], e["entry_time"], e.get("exit_time"), round(e["entry_price"], 9))
+    assert len(batch) >= 6
+    assert [key(e) for e in pieces] == [key(e) for e in batch]
 
 
 if __name__ == "__main__":
