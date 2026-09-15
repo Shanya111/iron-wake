@@ -1302,6 +1302,29 @@ def test_trend_incremental_matches_one_pass():
     assert [key(e) for e in pieces] == [key(e) for e in batch]
 
 
+# ── Ложный пробой выключен (15 сентября 2026) ────────────────────────────────
+
+def test_spring_switch_controls_scheduler_jobs():
+    """SPRING_SIGNALS снимает ровно две задачи: поиск ложного пробоя и пересчёт уровней.
+
+    Тренд, трекинг открытых сигналов, журнал и алерты стоят при любом значении —
+    иначе выключение одной стратегии молча остановило бы другую или бросило бы
+    открытые сигналы на полпути."""
+    import scheduler
+    saved = config.SPRING_SIGNALS
+    try:
+        config.SPRING_SIGNALS = False
+        off = {f for f, _ in scheduler.jobs()}
+        config.SPRING_SIGNALS = True
+        on = {f for f, _ in scheduler.jobs()}
+    finally:
+        config.SPRING_SIGNALS = saved
+    always = {scheduler.monitor_trend, scheduler.track_signals,
+              scheduler.track_trades, scheduler.check_alerts}
+    assert off == always
+    assert on == always | {scheduler.run_analysis, scheduler.monitor_signals}
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

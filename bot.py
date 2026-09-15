@@ -1045,7 +1045,12 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
             blockers = ex["sides"][side]["blockers"] or ["условия сложились"]
             lines.append(f"  {SIDE_WORD[side]}: сигнала нет. Не хватает:")
             lines += [f"     • {b}" for b in blockers]
-    if not fired:
+    if not config.SPRING_SIGNALS:
+        # Ложный пробой снят с боя 15 сентября 2026. Разбор остался справкой, но
+        # «СИГНАЛ ЕСТЬ» без этой строки читается как «сейчас придёт уведомление».
+        lines.append("  ⏸ Авто-сигналы ложного пробоя ВЫКЛЮЧЕНЫ — уведомление по ним "
+                     "не придёт. Разбор выше — справка.")
+    elif not fired:
         lines.append("  Ждём: сигнал родится на той свече, которая закроет все пункты выше.")
 
     f = ex["filters"]
@@ -1149,6 +1154,10 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
         if ob.get("ask_wall"):
             dom += f", крупная продажа у {fmt(ob['ask_wall']['price'], d)}"
         out.append(dom)
+    if not config.SPRING_SIGNALS:
+        # Иначе модель пообещает «бот пришлёт сигнал», а бот его не пришлёт.
+        out.append("ВАЖНО: авто-сигналы ложного пробоя в боте ВЫКЛЮЧЕНЫ — уведомления "
+                   "по этому раскладу не будет, не обещай его.")
     out.append("Прокомментируй расклад.")
     return "\n".join(out)
 
@@ -1591,8 +1600,13 @@ def settings_text(user_id: int, is_admin: bool) -> str:
         if is_admin else
         "Это твоя личная настройка. «Сбросить» вернёт общую."
     )
+    # Ложный пробой снят с боя 15 сентября 2026: фильтры остались, но сигналов по ним
+    # бот не шлёт — без этой строки меню обещало бы то, чего нет.
+    off = ("⏸ Авто-сигналы ложного пробоя сейчас ВЫКЛЮЧЕНЫ — эти фильтры влияют "
+           "только на разбор в /analyze.\n\n" if not config.SPRING_SIGNALS else "")
     return (
         "⚙️ Строгость отбора сигналов\n\n"
+        f"{off}"
         f"Сейчас: {_filters_line(dist, risk)}{personal}\n{stale}\n"
         "Оба фильтра про одно — не входить вдогонку за ушедшим движением. Пружина "
         "торгуется ОТ уровня: сняли ликвидность фитилём и вернулись; вход в конце "

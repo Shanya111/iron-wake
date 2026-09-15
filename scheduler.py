@@ -11,6 +11,9 @@
   • track_trades (каждые 5 мин) — исход сделок журнала;
   • check_alerts (каждые 5 мин) — алерты «касание уровня» (правило — в alerts.py).
 
+С 15 сентября 2026 первые две (run_analysis и monitor_signals) НЕ ставятся:
+ложный пробой снят с боя (config.SPRING_SIGNALS), состав задач решает jobs().
+
 Анализируются инструменты движка (все 21 из реестра: крипта, золото, нефть и пять
 валютных пар) из числа подписанных — лишние пары не дёргаем. Форекс вернулся в движок
 3 сентября 2026; вне форекс-сессии биржа держит его контракты на паузе, и запрос
@@ -716,14 +719,34 @@ async def check_alerts(bot) -> None:
             print(f"[check_alerts] не отправилось {a['user_id']}: {e}")
 
 
+def jobs() -> list[tuple]:
+    """Какие задачи ставятся в планировщик и с каким интервалом (в минутах).
+
+    Вынесено из setup, чтобы состав проверялся тестом без запуска планировщика.
+    Ложный пробой (run_analysis + monitor_signals) ставится только при
+    config.SPRING_SIGNALS — выключен 15 сентября 2026. track_signals остаётся всегда:
+    он доводит до исхода сигналы, открытые до выключения.
+    """
+    out = []
+    if config.SPRING_SIGNALS:
+        out += [(run_analysis, config.ANALYZE_EVERY_MIN),
+                (monitor_signals, config.MONITOR_EVERY_MIN)]
+    out += [
+        (monitor_trend, config.MONITOR_EVERY_MIN),
+        (track_signals, config.MONITOR_EVERY_MIN),
+        (track_trades, config.MONITOR_EVERY_MIN),
+        (check_alerts, config.ALERT_EVERY_MIN),
+    ]
+    return out
+
+
 def setup(bot) -> AsyncIOScheduler:
-    """Создаёт и запускает единственный планировщик бота (шесть задач, см. модуль)."""
+    """Создаёт и запускает единственный планировщик бота (состав задач — jobs())."""
     sched = AsyncIOScheduler()
-    sched.add_job(run_analysis, "interval", minutes=config.ANALYZE_EVERY_MIN, args=[bot])
-    sched.add_job(monitor_signals, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
-    sched.add_job(monitor_trend, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
-    sched.add_job(track_signals, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
-    sched.add_job(track_trades, "interval", minutes=config.MONITOR_EVERY_MIN, args=[bot])
-    sched.add_job(check_alerts, "interval", minutes=config.ALERT_EVERY_MIN, args=[bot])
+    for func, minutes in jobs():
+        sched.add_job(func, "interval", minutes=minutes, args=[bot])
+    if not config.SPRING_SIGNALS:
+        print("[scheduler] ложный пробой выключен (SPRING_SIGNALS = False): "
+              "run_analysis и monitor_signals не запущены")
     sched.start()
     return sched
