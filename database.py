@@ -132,6 +132,16 @@ def init_db() -> None:
                 UNIQUE(user_id, instrument)
             )
         """)
+        # Галочки стратегий в /subscribe (15.09.2026). Хранится ОТКАЗ, а не согласие:
+        # по умолчанию подписка на инструмент приносит сигналы обеих стратегий, как и до
+        # появления галочек, — уже подписанным ничего мигрировать не нужно.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS strategy_off (
+                user_id  INTEGER NOT NULL,
+                strategy TEXT    NOT NULL,   -- код из config.STRATEGIES: spring | trend
+                UNIQUE(user_id, strategy)
+            )
+        """)
         # Журнал сделок пользователя (записывается свободным текстом через LLM).
         # instrument — код инструмента движка ИЛИ символ контракта BingX (своя пара; до
         # 26.08.2026 тут были тикеры Yahoo — те записи читаются, но не ведутся). bar_time —
@@ -586,13 +596,45 @@ def get_user_subscriptions(user_id: int) -> list[str]:
     return [row[0] for row in rows]
 
 
-def get_subscribers(instrument: str) -> list[int]:
-    """user_id всех подписчиков инструмента (кому слать сигнал)."""
+def get_subscribers(instrument: str, strategy: str | None = None) -> list[int]:
+    """user_id подписчиков инструмента (кому слать сигнал).
+
+    strategy — код из config.STRATEGIES: тогда без тех, кто снял галочку этой стратегии.
+    None — все подписчики инструмента (старые «общие» сигналы, см. scheduler._send_to_owner).
+    """
+    with sqlite3.connect(DB_PATH) as conn:
+        if strategy is None:
+            rows = conn.execute(
+                "SELECT user_id FROM subscriptions WHERE instrument = ?", (instrument,)
+            ).fetchall()
+        else:
+            rows = conn.execute("""
+                SELECT user_id FROM subscriptions
+                WHERE instrument = ?
+                  AND user_id NOT IN (SELECT user_id FROM strategy_off WHERE strategy = ?)
+            """, (instrument, strategy)).fetchall()
+    return [row[0] for row in rows]
+
+
+def set_strategy(user_id: int, strategy: str, on: bool) -> None:
+    """Включить или выключить пользователю сигналы стратегии (галочка в /subscribe)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        if on:
+            conn.execute("DELETE FROM strategy_off WHERE user_id = ? AND strategy = ?",
+                         (user_id, strategy))
+        else:
+            conn.execute("INSERT OR IGNORE INTO strategy_off (user_id, strategy) VALUES (?, ?)",
+                         (user_id, strategy))
+        conn.commit()
+
+
+def get_strategies_off(user_id: int) -> set[str]:
+    """Стратегии, которые пользователь выключил. Остальные у него включены."""
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT user_id FROM subscriptions WHERE instrument = ?", (instrument,)
+            "SELECT strategy FROM strategy_off WHERE user_id = ?", (user_id,)
         ).fetchall()
-    return [row[0] for row in rows]
+    return {row[0] for row in rows}
 
 
 def get_subscribed_instruments() -> list[str]:

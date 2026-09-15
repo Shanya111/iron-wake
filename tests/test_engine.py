@@ -17,6 +17,7 @@ import analyzer  # noqa: E402
 import config  # noqa: E402
 import instruments
 import pattern_detector  # noqa: E402
+import spring_june  # noqa: E402
 import trend  # noqa: E402
 
 
@@ -1323,6 +1324,153 @@ def test_spring_switch_controls_scheduler_jobs():
               scheduler.track_trades, scheduler.check_alerts}
     assert off == always
     assert on == always | {scheduler.run_analysis, scheduler.monitor_signals}
+
+
+# ── Ложный пробой в редакции 23 июня (spring_june, 15 сентября 2026) ─────────
+#
+# Правила первого движка: прокол глубже 0.05% ЦЕНЫ уровня, объём ×1.5 на той же
+# свече, фильтр тренда, стоп за фитилём + 0.1%, цель — ближайший уровень. Фикстуры
+# взяты сентябрьские, чтобы тесты ОТЛИЧАЛИ правила: там, где сентябрьский детектор
+# молчит (вялый отбой, выкуп уровня снизу), июньский обязан дать сигнал.
+
+_JUNE_LONG = [{"price": 100.0, "type": "support", "strength": "strong"},
+              {"price": 110.0, "type": "resistance", "strength": "weak"}]
+_JUNE_SHORT = [{"price": 100.0, "type": "resistance", "strength": "weak"},
+               {"price": 90.0, "type": "support", "strength": "weak"}]
+
+
+def test_june_takes_weak_rebound():
+    """Силы отбоя в июне не было: вялый выкуп прокола — тоже сигнал."""
+    df = _weak_rebound_spring_df()
+    assert pattern_detector.detect_spring(df, _JUNE_LONG, trend="up") is None
+    sig = spring_june.detect_spring(df, _JUNE_LONG, trend="up")
+    assert sig is not None and sig["direction"] == "long" and sig["priority"] == "high"
+    assert abs(sig["entry_price"] - 100.2) < 1e-9
+    assert abs(sig["stop_loss"] - 99.0 * (1 - config.STOP_SPREAD)) < 1e-9
+    assert abs(sig["take_profit"] - 110.0) < 1e-9
+
+
+def test_june_break_depth_is_share_of_level_price():
+    """Прокол мерится долей ЦЕНЫ уровня: 0.04% мало, 0.06% хватает."""
+    levels = [{"price": 100.0, "type": "support", "strength": "weak"}]
+    df = _spring_df()
+    low = df.columns.get_loc("low")
+    df.iloc[23, low] = 100.0 * (1 - 0.0004)
+    assert spring_june.detect_spring(df, levels, trend="up") is None
+    df.iloc[23, low] = 100.0 * (1 - 0.0006)
+    assert spring_june.detect_spring(df, levels, trend="up") is not None
+
+
+def test_june_needs_volume_and_trend():
+    df = _spring_df()
+    assert spring_june.detect_spring(df, _JUNE_LONG, trend="down") is None
+    df.iloc[23, df.columns.get_loc("volume")] = 100.0
+    assert spring_june.detect_spring(df, _JUNE_LONG, trend="up") is None
+
+
+def test_june_upthrust_stop_behind_wick():
+    df = _upthrust_df()
+    sig = spring_june.detect_upthrust(df, _JUNE_SHORT, trend="down")
+    assert sig is not None and sig["direction"] == "short"
+    assert abs(sig["entry_price"] - 99.5) < 1e-9
+    assert abs(sig["stop_loss"] - 101.0 * (1 + config.STOP_SPREAD)) < 1e-9
+    assert abs(sig["take_profit"] - 90.0) < 1e-9
+    assert spring_june.detect_upthrust(df, _JUNE_SHORT, trend="up") is None
+
+
+def test_june_target_takes_closest_level():
+    """Минимальной цели в июне не было: уровень вплотную к закрытию — это и есть цель."""
+    df = _spring_df()   # закрытие свечи пробоя 100.5
+    levels = _JUNE_LONG + [{"price": 100.55, "type": "resistance", "strength": "weak"}]
+    sig = spring_june.detect_spring(df, levels, trend="up")
+    assert abs(sig["take_profit"] - 100.55) < 1e-9
+
+
+def test_june_fallback_target_two_risks():
+    df = _spring_df()
+    levels = [{"price": 100.0, "type": "support", "strength": "weak"}]
+    sig = spring_june.detect_spring(df, levels, trend="up")
+    risk = 100.5 - 99.0 * (1 - config.STOP_SPREAD)
+    assert abs(sig["take_profit"] - (100.5 + risk * config.FALLBACK_RR)) < 1e-9
+
+
+def test_june_no_fresh_cross_needed():
+    """Выкуп уровня снизу сентябрьский движок свипом не считает, июньский — берёт."""
+    df = _below_level_df(fresh=False)
+    levels = [_LVL_SUPPORT, _LVL_RESIST]
+    assert pattern_detector.detect_spring(df, levels, trend="sideways") is None
+    assert spring_june.detect_spring(df, levels, trend="sideways") is not None
+
+
+def test_june_explain_agrees_with_detector():
+    """/analyze по правилам 23 июня: вердикт, пробитый уровень и цель — как у детектора."""
+    quiet = _spring_df()
+    quiet.iloc[23, quiet.columns.get_loc("volume")] = 100.0
+    cases = [
+        (_spring_df(), _JUNE_LONG, "up"),
+        (quiet, _JUNE_LONG, "up"),
+        (_weak_rebound_spring_df(), _JUNE_LONG, "up"),
+        (_weak_rebound_spring_df(), _JUNE_LONG, "down"),
+        (_upthrust_df(), _JUNE_SHORT, "down"),
+        (_upthrust_df(), _JUNE_SHORT, "sideways"),
+        (_below_level_df(fresh=False), [_LVL_SUPPORT, _LVL_RESIST], "sideways"),
+    ]
+    fired = 0
+    for df, levels, tr in cases:
+        ex = spring_june.explain(df, levels, tr)
+        assert ex["rules"] == "june23" and ex["pools"] == []
+        for side, detect in (("long", spring_june.detect_spring),
+                             ("short", spring_june.detect_upthrust)):
+            sig = detect(df, levels, tr)
+            s = ex["sides"][side]
+            assert s["ready"] == (sig is not None), (side, tr, s["blockers"])
+            if sig is None:
+                continue
+            fired += 1
+            assert abs(s["broken_level"]["price"] - sig["level_price"]) < 1e-9
+            if s["target"] is not None:
+                assert abs(s["target"] - sig["take_profit"]) < 1e-9
+    assert fired >= 4   # иначе тест сравнивал бы одни «сигнала нет»
+
+
+def test_spring_rules_follow_engine_switch():
+    """Сигналы и /analyze берут правила из ОДНОГО модуля, его выбирает SPRING_ENGINE."""
+    import scheduler
+    saved = config.SPRING_ENGINE
+    try:
+        config.SPRING_ENGINE = "june23"
+        assert scheduler.spring_rules() is spring_june
+        config.SPRING_ENGINE = "september"
+        assert scheduler.spring_rules() is pattern_detector
+    finally:
+        config.SPRING_ENGINE = saved
+
+
+# ── Галочки стратегий в /subscribe (15 сентября 2026) ────────────────────────
+
+def test_strategy_checkbox_filters_subscribers():
+    """Снятая галочка убирает человека из рассылки ЭТОЙ стратегии, но не из подписки
+    на инструмент и не из другой стратегии. По умолчанию включены обе."""
+    import tempfile
+    from pathlib import Path
+    import database
+    saved = database.DB_PATH
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        database.DB_PATH = Path(tmp) / "test.db"
+        try:
+            database.init_db()
+            database.add_subscription(1, "BTC")
+            database.add_subscription(2, "BTC")
+            assert sorted(database.get_subscribers("BTC", "spring")) == [1, 2]
+            database.set_strategy(2, "spring", False)
+            assert database.get_strategies_off(2) == {"spring"}
+            assert database.get_subscribers("BTC", "spring") == [1]
+            assert sorted(database.get_subscribers("BTC", "trend")) == [1, 2]
+            assert sorted(database.get_subscribers("BTC")) == [1, 2]
+            database.set_strategy(2, "spring", True)
+            assert sorted(database.get_subscribers("BTC", "spring")) == [1, 2]
+        finally:
+            database.DB_PATH = saved
 
 
 if __name__ == "__main__":

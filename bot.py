@@ -30,7 +30,6 @@ import analyzer
 import config
 import data_fetcher
 import database
-import pattern_detector
 import scheduler as engine
 from llm import ANALYST_PROMPT, ask_openrouter, classify_intent
 from instruments import (
@@ -399,7 +398,7 @@ HELP_TEXT = (
     "/alert — алерт: уведомлю, когда цена коснётся уровня\n"
     "/myalerts — мои алерты (посмотреть и удалить)\n"
     "/analyze — разбор инструмента глазами движка: что видит, чего не хватает\n"
-    "/subscribe — подписка на торговые сигналы (Spring/Upthrust)\n"
+    "/subscribe — подписка на сигналы: стратегии (ложный пробой, тренд) и инструменты\n"
     "/signals — последние сигналы\n"
     "/stats — статистика сигналов (винрейт, итог в R) за 30 дней / всё время\n"
     "/trend — тренд по недельному каналу: позиции модели и итог\n"
@@ -934,9 +933,12 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
     Смысл не в описании рынка вообще, а в ответе на вопрос «что здесь происходит
     глазами движка и чего не хватает до сигнала». Порядок пунктов совпадает с
     порядком проверок в pattern_detector (тренд → уровни → объём → отбой → пробой → R:R).
+    Разбор по правилам 23 июня (spring_june, ex["rules"] == "june23") идёт без пункта
+    про отбой и со своими порогами — у того движка их нет.
     """
     c = ex["close"]
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(c)
+    june = ex.get("rules") == "june23"
     trend_ru = {
         "up": "восходящий ↑ — движок берёт только ЛОНГИ",
         "down": "нисходящий ↓ — движок берёт только ШОРТЫ",
@@ -987,22 +989,27 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
         whose = "" if off == 0 else f" — уровень проколот {off} ч назад"
         lines.append(f"  {SIDE_WORD[side]}: {s['vol_ratio']:.1f}× среднего"
                      f"{whose} {'✅' if s['vol_ok'] else '❌'}")
-    lines += [
-        "",
-        f"4. Сила отбоя — где свеча закрылась внутри своего размаха "
-        f"(нужно от {config.MIN_CLOSE_POS:g}):",
-    ]
-    # Отбой считается ОТ СВОЕГО края: лонгу нужно закрытие у максимума свечи, шорту —
-    # у минимума. Поэтому число у сторон разное, и печатаем его по каждой отдельно.
-    for side in live:
-        s = ex["sides"][side]
-        if s["rebound"] is None:
-            lines.append(f"  {SIDE_WORD[side]}: свеча без размаха — не измерить ❌")
-        else:
-            lines.append(f"  {SIDE_WORD[side]}: {s['rebound']:.2f} "
-                         f"{'✅' if s['rebound_ok'] else '❌ — прокол выкупили вяло'}")
+    # Пункт про отбой есть только у правил сентября: движок 23 июня силу отбоя не
+    # проверяет. Нумерацию сдвигаем, чтобы в отчёте не было дырки.
+    num = 4
+    if not june:
+        lines += [
+            "",
+            f"{num}. Сила отбоя — где свеча закрылась внутри своего размаха "
+            f"(нужно от {config.MIN_CLOSE_POS:g}):",
+        ]
+        # Отбой считается ОТ СВОЕГО края: лонгу нужно закрытие у максимума свечи, шорту —
+        # у минимума. Поэтому число у сторон разное, и печатаем его по каждой отдельно.
+        for side in live:
+            s = ex["sides"][side]
+            if s["rebound"] is None:
+                lines.append(f"  {SIDE_WORD[side]}: свеча без размаха — не измерить ❌")
+            else:
+                lines.append(f"  {SIDE_WORD[side]}: {s['rebound']:.2f} "
+                             f"{'✅' if s['rebound_ok'] else '❌ — прокол выкупили вяло'}")
+        num += 1
 
-    lines += ["", "5. Ложный пробой (прокол уровня с возвратом обратно):"]
+    lines += ["", f"{num}. Ложный пробой (прокол уровня с возвратом обратно):"]
     for side in live:
         s = ex["sides"][side]
         br = s["broken_level"]
@@ -1014,7 +1021,7 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
             what = (s["break_note"] or "нет") + " ❌"
         lines.append(f"  {SIDE_WORD[side]}: {what}")
 
-    lines += ["", "6. Профит/риск, если бы входили прямо сейчас (справка, не порог):"]
+    lines += ["", f"{num + 1}. Профит/риск, если бы входили прямо сейчас (справка, не порог):"]
     for side in live:
         s = ex["sides"][side]
         if s["rr"] is None:
@@ -1052,23 +1059,31 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
     elif not fired:
         lines.append("  Ждём: сигнал родится на той свече, которая закроет все пункты выше.")
 
-    f = ex["filters"]
-    fl = ["вход у уровня " + (f"≤ {f['MAX_ENTRY_DIST_ATR']:g} ATR"
-                              if f["MAX_ENTRY_DIST_ATR"] else "выкл"),
-          "вдогонку " + (f"≤ {f['MAX_RISK_ATR']:g} ATR" if f["MAX_RISK_ATR"] else "выкл")]
-    # Правило стопа называем словами: он уходит за экстремум ПАРЫ свечей, поэтому
-    # бывает заметно дальше, чем «под свечой сигнала», и это удивляет.
-    stop_rule = ("за дальним экстремумом свечи сигнала и предыдущей"
-                 if config.STOP_STRUCT_BARS else "за экстремумом свечи сигнала")
-    lines += ["", f"⚙️ Фильтры отбора: {', '.join(fl)}",
-              f"     Пороги движка: прокол ≥ {config.BREAK_ATR:g} ATR, объём "
-              f"×{config.VOL_MULT:g} на сигнальной свече, отбой ≥ {config.MIN_CLOSE_POS:g} "
-              f"размаха свечи",
-              "     Свип засчитывается, только если до прокола цена была по другую "
-              "сторону уровня — выкуп уровня снизу это не свип",
-              f"     Стоп — {stop_rule}, плюс запас {config.STOP_ATR:g} ATR",
-              f"     Цель — ближайший встречный уровень не ближе "
-              f"{config.MIN_TARGET_ATR:g} ATR от входа"]
+    if june:
+        # Фильтров строгости у движка 23 июня не было — строку про них не печатаем.
+        lines += ["", "⚙️ Правила движка — редакция 23 июня 2026:",
+                  f"     Прокол уровня глубже {config.BREAK_PCT * 100:g}% его цены и закрытие "
+                  f"обратно, объём ×{config.VOL_MULT:g} на этой же свече, по тренду дневки",
+                  f"     Стоп — за фитилём свечи плюс {config.STOP_SPREAD * 100:g}% цены",
+                  "     Цель — ближайший встречный уровень, какой есть"]
+    else:
+        f = ex["filters"]
+        fl = ["вход у уровня " + (f"≤ {f['MAX_ENTRY_DIST_ATR']:g} ATR"
+                                  if f["MAX_ENTRY_DIST_ATR"] else "выкл"),
+              "вдогонку " + (f"≤ {f['MAX_RISK_ATR']:g} ATR" if f["MAX_RISK_ATR"] else "выкл")]
+        # Правило стопа называем словами: он уходит за экстремум ПАРЫ свечей, поэтому
+        # бывает заметно дальше, чем «под свечой сигнала», и это удивляет.
+        stop_rule = ("за дальним экстремумом свечи сигнала и предыдущей"
+                     if config.STOP_STRUCT_BARS else "за экстремумом свечи сигнала")
+        lines += ["", f"⚙️ Фильтры отбора: {', '.join(fl)}",
+                  f"     Пороги движка: прокол ≥ {config.BREAK_ATR:g} ATR, объём "
+                  f"×{config.VOL_MULT:g} на сигнальной свече, отбой ≥ {config.MIN_CLOSE_POS:g} "
+                  f"размаха свечи",
+                  "     Свип засчитывается, только если до прокола цена была по другую "
+                  "сторону уровня — выкуп уровня снизу это не свип",
+                  f"     Стоп — {stop_rule}, плюс запас {config.STOP_ATR:g} ATR",
+                  f"     Цель — ближайший встречный уровень не ближе "
+                  f"{config.MIN_TARGET_ATR:g} ATR от входа"]
     # Скользящий час меняет не правила, а МОМЕНТ проверки, и человеку это надо
     # сказать: иначе он будет искать сигнальную свечу на круглом часе и не найдёт.
     if config.ROLLING_HOUR:
@@ -1124,8 +1139,10 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
         out.append("Пулы ликвидности (равные экстремумы, движок свипает их наравне "
                    "с уровнями): " + ", ".join(fmt(x, d) for x in near_pools))
     # Сила отбоя — условие про ту же свечу, и оно у сторон разное. Без него модель
-    # видела бы блокер «отбой 0.31 — порог 0.6» без всякого контекста.
-    for side in live:
+    # видела бы блокер «отбой 0.31 — порог 0.6» без всякого контекста. У правил
+    # 23 июня такого условия нет.
+    june = ex.get("rules") == "june23"
+    for side in ([] if june else live):
         reb = ex["sides"][side]["rebound"]
         out.append(f"{side}: отбой " + ("не измерить (свеча без размаха)" if reb is None
                                         else f"{reb:.2f} размаха свечи, "
@@ -1157,6 +1174,16 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
         # Иначе модель пообещает «бот пришлёт сигнал», а бот его не пришлёт.
         out.append("ВАЖНО: авто-сигналы ложного пробоя в боте ВЫКЛЮЧЕНЫ — уведомления "
                    "по этому раскладу не будет, не обещай его.")
+    if june:
+        # ANALYST_PROMPT описывает правила сентября: без этой строки модель объяснит
+        # человеку условия, которых у движка 23 июня нет.
+        out.append(
+            f"ВАЖНО: движок работает по правилам 23 июня 2026 — прокол уровня глубже "
+            f"{config.BREAK_PCT * 100:g}% его цены с закрытием обратно, объём "
+            f"×{config.VOL_MULT:g} на этой же свече, сделка по тренду дневки; стоп за фитилём "
+            f"свечи плюс {config.STOP_SPREAD * 100:g}%; цель — ближайший встречный уровень, "
+            "какой есть. Силы отбоя, свежего пересечения, пулов ликвидности, ожидания "
+            "возврата и минимальной цели у него НЕТ — не упоминай их.")
     out.append("Прокомментируй расклад.")
     return "\n".join(out)
 
@@ -1183,7 +1210,10 @@ async def _do_analyze(message: Message, code: str, user_id: int):
 
     # Разбор — по ЛИЧНЫМ фильтрам пользователя: он должен видеть свой отбор, а не чужой.
     settings = config.effective(database.get_user_settings(user_id))
-    ex = pattern_detector.explain(h1, levels, trend, settings)
+    # Разбор — по тем же правилам, по которым бот шлёт сигналы (с 15.09.2026 это
+    # редакция 23 июня, см. engine.spring_rules).
+    rules = engine.spring_rules()
+    ex = rules.explain(h1, levels, trend, settings)
     if not ex.get("enough_history"):
         await waiting.delete()
         await message.answer("Слишком мало часовых свечей для разбора, попробуй позже.")
@@ -1191,8 +1221,8 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     # Сам детектор гоняем тоже: если сигнал есть, показываем ЕГО числа, а не свои
     # пересчёты. Заодно это страховка от расхождения explain() и _detect.
     signals = {
-        "long": pattern_detector.detect_spring(h1, levels, trend, settings),
-        "short": pattern_detector.detect_upthrust(h1, levels, trend, settings),
+        "long": rules.detect_spring(h1, levels, trend, settings),
+        "short": rules.detect_upthrust(h1, levels, trend, settings),
     }
 
     # Стакан (DOM) есть у всех инструментов движка (BingX), включая золото и нефть —
@@ -1301,14 +1331,46 @@ async def cb_analyze(call: CallbackQuery):
     await _do_analyze(call.message, code, call.from_user.id)
 
 
+def subscribe_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Клавиатура /subscribe: сверху галочки стратегий, ниже — инструменты.
+
+    Сигнал приходит, только если отмечены И стратегия, И инструмент (фильтр — в
+    database.get_subscribers). Стратегии — по одной в ряд: подписи длинные, а на
+    телефоне больше ~38 знаков обрезается.
+    """
+    off = database.get_strategies_off(user_id)
+    rows = [[InlineKeyboardButton(text=("✅ " if code not in off else "") + name,
+                                  callback_data=f"substrat_{code}")]
+            for code, name in config.STRATEGIES.items()]
+    subs = set(database.get_user_subscriptions(user_id))
+    rows += engine_keyboard("subtoggle_", subs).inline_keyboard
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(message: Message):
-    subs = set(database.get_user_subscriptions(message.from_user.id))
     await message.answer(
-        "Подписка на торговые сигналы (Spring/Upthrust). Нажми инструмент, чтобы "
-        "включить/выключить уведомления:",
-        reply_markup=engine_keyboard("subtoggle_", subs),
+        "Подписка на торговые сигналы.\n\n"
+        "Верхние кнопки — стратегии, какие сигналы присылать:\n"
+        "• Ложный пробой — Spring/Upthrust по правилам 23 июня\n"
+        "• Тренд по недельному каналу — вход на пробое недели, выход по каналу (/trend)\n\n"
+        "Ниже — инструменты. Сигнал приходит, если отмечены и стратегия, и инструмент. "
+        "Нажми кнопку, чтобы включить или выключить:",
+        reply_markup=subscribe_keyboard(message.from_user.id),
     )
+
+
+@dp.callback_query(F.data.startswith("substrat_"))
+async def cb_substrat(call: CallbackQuery):
+    """Галочка стратегии в /subscribe: включает или выключает все её сигналы разом."""
+    code = call.data.removeprefix("substrat_")
+    if code not in config.STRATEGIES:
+        await call.answer()
+        return
+    turn_on = code in database.get_strategies_off(call.from_user.id)
+    database.set_strategy(call.from_user.id, code, turn_on)
+    await call.answer(("Включено: " if turn_on else "Выключено: ") + config.STRATEGIES[code])
+    await call.message.edit_reply_markup(reply_markup=subscribe_keyboard(call.from_user.id))
 
 
 @dp.callback_query(F.data.startswith("subtoggle_"))
@@ -1326,7 +1388,7 @@ async def cb_subtoggle(call: CallbackQuery):
         database.add_subscription(call.from_user.id, code)
         subs.add(code)
         await call.answer("Подписка оформлена")
-    await call.message.edit_reply_markup(reply_markup=engine_keyboard("subtoggle_", subs))
+    await call.message.edit_reply_markup(reply_markup=subscribe_keyboard(call.from_user.id))
 
 
 @dp.message(Command("signals"))

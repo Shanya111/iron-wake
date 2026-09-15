@@ -11,8 +11,10 @@
   • track_trades (каждые 5 мин) — исход сделок журнала;
   • check_alerts (каждые 5 мин) — алерты «касание уровня» (правило — в alerts.py).
 
-С 15 сентября 2026 первые две (run_analysis и monitor_signals) НЕ ставятся:
-ложный пробой снят с боя (config.SPRING_SIGNALS), состав задач решает jobs().
+Первые две (run_analysis и monitor_signals) ставятся только при config.SPRING_SIGNALS,
+состав задач решает jobs(). С 15 сентября 2026 ложный пробой шлёт сигналы по правилам
+23 июня (spring_june, выбор — spring_rules). Кому слать, решают подписка на инструмент
+и галочка стратегии в /subscribe (database.get_subscribers).
 
 Анализируются инструменты движка (все 21 из реестра: крипта, золото, нефть и пять
 валютных пар) из числа подписанных — лишние пары не дёргаем. Форекс вернулся в движок
@@ -36,6 +38,7 @@ import data_fetcher
 import database
 import llm
 import pattern_detector
+import spring_june
 import trend as channel_trend  # стратегия №4; имя «trend» занято трендом дневки в monitor_signals
 from instruments import ccxt_symbol, engine_codes, fmt, infer_decimals, resolve, short
 
@@ -88,6 +91,17 @@ def _subscribed_engine() -> list[str]:
     return [c for c in database.get_subscribed_instruments() if c in engine]
 
 
+def spring_rules():
+    """Модуль с правилами ложного пробоя: по нему бот шлёт сигналы и строит /analyze.
+
+    config.SPRING_ENGINE = "june23" — редакция 23 июня (spring_june), любое другое
+    значение — сентябрьская (pattern_detector). У обоих модулей одинаковые
+    detect_spring / detect_upthrust / explain, поэтому выбирается модуль целиком:
+    сигнал и разбор не могут оказаться по разным правилам.
+    """
+    return spring_june if config.SPRING_ENGINE == "june23" else pattern_detector
+
+
 async def run_analysis(bot=None) -> None:
     """Контекстный анализ (раз в час): тренд D1 + уровни D1/H1 + зоны ликвидности → БД."""
     codes = _subscribed_engine()
@@ -128,8 +142,10 @@ async def monitor_signals(bot) -> None:
     Свечи/уровни/тренд считаются один раз на инструмент (детект — чистый CPU по кешу).
     """
     codes = _subscribed_engine()
+    rules = spring_rules()
     for code in codes:
-        subscribers = database.get_subscribers(code)
+        # Только те, у кого в /subscribe отмечены и инструмент, и «Ложный пробой».
+        subscribers = database.get_subscribers(code, "spring")
         if not subscribers:
             continue
         try:
@@ -147,7 +163,7 @@ async def monitor_signals(bot) -> None:
         comment_cache: dict[tuple, str | None] = {}
         for user_id in subscribers:
             settings = config.effective(database.get_user_settings(user_id))
-            for detector in (pattern_detector.detect_spring, pattern_detector.detect_upthrust):
+            for detector in (rules.detect_spring, rules.detect_upthrust):
                 signal = detector(h1, levels, trend, settings)
                 if signal is None:
                     continue
@@ -512,8 +528,8 @@ async def monitor_trend(bot) -> None:
     как их прошёл бы замер. Окно — config.TREND_H1_LIMIT часов; лежал дольше — старые
     часы уже не восстановить, об этом строка в логе.
 
-    Сообщения уходят подписчикам инструмента из /subscribe — тем же, кто получает
-    Spring/Upthrust (решение владельца 14.09.2026). Валютные пары вне сессии на паузе:
+    Сообщения уходят подписчикам инструмента из /subscribe (решение владельца 14.09.2026),
+    у которых отмечена галочка «Тренд по недельному каналу» (с 15.09.2026). Валютные пары вне сессии на паузе:
     запрос свечей падает, инструмент пропускается до следующего раза.
     """
     for code in engine_codes():
@@ -591,7 +607,7 @@ async def _notify_trend(bot, code: str, ev: dict) -> None:
             "(без комиссии и фандинга).\n"
             f"{late}"
         )
-    for user_id in database.get_subscribers(code):
+    for user_id in database.get_subscribers(code, "trend"):
         try:
             await bot.send_message(user_id, text)
         except Exception as e:
@@ -608,7 +624,7 @@ async def trend_overview() -> str:
         "Вход: час закрылся за максимумом (минимумом) последних 168 ч. Стоп 3 ATR. "
         "Выход: час закрылся за встречным каналом 42 ч. Цели нет.",
         "Модель ведёт одну позицию на инструмент по часовым свечам BingX, сигналы "
-        "приходят подписчикам инструмента (/subscribe).",
+        "приходят, если в /subscribe отмечены эта стратегия и инструмент.",
         "",
     ]
     if opened:
@@ -724,8 +740,9 @@ def jobs() -> list[tuple]:
 
     Вынесено из setup, чтобы состав проверялся тестом без запуска планировщика.
     Ложный пробой (run_analysis + monitor_signals) ставится только при
-    config.SPRING_SIGNALS — выключен 15 сентября 2026. track_signals остаётся всегда:
-    он доводит до исхода сигналы, открытые до выключения.
+    config.SPRING_SIGNALS — выключался утром 15 сентября 2026, в тот же день включён
+    с правилами 23 июня. track_signals остаётся всегда: при выключении он доводит до
+    исхода уже открытые сигналы.
     """
     out = []
     if config.SPRING_SIGNALS:
