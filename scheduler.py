@@ -573,23 +573,21 @@ async def _notify_trend(bot, code: str, ev: dict) -> None:
         # Объём позиции, при котором стоп стоит 1% депозита. У валюты стоп узкий,
         # и нужный объём больше депозита — тогда называем и плечо.
         size = 0.01 / risk_pct if risk_pct else 0.0
-        size_txt = (f"объём ≈ {size:.0%} депозита" if size <= 1
-                    else f"объём ≈ {size:.1f} депозита (плечо от x{math.ceil(size)})")
-        edge = "выше максимума" if long_ else "ниже минимума"
-        back = "ниже минимума" if long_ else "выше максимума"
+        size_txt = (f"{size:.0%} депозита" if size <= 1
+                    else f"{size:.1f} депозита, плечо x{math.ceil(size)}")
+        # Коротко, цифрами: владелец просил «меньше букв» (15.09.2026). Цели у тренда
+        # нет, поэтому вместо неё строка выхода — текущая граница канала 42 ч.
+        stop_sign = "−" if long_ else "+"
+        back = "ниже" if long_ else "выше"
         text = (
             f"📈 ТРЕНД — {info['short']} {arrow}\n"
-            f"Час закрылся {edge} недели ({fmt(ev['level'], d)}).\n"
-            f"Вход по рынку ≈ {fmt(ev['entry_price'], d)}\n"
-            f"Стоп: {fmt(ev['stop_loss'], d)} ({risk_pct:.1%} от входа, 3 ATR)\n"
-            f"Цели нет. Выход — когда час закроется {back} последних 42 часов "
-            f"(сейчас {fmt(ev['exit_level'], d)}). Об этом напишу.\n"
-            f"Риск 1% депозита = {size_txt}.\n"
+            f"Пробой недели {fmt(ev['level'], d)}\n\n"
+            f"Вход: {fmt(ev['entry_price'], d)} по рынку\n"
+            f"Стоп: {fmt(ev['stop_loss'], d)} ({stop_sign}{risk_pct:.1%})\n"
+            f"Выход: час {back} {fmt(ev['exit_level'], d)} — напишу\n"
+            f"Объём: {size_txt} = риск 1%\n"
             f"{late}"
-            f"Замер на истории по {info['short']}: "
-            f"{config.TREND_MEASURED.get(code, 'не мерилась')}.\n\n"
-            "Это подсказка, не приказ. Решение и риск — на тебе."
-        )
+        ).rstrip()
     elif ev["type"] == "stop":
         text = (
             f"🛑 ТРЕНД — {info['short']} {arrow}: сработал стоп {fmt(ev['stop_loss'], d)}.\n"
