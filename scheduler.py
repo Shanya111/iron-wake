@@ -13,8 +13,8 @@
 
 Первые две (run_analysis и monitor_signals) ставятся только при config.SPRING_SIGNALS,
 состав задач решает jobs(). С 15 сентября 2026 ложный пробой шлёт сигналы по правилам
-23 июня (spring_june, выбор — spring_rules). Кому слать, решают подписка на инструмент
-и галочка стратегии в /subscribe (database.get_subscribers).
+23 июня (spring_june, выбор — spring_rules). Кому слать, решает подписка в /subscribe:
+она на пару «инструмент + стратегия» (database.get_subscribers).
 
 Анализируются инструменты движка (все 21 из реестра: крипта, золото, нефть и пять
 валютных пар) из числа подписанных — лишние пары не дёргаем. Форекс вернулся в движок
@@ -88,7 +88,8 @@ def _subscribed_engine() -> list[str]:
 
     Своя пара сюда не попадает никогда: подписки ставятся только по реестру."""
     engine = set(engine_codes())
-    return [c for c in database.get_subscribed_instruments() if c in engine]
+    # Задачи ложного пробоя — поэтому и подписки берутся только по нему.
+    return [c for c in database.get_subscribed_instruments("spring") if c in engine]
 
 
 def spring_rules():
@@ -144,7 +145,7 @@ async def monitor_signals(bot) -> None:
     codes = _subscribed_engine()
     rules = spring_rules()
     for code in codes:
-        # Только те, у кого в /subscribe отмечены и инструмент, и «Ложный пробой».
+        # Только те, кто подписан на этот инструмент по ложному пробою.
         subscribers = database.get_subscribers(code, "spring")
         if not subscribers:
             continue
@@ -314,7 +315,7 @@ async def _send_to_owner(bot, signal: dict, text: str) -> None:
     """Шлёт текст владельцу сигнала. Старые «общие» сигналы (user_id NULL, до
     перехода на персональные) уходят всем текущим подписчикам, как раньше."""
     owner = signal.get("user_id")
-    recipients = [owner] if owner else database.get_subscribers(signal["instrument"])
+    recipients = [owner] if owner else database.get_subscribers(signal["instrument"], "spring")
     for user_id in recipients:
         try:
             await bot.send_message(user_id, text)
@@ -529,7 +530,7 @@ async def monitor_trend(bot) -> None:
     часы уже не восстановить, об этом строка в логе.
 
     Сообщения уходят подписчикам инструмента из /subscribe (решение владельца 14.09.2026),
-    у которых отмечена галочка «Тренд по недельному каналу» (с 15.09.2026). Валютные пары вне сессии на паузе:
+    подписанным на него именно по тренду (с 15.09.2026). Валютные пары вне сессии на паузе:
     запрос свечей падает, инструмент пропускается до следующего раза.
     """
     for code in engine_codes():
@@ -624,7 +625,7 @@ async def trend_overview() -> str:
         "Вход: час закрылся за максимумом (минимумом) последних 168 ч. Стоп 3 ATR. "
         "Выход: час закрылся за встречным каналом 42 ч. Цели нет.",
         "Модель ведёт одну позицию на инструмент по часовым свечам BingX, сигналы "
-        "приходят, если в /subscribe отмечены эта стратегия и инструмент.",
+        "приходят по инструментам, отмеченным для тренда в /subscribe.",
         "",
     ]
     if opened:

@@ -1446,31 +1446,74 @@ def test_spring_rules_follow_engine_switch():
         config.SPRING_ENGINE = saved
 
 
-# ── Галочки стратегий в /subscribe (15 сентября 2026) ────────────────────────
+# ── Подписка по стратегиям в /subscribe (15 сентября 2026) ──────────────────
 
-def test_strategy_checkbox_filters_subscribers():
-    """Снятая галочка убирает человека из рассылки ЭТОЙ стратегии, но не из подписки
-    на инструмент и не из другой стратегии. По умолчанию включены обе."""
+def _temp_db():
+    """Контекст с чистой базой во временной папке; боевой путь возвращается на место."""
+    import contextlib
+    import sqlite3
     import tempfile
     from pathlib import Path
     import database
-    saved = database.DB_PATH
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
-        database.DB_PATH = Path(tmp) / "test.db"
-        try:
-            database.init_db()
-            database.add_subscription(1, "BTC")
-            database.add_subscription(2, "BTC")
-            assert sorted(database.get_subscribers("BTC", "spring")) == [1, 2]
-            database.set_strategy(2, "spring", False)
-            assert database.get_strategies_off(2) == {"spring"}
-            assert database.get_subscribers("BTC", "spring") == [1]
-            assert sorted(database.get_subscribers("BTC", "trend")) == [1, 2]
-            assert sorted(database.get_subscribers("BTC")) == [1, 2]
-            database.set_strategy(2, "spring", True)
-            assert sorted(database.get_subscribers("BTC", "spring")) == [1, 2]
-        finally:
-            database.DB_PATH = saved
+
+    @contextlib.contextmanager
+    def ctx():
+        saved = database.DB_PATH
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            database.DB_PATH = Path(tmp) / "test.db"
+            try:
+                yield database, sqlite3
+            finally:
+                database.DB_PATH = saved
+    return ctx()
+
+
+def test_subscription_is_per_instrument_and_strategy():
+    """Одну монету — по одной стратегии, другую — по другой; рассылка каждой стратегии
+    видит только своих подписчиков. Без стратегии (NL-роутер) — подписка по обеим."""
+    with _temp_db() as (database, _):
+        database.init_db()
+        database.add_subscription(1, "BTC", "spring")
+        database.add_subscription(1, "ETH", "trend")
+        database.add_subscription(2, "BTC")
+        assert sorted(database.get_subscribers("BTC", "spring")) == [1, 2]
+        assert database.get_subscribers("BTC", "trend") == [2]
+        assert database.get_subscribers("ETH", "trend") == [1]
+        assert database.get_subscribers("ETH", "spring") == []
+        assert database.get_user_subscriptions(1, "spring") == ["BTC"]
+        assert sorted(database.get_user_subscriptions(1)) == ["BTC", "ETH"]
+        assert database.get_subscribed_instruments("spring") == ["BTC"]
+        database.remove_subscription(2, "BTC", "trend")
+        assert database.get_subscribers("BTC", "trend") == []
+        assert sorted(database.get_subscribers("BTC", "spring")) == [1, 2]
+        database.set_strategy_instruments(1, "trend", ["SOL", "XRP"])
+        assert sorted(database.get_user_subscriptions(1, "trend")) == ["SOL", "XRP"]
+        assert database.get_user_subscriptions(1, "spring") == ["BTC"]
+        database.remove_subscription(2, "BTC")
+        assert database.get_subscribers("BTC", "spring") == [1]
+
+
+def test_old_subscriptions_migrate_once_to_both_strategies():
+    """Старая подписка на инструмент становится подпиской по обеим стратегиям, кроме
+    выключенных общей галочкой (strategy_off). Миграция не повторяется при рестарте:
+    иначе снятая подписка вернулась бы сама."""
+    with _temp_db() as (database, sqlite3):
+        with sqlite3.connect(database.DB_PATH) as conn:
+            conn.execute("CREATE TABLE subscriptions (id INTEGER PRIMARY KEY, user_id INTEGER, "
+                         "instrument TEXT, created_at TEXT, UNIQUE(user_id, instrument))")
+            conn.execute("CREATE TABLE strategy_off (user_id INTEGER, strategy TEXT)")
+            conn.executemany("INSERT INTO subscriptions (user_id, instrument, created_at) "
+                             "VALUES (?, ?, '2026-09-01')", [(1, "BTC"), (1, "ETH"), (2, "BTC")])
+            conn.execute("INSERT INTO strategy_off VALUES (2, 'spring')")
+            conn.commit()
+        database.init_db()
+        assert database.get_subscribers("BTC", "spring") == [1]
+        assert sorted(database.get_subscribers("BTC", "trend")) == [1, 2]
+        assert database.get_subscribers("ETH", "spring") == [1]
+        database.remove_subscription(1, "ETH")
+        database.init_db()
+        assert database.get_subscribers("ETH", "spring") == []
+        assert database.get_subscribers("ETH", "trend") == []
 
 
 if __name__ == "__main__":

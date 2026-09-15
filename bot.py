@@ -1331,64 +1331,118 @@ async def cb_analyze(call: CallbackQuery):
     await _do_analyze(call.message, code, call.from_user.id)
 
 
-def subscribe_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Клавиатура /subscribe: сверху галочки стратегий, ниже — инструменты.
+# Метка стратегии на кнопке инструмента в /subscribe. Красной галочки среди эмодзи нет,
+# поэтому ложный пробой помечен красным кругом, тренд — обычной зелёной галочкой.
+STRATEGY_MARK = {"spring": "🔴", "trend": "✅"}
 
-    Сигнал приходит, только если отмечены И стратегия, И инструмент (фильтр — в
-    database.get_subscribers). Стратегии — по одной в ряд: подписи длинные, а на
-    телефоне больше ~38 знаков обрезается.
+
+def subscribe_keyboard(user_id: int, strategy: str = "spring") -> InlineKeyboardMarkup:
+    """Клавиатура /subscribe: подписка на пару «инструмент + стратегия».
+
+    Сверху — выбор стратегии, которую сейчас настраиваешь (👉 — выбрана), под ним
+    «отметить все / снять все» для неё и сетка инструментов. На кнопке инструмента
+    видны метки ОБЕИХ стратегий — сразу понятно, что по какой монете приходит, — а
+    нажатие переключает только выбранную. Выбранная стратегия едет в callback_data,
+    поэтому хранить это состояние на сервере не нужно.
     """
-    off = database.get_strategies_off(user_id)
-    rows = [[InlineKeyboardButton(text=("✅ " if code not in off else "") + name,
-                                  callback_data=f"substrat_{code}")]
-            for code, name in config.STRATEGIES.items()]
-    subs = set(database.get_user_subscriptions(user_id))
-    rows += engine_keyboard("subtoggle_", subs).inline_keyboard
+    subs = {s: set(database.get_user_subscriptions(user_id, s)) for s in config.STRATEGIES}
+    rows = [[InlineKeyboardButton(text=("👉 " if s == strategy else "") + f"{STRATEGY_MARK[s]} {name}",
+                                  callback_data=f"subtab:{s}")]
+            for s, name in config.STRATEGIES.items()]
+    mark = STRATEGY_MARK[strategy]
+    rows.append([
+        InlineKeyboardButton(text=f"{mark} отметить все", callback_data=f"suball:{strategy}:1"),
+        InlineKeyboardButton(text=f"{mark} снять все", callback_data=f"suball:{strategy}:0"),
+    ])
+    codes = engine_codes()
+    for i in range(0, len(codes), 2):
+        row = []
+        for c in codes[i:i + 2]:
+            marks = "".join(STRATEGY_MARK[s] for s in config.STRATEGIES if c in subs[s])
+            row.append(InlineKeyboardButton(text=f"{marks} {short(c)}".strip(),
+                                            callback_data=f"sub:{strategy}:{c}"))
+        rows.append(row)
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _redraw_subscribe(call: CallbackQuery, strategy: str) -> None:
+    """Перерисовать клавиатуру /subscribe. Повторное нажатие выбранной стратегии даёт
+    ту же разметку, и Telegram отвечает ошибкой «не изменилось» — её глотаем."""
+    try:
+        await call.message.edit_reply_markup(
+            reply_markup=subscribe_keyboard(call.from_user.id, strategy))
+    except TelegramBadRequest:
+        pass
 
 
 @dp.message(Command("subscribe"))
 async def cmd_subscribe(message: Message):
     await message.answer(
-        "Подписка на торговые сигналы.\n\n"
-        "Верхние кнопки — стратегии, какие сигналы присылать:\n"
-        "• Ложный пробой — Spring/Upthrust по правилам 23 июня\n"
-        "• Тренд по недельному каналу — вход на пробое недели, выход по каналу (/trend)\n\n"
-        "Ниже — инструменты. Сигнал приходит, если отмечены и стратегия, и инструмент. "
-        "Нажми кнопку, чтобы включить или выключить:",
+        "Подписка на торговые сигналы — отдельно по каждой стратегии:\n"
+        "🔴 ложный пробой — Spring/Upthrust по правилам 23 июня\n"
+        "✅ тренд по недельному каналу — вход на пробое недели, выход по каналу (/trend)\n\n"
+        "Выбери стратегию верхней кнопкой (👉 — выбрана) и отмечай инструменты под ней. "
+        "Метки у инструмента показывают, по каким стратегиям он приходит: «🔴✅ BTC» — "
+        "по обеим, «🔴 ETH» — только ложный пробой.",
         reply_markup=subscribe_keyboard(message.from_user.id),
     )
 
 
-@dp.callback_query(F.data.startswith("substrat_"))
-async def cb_substrat(call: CallbackQuery):
-    """Галочка стратегии в /subscribe: включает или выключает все её сигналы разом."""
-    code = call.data.removeprefix("substrat_")
-    if code not in config.STRATEGIES:
+@dp.callback_query(F.data.startswith("subtab:"))
+async def cb_subtab(call: CallbackQuery):
+    """Выбор стратегии, которую настраиваешь в /subscribe."""
+    strategy = call.data.removeprefix("subtab:")
+    if strategy not in config.STRATEGIES:
         await call.answer()
         return
-    turn_on = code in database.get_strategies_off(call.from_user.id)
-    database.set_strategy(call.from_user.id, code, turn_on)
-    await call.answer(("Включено: " if turn_on else "Выключено: ") + config.STRATEGIES[code])
-    await call.message.edit_reply_markup(reply_markup=subscribe_keyboard(call.from_user.id))
+    await call.answer(f"Настраиваешь: {config.STRATEGIES[strategy]}")
+    await _redraw_subscribe(call, strategy)
 
 
-@dp.callback_query(F.data.startswith("subtoggle_"))
-async def cb_subtoggle(call: CallbackQuery):
-    code = call.data.removeprefix("subtoggle_")
-    if code not in engine_codes():
+@dp.callback_query(F.data.startswith("suball:"))
+async def cb_suball(call: CallbackQuery):
+    """«Отметить все» / «снять все» — все инструменты по выбранной стратегии."""
+    try:
+        _, strategy, on = call.data.split(":")
+    except ValueError:
         await call.answer()
         return
-    subs = set(database.get_user_subscriptions(call.from_user.id))
-    if code in subs:
-        database.remove_subscription(call.from_user.id, code)
-        subs.discard(code)
-        await call.answer("Отписка")
+    if strategy not in config.STRATEGIES:
+        await call.answer()
+        return
+    database.set_strategy_instruments(call.from_user.id, strategy,
+                                      engine_codes() if on == "1" else [])
+    await call.answer(("Отмечены все: " if on == "1" else "Сняты все: ")
+                      + config.STRATEGIES[strategy])
+    await _redraw_subscribe(call, strategy)
+
+
+@dp.callback_query(F.data.startswith("sub:"))
+async def cb_sub(call: CallbackQuery):
+    """Кнопка инструмента в /subscribe: подписка по ВЫБРАННОЙ стратегии вкл/выкл."""
+    try:
+        _, strategy, code = call.data.split(":")
+    except ValueError:
+        await call.answer()
+        return
+    if strategy not in config.STRATEGIES or code not in engine_codes():
+        await call.answer()
+        return
+    user_id = call.from_user.id
+    name = config.STRATEGIES[strategy]
+    if code in database.get_user_subscriptions(user_id, strategy):
+        database.remove_subscription(user_id, code, strategy)
+        await call.answer(f"{short(code)}: отписка — {name}")
     else:
-        database.add_subscription(call.from_user.id, code)
-        subs.add(code)
-        await call.answer("Подписка оформлена")
-    await call.message.edit_reply_markup(reply_markup=subscribe_keyboard(call.from_user.id))
+        database.add_subscription(user_id, code, strategy)
+        await call.answer(f"{short(code)}: подписка — {name}")
+    await _redraw_subscribe(call, strategy)
+
+
+@dp.callback_query(F.data.startswith(("subtoggle_", "substrat_")))
+async def cb_subscribe_stale(call: CallbackQuery):
+    """Кнопки прежнего меню /subscribe (до подписки по стратегиям) в старых сообщениях."""
+    await call.answer("Меню подписки обновилось — открой /subscribe заново", show_alert=True)
 
 
 @dp.message(Command("signals"))
@@ -1786,11 +1840,12 @@ async def _nl_subscribe(message: Message, intent: dict, action: str) -> None:
         return
     info = resolve(code)
     if action == "subscribe":
-        database.add_subscription(message.from_user.id, code)
-        await message.answer(f"Подписал на сигналы по {info['short']}. Управление — /subscribe.")
+        database.add_subscription(message.from_user.id, code)   # по обеим стратегиям
+        await message.answer(f"Подписал на сигналы по {info['short']} — обе стратегии. "
+                             "Отдельно по стратегиям — /subscribe.")
     else:
         database.remove_subscription(message.from_user.id, code)
-        await message.answer(f"Отписал от сигналов по {info['short']}.")
+        await message.answer(f"Отписал от сигналов по {info['short']} — обе стратегии.")
 
 
 async def _nl_analyze(message: Message, intent: dict) -> None:

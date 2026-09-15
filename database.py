@@ -2,6 +2,8 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import config
+
 DB_PATH = Path(__file__).parent / "bot.db"
 
 
@@ -132,16 +134,43 @@ def init_db() -> None:
                 UNIQUE(user_id, instrument)
             )
         """)
-        # Галочки стратегий в /subscribe (15.09.2026). Хранится ОТКАЗ, а не согласие:
-        # по умолчанию подписка на инструмент приносит сигналы обеих стратегий, как и до
-        # появления галочек, — уже подписанным ничего мигрировать не нужно.
+        # ── Подписка по стратегиям (15.09.2026) ─────────────────────────────────
+        # Подписка — пара «инструмент + стратегия»: одну монету можно вести по ложному
+        # пробою, другую по тренду. Таблица subscriptions выше с этого дня не пишется
+        # и не читается — осталась источником разовой миграции (DROP необратим).
+        #
+        # Миграция выполняется ровно один раз — когда таблицы ещё нет. Проверять
+        # «таблица пустая» нельзя: человек, снявший все подписки, получил бы их обратно
+        # при следующем рестарте. Старая подписка становится подпиской на ОБЕ стратегии,
+        # кроме тех, что человек успел выключить общей галочкой (strategy_off — первая
+        # версия галочек, прожила несколько часов 15.09.2026).
+        fresh = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'signal_subscriptions'"
+        ).fetchone() is None
         conn.execute("""
-            CREATE TABLE IF NOT EXISTS strategy_off (
-                user_id  INTEGER NOT NULL,
-                strategy TEXT    NOT NULL,   -- код из config.STRATEGIES: spring | trend
-                UNIQUE(user_id, strategy)
+            CREATE TABLE IF NOT EXISTS signal_subscriptions (
+                user_id    INTEGER NOT NULL,
+                instrument TEXT    NOT NULL,
+                strategy   TEXT    NOT NULL,   -- код из config.STRATEGIES: spring | trend
+                created_at TEXT    NOT NULL,
+                UNIQUE(user_id, instrument, strategy)
             )
         """)
+        if fresh:
+            has_off = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'strategy_off'"
+            ).fetchone() is not None
+            for strategy in config.STRATEGIES:
+                sql = """
+                    INSERT OR IGNORE INTO signal_subscriptions
+                        (user_id, instrument, strategy, created_at)
+                    SELECT user_id, instrument, ?, created_at FROM subscriptions
+                """
+                params: tuple = (strategy,)
+                if has_off:
+                    sql += " WHERE user_id NOT IN (SELECT user_id FROM strategy_off WHERE strategy = ?)"
+                    params = (strategy, strategy)
+                conn.execute(sql, params)
         # Журнал сделок пользователя (записывается свободным текстом через LLM).
         # instrument — код инструмента движка ИЛИ символ контракта BingX (своя пара; до
         # 26.08.2026 тут были тикеры Yahoo — те записи читаются, но не ведутся). bar_time —
@@ -568,79 +597,86 @@ def get_trend_positions() -> list[dict]:
 
 # ── Подписки на сигналы ─────────────────────────────────────────────────────
 
-def add_subscription(user_id: int, instrument: str) -> None:
+# Подписка — пара «инструмент + стратегия» (таблица signal_subscriptions, 15.09.2026).
+# strategy=None в функциях ниже значит «по всем стратегиям»: так подписывает NL-роутер
+# («подпиши на эфир»), где стратегию человек не называет.
+
+def _strategies(strategy: str | None) -> list[str]:
+    return list(config.STRATEGIES) if strategy is None else [strategy]
+
+
+def add_subscription(user_id: int, instrument: str, strategy: str | None = None) -> None:
+    """Подписать на сигналы инструмента по стратегии (None — по всем)."""
     created_at = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT OR IGNORE INTO subscriptions (user_id, instrument, created_at)
-            VALUES (?, ?, ?)
-        """, (user_id, instrument, created_at))
+        conn.executemany("""
+            INSERT OR IGNORE INTO signal_subscriptions (user_id, instrument, strategy, created_at)
+            VALUES (?, ?, ?, ?)
+        """, [(user_id, instrument, s, created_at) for s in _strategies(strategy)])
         conn.commit()
 
 
-def remove_subscription(user_id: int, instrument: str) -> None:
+def remove_subscription(user_id: int, instrument: str, strategy: str | None = None) -> None:
+    """Отписать от сигналов инструмента по стратегии (None — по всем)."""
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "DELETE FROM subscriptions WHERE user_id = ? AND instrument = ?",
-            (user_id, instrument),
+        conn.executemany(
+            "DELETE FROM signal_subscriptions WHERE user_id = ? AND instrument = ? AND strategy = ?",
+            [(user_id, instrument, s) for s in _strategies(strategy)],
         )
         conn.commit()
 
 
-def get_user_subscriptions(user_id: int) -> list[str]:
-    """Коды инструментов, на которые подписан пользователь."""
+def set_strategy_instruments(user_id: int, strategy: str, instruments: list[str]) -> None:
+    """Оставить по стратегии РОВНО этот набор инструментов («отметить все» / «снять все»)."""
+    created_at = datetime.now().isoformat(timespec="seconds")
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT instrument FROM subscriptions WHERE user_id = ?", (user_id,)
-        ).fetchall()
+        conn.execute("DELETE FROM signal_subscriptions WHERE user_id = ? AND strategy = ?",
+                     (user_id, strategy))
+        conn.executemany("""
+            INSERT OR IGNORE INTO signal_subscriptions (user_id, instrument, strategy, created_at)
+            VALUES (?, ?, ?, ?)
+        """, [(user_id, code, strategy, created_at) for code in instruments])
+        conn.commit()
+
+
+def get_user_subscriptions(user_id: int, strategy: str | None = None) -> list[str]:
+    """Коды инструментов, на которые подписан пользователь (по стратегии или по любой)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        if strategy is None:
+            rows = conn.execute(
+                "SELECT DISTINCT instrument FROM signal_subscriptions WHERE user_id = ?",
+                (user_id,)).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT instrument FROM signal_subscriptions WHERE user_id = ? AND strategy = ?",
+                (user_id, strategy)).fetchall()
     return [row[0] for row in rows]
 
 
 def get_subscribers(instrument: str, strategy: str | None = None) -> list[int]:
-    """user_id подписчиков инструмента (кому слать сигнал).
-
-    strategy — код из config.STRATEGIES: тогда без тех, кто снял галочку этой стратегии.
-    None — все подписчики инструмента (старые «общие» сигналы, см. scheduler._send_to_owner).
-    """
+    """user_id подписчиков инструмента по стратегии — кому слать её сигнал.
+    None — подписанные по любой стратегии."""
     with sqlite3.connect(DB_PATH) as conn:
         if strategy is None:
             rows = conn.execute(
-                "SELECT user_id FROM subscriptions WHERE instrument = ?", (instrument,)
-            ).fetchall()
+                "SELECT DISTINCT user_id FROM signal_subscriptions WHERE instrument = ?",
+                (instrument,)).fetchall()
         else:
-            rows = conn.execute("""
-                SELECT user_id FROM subscriptions
-                WHERE instrument = ?
-                  AND user_id NOT IN (SELECT user_id FROM strategy_off WHERE strategy = ?)
-            """, (instrument, strategy)).fetchall()
+            rows = conn.execute(
+                "SELECT user_id FROM signal_subscriptions WHERE instrument = ? AND strategy = ?",
+                (instrument, strategy)).fetchall()
     return [row[0] for row in rows]
 
 
-def set_strategy(user_id: int, strategy: str, on: bool) -> None:
-    """Включить или выключить пользователю сигналы стратегии (галочка в /subscribe)."""
+def get_subscribed_instruments(strategy: str | None = None) -> list[str]:
+    """Уникальные инструменты с хотя бы одной подпиской (по стратегии или по любой)."""
     with sqlite3.connect(DB_PATH) as conn:
-        if on:
-            conn.execute("DELETE FROM strategy_off WHERE user_id = ? AND strategy = ?",
-                         (user_id, strategy))
+        if strategy is None:
+            rows = conn.execute("SELECT DISTINCT instrument FROM signal_subscriptions").fetchall()
         else:
-            conn.execute("INSERT OR IGNORE INTO strategy_off (user_id, strategy) VALUES (?, ?)",
-                         (user_id, strategy))
-        conn.commit()
-
-
-def get_strategies_off(user_id: int) -> set[str]:
-    """Стратегии, которые пользователь выключил. Остальные у него включены."""
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT strategy FROM strategy_off WHERE user_id = ?", (user_id,)
-        ).fetchall()
-    return {row[0] for row in rows}
-
-
-def get_subscribed_instruments() -> list[str]:
-    """Уникальные инструменты, на которые есть хотя бы одна подписка (что мониторить)."""
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT DISTINCT instrument FROM subscriptions").fetchall()
+            rows = conn.execute(
+                "SELECT DISTINCT instrument FROM signal_subscriptions WHERE strategy = ?",
+                (strategy,)).fetchall()
     return [row[0] for row in rows]
 
 
