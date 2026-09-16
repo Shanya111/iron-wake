@@ -422,7 +422,7 @@ async def cmd_help(message: Message):
 ABOUT_TEXT = (
     "iron-wake — торговый ассистент по 21 бессрочному фьючерсу BingX "
     "(14 крипто-пар, золото, нефть Brent, 5 валютных пар).\n\n"
-    "Разбирает рынок по методике VSA: тренд дневки, уровни, объём, стакан заявок. "
+    "Разбирает рынок по методике VSA: тренд по 6-часовым свечам, уровни, объём, стакан. "
     "Ищет ложные пробои Spring и Upthrust и присылает сигнал с ценой лимитной "
     "заявки, стопом и целью — а потом сам доводит его до исхода.\n\n"
     "Вторая стратегия — тренд по недельному каналу: вход на пробое недели, выход "
@@ -952,7 +952,7 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
         f"Цена (закрытие часовой свечи {ex['bar_time'][:16]} UTC): {fmt(c, d)}",
         f"Средний размах свечи (ATR): {fmt(ex['atr'], d)} — это {ex['atr_pct'] * 100:.2f}% цены",
         "",
-        f"1. Тренд дневки: {trend_ru}",
+        f"1. Тренд по {config.TREND_TF_HOURS}-часовым свечам: {trend_ru}",
         "",
         "2. Ближайшие уровни (расстояние — в ATR, единой мерке для всех инструментов):",
     ]
@@ -1063,7 +1063,8 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
         # Фильтров строгости у движка 23 июня не было — строку про них не печатаем.
         lines += ["", "⚙️ Правила движка — редакция 23 июня 2026:",
                   f"     Прокол уровня глубже {config.BREAK_PCT * 100:g}% его цены и закрытие "
-                  f"обратно, объём ×{config.VOL_MULT:g} на этой же свече, по тренду дневки",
+                  f"обратно, объём ×{config.VOL_MULT:g} на этой же свече, "
+                  f"по тренду {config.TREND_TF_HOURS}-часовых свечей",
                   f"     Стоп — за фитилём свечи плюс {config.STOP_SPREAD * 100:g}% цены",
                   "     Цель — ближайший встречный уровень, какой есть"]
     else:
@@ -1180,7 +1181,8 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
         out.append(
             f"ВАЖНО: движок работает по правилам 23 июня 2026 — прокол уровня глубже "
             f"{config.BREAK_PCT * 100:g}% его цены с закрытием обратно, объём "
-            f"×{config.VOL_MULT:g} на этой же свече, сделка по тренду дневки; стоп за фитилём "
+            f"×{config.VOL_MULT:g} на этой же свече, сделка по тренду "
+            f"{config.TREND_TF_HOURS}-часовых свечей; стоп за фитилём "
             f"свечи плюс {config.STOP_SPREAD * 100:g}%; цель — ближайший встречный уровень, "
             "какой есть. Силы отбоя, свежего пересечения, пулов ликвидности, ожидания "
             "возврата и минимальной цели у него НЕТ — не упоминай их.")
@@ -1199,12 +1201,16 @@ async def _do_analyze(message: Message, code: str, user_id: int):
         d1 = await engine.fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
         hourly = await engine.fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
         h1 = await engine.engine_candles(code)
+        # Направление движок смотрит по 6-часовым свечам — их собирает engine_trend
+        # из длинной часовой серии (тот же ключ кеша, что у стратегии №4).
+        h1_trend = await engine.fetch_candles(
+            code, config.H1_TIMEFRAME, config.TREND_TF_H1_LIMIT)
     except Exception:
         await waiting.delete()
         await message.answer("Не удалось получить данные сейчас, попробуй позже.")
         return
 
-    trend = analyzer.get_trend(d1)
+    trend = analyzer.engine_trend(h1_trend)
     levels = engine.analyze_and_store(code, d1, hourly)  # считает и сохраняет уровни в БД
     zones = analyzer.find_liquidity_zones(d1)
 

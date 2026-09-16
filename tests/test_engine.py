@@ -44,6 +44,58 @@ def test_trend_sideways():
     assert analyzer.get_trend(_df(rows)) == "sideways"
 
 
+def test_tf_candles_aggregate_six_hours():
+    """Шестичасовая свеча собирается из шести часовых: открытие первой, закрытие
+    последней, крайние значения и сумма объёма. Последняя свеча может быть
+    НЕПОЛНОЙ — так же, как боевой фильтр видел недоделанным сегодняшний день."""
+    rows = [(10 + i, 20 + i, 5 + i, 12 + i, 100 + i) for i in range(13)]
+    tf = analyzer.tf_candles(_df(rows), 6)
+    assert len(tf) == 3                       # 6 + 6 + 1 неполная
+    first = tf.iloc[0]
+    assert first["open"] == rows[0][0]
+    assert first["close"] == rows[5][3]
+    assert first["high"] == max(r[1] for r in rows[:6])
+    assert first["low"] == min(r[2] for r in rows[:6])
+    assert first["volume"] == sum(r[4] for r in rows[:6])
+    assert tf.iloc[-1]["close"] == rows[12][3]   # неполная свеча из одного часа
+
+
+def _tf_direction_rows():
+    """Сто двадцать часов роста, потом двадцать часов падения.
+
+    Ряд подобран так, чтобы ТРИ таймфрейма дали ТРИ РАЗНЫХ ответа: на ЧАСАХ это
+    падение (последние двадцать баров перевешивают короткую EMA), на ШЕСТИЧАСОВЫХ
+    свечах — рост (цена всё ещё на 13% выше своей EMA20), а дневных свечей тут
+    всего шесть — для EMA20 их мало, и дневное правило скажет «вбок».
+    """
+    rows = [(100 + 2 * i, 101 + 2 * i, 99 + 2 * i, 100 + 2 * i, 100) for i in range(120)]
+    top = 100 + 2 * 119
+    rows += [(top - 2 * (i + 1), top - 2 * (i + 1) + 1,
+              top - 2 * (i + 1) - 1, top - 2 * (i + 1), 100) for i in range(20)]
+    return rows
+
+
+def test_engine_trend_uses_six_hour_candles():
+    """Направление движок берёт с 6-часовых свечей — не с часовых и не с дневных.
+
+    Тест падает, если кто-нибудь вернёт фильтр на дневки (будет 'sideways') или
+    станет считать его по часам (будет 'down')."""
+    rows = _tf_direction_rows()
+    df = _df(rows + [rows[-1]])              # последний час — формирующийся
+    assert analyzer.engine_trend(df) == "up"
+    assert analyzer.get_trend(df) == "down"                  # часовой ряд целиком
+    assert analyzer.get_trend(analyzer.tf_candles(df.iloc[:-1], 24)) == "sideways"
+
+
+def test_engine_trend_ignores_forming_hour():
+    """Формирующийся час в расчёт не идёт: решение движок принимает по закрытой
+    свече, и направление не должно дёргаться внутри часа."""
+    rows = _tf_direction_rows()
+    calm = analyzer.engine_trend(_df(rows + [rows[-1]]))
+    wild = analyzer.engine_trend(_df(rows + [(300, 900, 10, 20, 100)]))
+    assert calm == wild == "up"
+
+
 # ── Уровни ─────────────────────────────────────────────────────────────────
 
 def test_find_levels_pivot():

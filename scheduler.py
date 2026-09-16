@@ -129,7 +129,9 @@ def analyze_and_store(code: str, d1, h1) -> list[dict]:
         for z in zones
     ]
     database.save_levels(code, prioritized + liquidity_levels)
-    print(f"[analysis] {code}: тренд={analyzer.get_trend(d1)}, "
+    # Тренд D1 печатается СПРАВОЧНО: направление движок с 16.09.2026 берёт с
+    # 6-часовых свечей (analyzer.engine_trend), а эта задача считает только уровни.
+    print(f"[analysis] {code}: тренд D1 (справочно)={analyzer.get_trend(d1)}, "
           f"уровней={len(prioritized)}, зон ликвидности={len(zones)}")
     return prioritized
 
@@ -151,13 +153,15 @@ async def monitor_signals(bot) -> None:
             continue
         try:
             h1 = await engine_candles(code)
-            d1 = await fetch_candles(code, config.D1_TIMEFRAME, config.D1_LIMIT)
+            # Направление — по 6-часовым свечам (с 16.09.2026), поэтому дневные свечи
+            # тут больше не нужны: уровни приходят готовыми из таблицы levels.
+            h1_trend = await fetch_candles(code, config.H1_TIMEFRAME, config.TREND_TF_H1_LIMIT)
         except Exception as e:
             print(f"[monitor_signals] {code}: ошибка данных: {e}")
             continue
         if len(h1) < config.VOL_LOOKBACK + 3:
             continue
-        trend = analyzer.get_trend(d1)
+        trend = analyzer.engine_trend(h1_trend)
         levels = database.get_levels(code)
         # Комментарий LLM считаем один раз на одинаковый сигнал в цикле (а не на каждого
         # подписчика): ключ — паттерн+направление+цель (цель зависит от личного R:R).
