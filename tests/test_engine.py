@@ -1541,7 +1541,7 @@ def test_asset_class_splits_markets():
     assert instruments.asset_class("WIF/USDT:USDT") == "crypto"   # своя пара
     assert config.JUNE_MIN_TP_R["crypto"] == 1.0
     assert config.JUNE_MIN_TP_R["fx"] == 0.5
-    assert config.JUNE_MIN_TP_R["commodity"] == 0.0
+    assert config.JUNE_MIN_TP_R["commodity"] == 0.5
 
 
 def test_june_explain_uses_same_min_target_as_detector():
