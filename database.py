@@ -217,7 +217,9 @@ def init_db() -> None:
                 stop_loss   REAL    NOT NULL,
                 entry_time  TEXT    NOT NULL,                 -- открытие часа входа, UTC
                 signal_bar  TEXT    NOT NULL,                 -- свеча пробоя недели, UTC
-                status      TEXT    NOT NULL DEFAULT 'open',  -- open | stop | exit
+                status      TEXT    NOT NULL DEFAULT 'open',  -- open | stop | exit |
+                                                             -- manual (закрыто рукой
+                                                             -- владельца, 17.09.2026)
                 exit_price  REAL,
                 exit_time   TEXT,
                 result_r    REAL,

@@ -669,7 +669,10 @@ async def trend_overview() -> str:
         for p in closed[:5]:
             info = resolve(p["instrument"])
             arrow = "🟢" if p["direction"] == "long" else "🔴"
-            how = "стоп" if p["status"] == "stop" else "выход"
+            # 'manual' — закрыто рукой владельца (17.09.2026, снятие стратегии с боя).
+            # Назвать его «выходом» значило бы приписать модели решение, которого она
+            # не принимала: канал в тот момент позицию держал.
+            how = {"stop": "стоп", "exit": "выход"}.get(p["status"], "закрыто вручную")
             lines.append(f"  {arrow} {info['short']} — {how}, {p['result_r']:+.1f}R "
                          f"({(p['exit_time'] or '')[:10]})")
     else:
