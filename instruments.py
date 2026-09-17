@@ -93,9 +93,9 @@ INSTRUMENTS = {
     "USDJPY": {"name": "USD/JPY",       "decimals": 3, "fx": True,
                "ccxt": {"symbol": "NCFXUSD2JPY/USDT:USDT", "exchange": "bingx"}},
     # ── Товары: бессрочные фьючерсы BingX (синтетика на золото и Brent) ────────
-    "GOLD":   {"name": "Золото",        "decimals": 2,
+    "GOLD":   {"name": "Золото",        "decimals": 2, "commodity": True,
                "ccxt": {"symbol": "NCCOGOLD2USD/USDT:USDT", "exchange": "bingx"}},
-    "BRENT":  {"name": "Нефть Brent",   "decimals": 2,
+    "BRENT":  {"name": "Нефть Brent",   "decimals": 2, "commodity": True,
                "ccxt": {"symbol": "NCCO1OILBRENT2USD/USDT:USDT", "exchange": "bingx"}},
     # ── Крипта: бессрочные фьючерсы BingX ─────────────────────────────────────
     "BTC":    {"name": "Bitcoin",        "decimals": 2,
@@ -212,6 +212,24 @@ def is_fx(code: str | None) -> bool:
     """
     info = INSTRUMENTS.get(code) if code else None
     return bool(info and info.get("fx"))
+
+
+def asset_class(code: str | None) -> str:
+    """Класс инструмента: 'fx' / 'commodity' / 'crypto'.
+
+    Нужен там, где правило зависит от рынка, а не от конкретной пары — сейчас это
+    минимальная цель ложного пробоя (config.JUNE_MIN_TP_R): у валюты она одна, у
+    крипты другая, у золота с нефтью её нет вовсе.
+
+    «Своя пара» (любой контракт BingX вне реестра) считается криптой: в реестре её
+    нет, а сигналы движка по ней и не идут — подписки ставятся только по реестру.
+    """
+    info = INSTRUMENTS.get(code) if code else None
+    if info and info.get("fx"):
+        return "fx"
+    if info and info.get("commodity"):
+        return "commodity"
+    return "crypto"
 
 
 def ccxt_symbol(code: str) -> dict | None:

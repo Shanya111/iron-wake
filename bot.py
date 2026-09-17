@@ -34,6 +34,7 @@ import scheduler as engine
 from llm import ANALYST_PROMPT, ask_openrouter, classify_intent
 from instruments import (
     INSTRUMENTS,
+    asset_class,
     ccxt_symbol,
     engine_codes,
     fmt,
@@ -1061,12 +1062,15 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
 
     if june:
         # Фильтров строгости у движка 23 июня не было — строку про них не печатаем.
+        min_tp_r = ex.get("min_tp_r", 0.0)
         lines += ["", "⚙️ Правила движка — редакция 23 июня 2026:",
                   f"     Прокол уровня глубже {config.BREAK_PCT * 100:g}% его цены и закрытие "
                   f"обратно, объём ×{config.VOL_MULT:g} на этой же свече, "
                   f"по тренду {config.TREND_TF_HOURS}-часовых свечей",
-                  f"     Стоп — за фитилём свечи плюс {config.STOP_SPREAD * 100:g}% цены",
-                  "     Цель — ближайший встречный уровень, какой есть"]
+                  f"     Стоп — за фитилём свечи плюс {config.JUNE_STOP_ATR:g} ATR",
+                  "     Цель — ближайший встречный уровень" + (
+                      f", но не ближе {min_tp_r:g} риска"
+                      if min_tp_r else ", какой есть")]
     else:
         f = ex["filters"]
         fl = ["вход у уровня " + (f"≤ {f['MAX_ENTRY_DIST_ATR']:g} ATR"
@@ -1183,9 +1187,11 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
             f"{config.BREAK_PCT * 100:g}% его цены с закрытием обратно, объём "
             f"×{config.VOL_MULT:g} на этой же свече, сделка по тренду "
             f"{config.TREND_TF_HOURS}-часовых свечей; стоп за фитилём "
-            f"свечи плюс {config.STOP_SPREAD * 100:g}%; цель — ближайший встречный уровень, "
-            "какой есть. Силы отбоя, свежего пересечения, пулов ликвидности, ожидания "
-            "возврата и минимальной цели у него НЕТ — не упоминай их.")
+            f"свечи плюс {config.JUNE_STOP_ATR:g} ATR; цель — ближайший встречный уровень"
+            + (f" не ближе {ex.get('min_tp_r', 0):g} риска сделки"
+               if ex.get("min_tp_r") else ", какой есть")
+            + ". Силы отбоя, свежего пересечения, пулов ликвидности и ожидания "
+            "возврата у него НЕТ — не упоминай их.")
     out.append("Прокомментируй расклад.")
     return "\n".join(out)
 
@@ -1215,7 +1221,10 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     zones = analyzer.find_liquidity_zones(d1)
 
     # Разбор — по ЛИЧНЫМ фильтрам пользователя: он должен видеть свой отбор, а не чужой.
-    settings = config.effective(database.get_user_settings(user_id))
+    # MIN_TP_R кладём сюда же: минимальная цель зависит от рынка (крипта / валюта /
+    # товары) и должна быть той же, по которой уходит сигнал.
+    settings = {**config.effective(database.get_user_settings(user_id)),
+                "MIN_TP_R": config.JUNE_MIN_TP_R.get(asset_class(code), 0.0)}
     # Разбор — по тем же правилам, по которым бот шлёт сигналы (с 15.09.2026 это
     # редакция 23 июня, см. engine.spring_rules).
     rules = engine.spring_rules()

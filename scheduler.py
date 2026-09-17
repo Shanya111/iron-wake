@@ -40,7 +40,8 @@ import llm
 import pattern_detector
 import spring_june
 import trend as channel_trend  # стратегия №4; имя «trend» занято трендом дневки в monitor_signals
-from instruments import ccxt_symbol, engine_codes, fmt, infer_decimals, resolve, short
+from instruments import (asset_class, ccxt_symbol, engine_codes, fmt, infer_decimals,
+                         resolve, short)
 
 
 async def fetch_candles(code: str, timeframe: str, limit: int):
@@ -166,8 +167,12 @@ async def monitor_signals(bot) -> None:
         # Комментарий LLM считаем один раз на одинаковый сигнал в цикле (а не на каждого
         # подписчика): ключ — паттерн+направление+цель (цель зависит от личного R:R).
         comment_cache: dict[tuple, str | None] = {}
+        # Минимальная цель зависит от РЫНКА, а не от пользователя: у крипты один риск,
+        # у валюты полриска, у золота с нефтью правила нет (config.JUNE_MIN_TP_R).
+        min_tp_r = config.JUNE_MIN_TP_R.get(asset_class(code), 0.0)
         for user_id in subscribers:
-            settings = config.effective(database.get_user_settings(user_id))
+            settings = {**config.effective(database.get_user_settings(user_id)),
+                        "MIN_TP_R": min_tp_r}
             for detector in (rules.detect_spring, rules.detect_upthrust):
                 signal = detector(h1, levels, trend, settings)
                 if signal is None:

@@ -35,15 +35,16 @@ RULES = "june23"  # метка в разборе explain: по ней отчёт
 
 def detect_spring(df: pd.DataFrame, levels: list[dict], trend: str,
                   settings: dict | None = None) -> dict | None:
-    """Лонг. settings принимается ради одинаковой сигнатуры с pattern_detector и не
-    используется: фильтров строгости у движка 23 июня не было."""
-    return _detect(df, levels, trend, side="long")
+    """Лонг. Из settings читается ровно один ключ — MIN_TP_R (минимальная цель в долях
+    старого риска, кладёт вызывающий по классу инструмента). Фильтров строгости у
+    движка 23 июня не было и нет: MAX_ENTRY_DIST_ATR и MAX_RISK_ATR тут не смотрят."""
+    return _detect(df, levels, trend, side="long", settings=settings)
 
 
 def detect_upthrust(df: pd.DataFrame, levels: list[dict], trend: str,
                     settings: dict | None = None) -> dict | None:
-    """Шорт — зеркало Spring. settings не используется, как и у detect_spring."""
-    return _detect(df, levels, trend, side="short")
+    """Шорт — зеркало Spring. Из settings читается тот же MIN_TP_R, что у detect_spring."""
+    return _detect(df, levels, trend, side="short", settings=settings)
 
 
 def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
@@ -64,21 +65,60 @@ def _broke_and_returned(side: str, h: float, l: float, c: float,
     return h > price * (1 + config.BREAK_PCT), c < price
 
 
-def _stop(side: str, h: float, l: float) -> float:
-    """Стоп за фитилём свечи плюс STOP_SPREAD цены."""
+def _stop(side: str, h: float, l: float, atr: float) -> float:
+    """Стоп за фитилём свечи плюс JUNE_STOP_ATR × ATR (с 17 сентября 2026).
+
+    До этого дня запас считался долей цены (STOP_SPREAD, 0.1%). Замер и цена решения —
+    в комментарии к config.JUNE_STOP_ATR. Без ATR (плоские свечи) откатываемся на
+    прежнюю мерку: движок не должен замолкать из-за того, что волатильность нулевая.
+    """
+    if atr and atr > 0:
+        return l - config.JUNE_STOP_ATR * atr if side == "long" else h + config.JUNE_STOP_ATR * atr
     return l * (1 - config.STOP_SPREAD) if side == "long" else h * (1 + config.STOP_SPREAD)
 
 
-def _target_level(levels: list[dict], side: str, c: float) -> float | None:
-    """Ближайший встречный уровень, какой есть (без минимального расстояния)."""
+def _old_risk(side: str, h: float, l: float, c: float) -> float:
+    """Риск ПРЕЖНЕГО движка: закрытие → фитиль плюс STOP_SPREAD цены.
+
+    Живёт отдельно от реального стопа нарочно. Минимальная цель меряется в долях
+    именно этого риска (решение владельца 17.09.2026): иначе, расширив стоп до 1 ATR,
+    мы бы заодно отодвинули и цель — вышло бы два рычага вместо одного.
+    """
+    stop = l * (1 - config.STOP_SPREAD) if side == "long" else h * (1 + config.STOP_SPREAD)
+    return abs(c - stop)
+
+
+def _target_level(levels: list[dict], side: str, c: float,
+                  min_gap: float = 0.0) -> float | None:
+    """Ближайший встречный уровень НЕ БЛИЖЕ min_gap от закрытия.
+
+    min_gap — доля старого риска (config.JUNE_MIN_TP_R по классу инструмента). Уровни
+    ближе пропускаются, цель встаёт на следующий за ними; сигнал при этом остаётся —
+    двигается только цель, число сигналов не меняется.
+    """
     if side == "long":
-        prices = [x["price"] for x in levels if x["type"] == "resistance" and x["price"] > c]
+        prices = [x["price"] for x in levels
+                  if x["type"] == "resistance" and x["price"] > c and x["price"] - c >= min_gap]
         return min(prices) if prices else None
-    prices = [x["price"] for x in levels if x["type"] == "support" and x["price"] < c]
+    prices = [x["price"] for x in levels
+              if x["type"] == "support" and x["price"] < c and c - x["price"] >= min_gap]
     return max(prices) if prices else None
 
 
-def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str) -> dict | None:
+def _min_gap(settings: dict | None, side: str, h: float, l: float, c: float) -> float:
+    """Минимальное расстояние до цели в ЦЕНЕ.
+
+    MIN_TP_R кладёт вызывающий по классу инструмента (instruments.asset_class →
+    config.JUNE_MIN_TP_R): у крипты 1 риск, у валюты 0.5, у золота и нефти правила нет.
+    Общий помощник для _detect и explain — разъедутся, и /analyze назовёт целью
+    уровень, который движок целью не считает.
+    """
+    k = float((settings or {}).get("MIN_TP_R", 0.0) or 0.0)
+    return k * _old_risk(side, h, l, c) if k > 0 else 0.0
+
+
+def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
+            settings: dict | None = None) -> dict | None:
     if len(df) < config.VOL_LOOKBACK + 3:
         return None
     # Фильтр направления по глобальному тренду.
@@ -105,8 +145,8 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str) -> dict
         if not (broke and returned):
             continue
 
-        stop = _stop(side, h, l)
-        target = _target_level(levels, side, c)
+        stop = _stop(side, h, l, pattern_detector._atr(df, pos))
+        target = _target_level(levels, side, c, _min_gap(settings, side, h, l, c))
         if side == "long":
             tp = target if target is not None else c + (c - stop) * config.FALLBACK_RR
         else:
@@ -175,9 +215,9 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
             blockers.append(break_note)
 
         # Профит/риск при входе прямо сейчас — справка, как и в сентябрьском отчёте.
-        stop = _stop(side, h, l)
+        stop = _stop(side, h, l, atr)
         risk = (c - stop) if side == "long" else (stop - c)
-        target = _target_level(levels, side, c)
+        target = _target_level(levels, side, c, _min_gap(settings, side, h, l, c))
         rr = risk_atr = None
         if risk > 0 and atr > 0:
             risk_atr = risk / atr
@@ -198,5 +238,8 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
             "ready": not blockers,
         }
 
+    # min_tp_r отдаём наружу, чтобы отчёт /analyze печатал ТО правило цели, по которому
+    # разбор и посчитан: у крипты, валюты и товаров оно разное.
     return {**base, "rules": RULES, "pools": [],
+            "min_tp_r": float((settings or {}).get("MIN_TP_R", 0.0) or 0.0),
             "filters": {"MAX_ENTRY_DIST_ATR": 0, "MAX_RISK_ATR": 0}, "sides": sides}
