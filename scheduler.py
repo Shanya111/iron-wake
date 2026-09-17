@@ -41,7 +41,7 @@ import pattern_detector
 import spring_june
 import trend as channel_trend  # стратегия №4; имя «trend» занято трендом дневки в monitor_signals
 from instruments import (asset_class, ccxt_symbol, engine_codes, fmt, infer_decimals,
-                         resolve, short, tick_size)
+                         resolve, short)
 
 
 async def fetch_candles(code: str, timeframe: str, limit: int):
@@ -170,11 +170,9 @@ async def monitor_signals(bot) -> None:
         # Минимальная цель зависит от РЫНКА, а не от пользователя: у крипты один риск,
         # у валюты полриска, у золота с нефтью правила нет (config.JUNE_MIN_TP_R).
         min_tp_r = config.JUNE_MIN_TP_R.get(asset_class(code), 0.0)
-        # Шаг цены — под стоп «два тика за фитилём»: детектор реестра не знает.
-        tick = tick_size(code, float(h1["close"].iloc[-1]))
         for user_id in subscribers:
             settings = {**config.effective(database.get_user_settings(user_id)),
-                        "MIN_TP_R": min_tp_r, "TICK": tick}
+                        "MIN_TP_R": min_tp_r}
             for detector in (rules.detect_spring, rules.detect_upthrust):
                 signal = detector(h1, levels, trend, settings)
                 if signal is None:

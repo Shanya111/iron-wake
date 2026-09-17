@@ -41,7 +41,6 @@ from instruments import (
     infer_decimals,
     resolve,
     short,
-    tick_size,
 )
 
 load_dotenv()
@@ -1068,10 +1067,7 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
                   f"     Прокол уровня глубже {config.BREAK_PCT * 100:g}% его цены и закрытие "
                   f"обратно, объём ×{config.VOL_MULT:g} на этой же свече, "
                   f"по тренду {config.TREND_TF_HOURS}-часовых свечей",
-                  "     Стоп — за фитилём свечи плюс " + (
-                      f"{config.JUNE_STOP_TICKS} тика"
-                      if config.JUNE_STOP_MODE == "ticks"
-                      else f"{config.JUNE_STOP_ATR:g} ATR"),
+                  f"     Стоп — за фитилём свечи плюс {config.JUNE_STOP_ATR:g} ATR",
                   "     Цель — ближайший встречный уровень" + (
                       f", но не ближе {min_tp_r:g} риска"
                       if min_tp_r else ", какой есть")]
@@ -1191,10 +1187,7 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
             f"{config.BREAK_PCT * 100:g}% его цены с закрытием обратно, объём "
             f"×{config.VOL_MULT:g} на этой же свече, сделка по тренду "
             f"{config.TREND_TF_HOURS}-часовых свечей; стоп за фитилём "
-            + (f"свечи плюс {config.JUNE_STOP_TICKS} тика цены"
-               if config.JUNE_STOP_MODE == "ticks"
-               else f"свечи плюс {config.JUNE_STOP_ATR:g} ATR")
-            + "; цель — ближайший встречный уровень"
+            f"свечи плюс {config.JUNE_STOP_ATR:g} ATR; цель — ближайший встречный уровень"
             + (f" не ближе {ex.get('min_tp_r', 0):g} риска сделки"
                if ex.get("min_tp_r") else ", какой есть")
             + ". Силы отбоя, свежего пересечения, пулов ликвидности и ожидания "
@@ -1231,8 +1224,7 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     # MIN_TP_R кладём сюда же: минимальная цель зависит от рынка (крипта / валюта /
     # товары) и должна быть той же, по которой уходит сигнал.
     settings = {**config.effective(database.get_user_settings(user_id)),
-                "MIN_TP_R": config.JUNE_MIN_TP_R.get(asset_class(code), 0.0),
-                "TICK": tick_size(code, float(h1["close"].iloc[-1]))}
+                "MIN_TP_R": config.JUNE_MIN_TP_R.get(asset_class(code), 0.0)}
     # Разбор — по тем же правилам, по которым бот шлёт сигналы (с 15.09.2026 это
     # редакция 23 июня, см. engine.spring_rules).
     rules = engine.spring_rules()
