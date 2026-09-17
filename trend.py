@@ -80,8 +80,8 @@ def _closed(position: dict, kind: str, price: float, when, level: float | None) 
     }
 
 
-def step(df: pd.DataFrame, last_bar: str | None,
-         position: dict | None) -> tuple[str | None, dict | None, list[dict]]:
+def step(df: pd.DataFrame, last_bar: str | None, position: dict | None,
+         allow_entries: bool = True) -> tuple[str | None, dict | None, list[dict]]:
     """Прогоняет правила по ЗАКРЫТЫМ свечам, которых модель ещё не видела.
 
     df       — часовые свечи биржи; последняя строка считается формирующейся;
@@ -100,6 +100,11 @@ def step(df: pd.DataFrame, last_bar: str | None,
     Свечи обрабатываются по одной и строго по порядку, поэтому неважно, сколько
     новых свечей пришло за раз: одна за пять минут или сорок после простоя —
     результат тот же, что при прогоне всей истории одним куском (на это есть тест).
+
+    allow_entries=False (стратегия выключена, config.TREND_SIGNALS) запрещает
+    ОТКРЫВАТЬ новые позиции, но уже открытую по-прежнему ведёт до стопа или выхода
+    по каналу и двигает last_bar. Бросить открытую позицию нельзя: /trend показывал
+    бы её открытой вечно, а подписчик не узнал бы об исходе.
     """
     if len(df) < 2:
         return last_bar, position, []
@@ -136,7 +141,7 @@ def step(df: pd.DataFrame, last_bar: str | None,
                     position = None
                     exited_by_channel = True
 
-        if position is None and not exited_by_channel:
+        if position is None and not exited_by_channel and allow_entries:
             atr, hi, lo = ind["atr"][i], ind["hi"][i], ind["lo"][i]
             if atr > 0 and not math.isnan(hi) and not math.isnan(lo):
                 d = 1 if c[i] > hi else -1 if c[i] < lo else 0

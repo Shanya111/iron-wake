@@ -1355,6 +1355,38 @@ def test_trend_incremental_matches_one_pass():
     assert [key(e) for e in pieces] == [key(e) for e in batch]
 
 
+# ── Тренд выключен (17 сентября 2026) ────────────────────────────────────────
+
+def test_trend_switch_stops_entries_but_keeps_managing():
+    """TREND_SIGNALS = False запрещает ВХОДЫ и только их.
+
+    Три вещи проверяются разом, и каждая — отдельное решение 17.09.2026:
+    новых позиций нет; уже открытая доводится до исхода (иначе /trend показывал бы
+    её открытой вечно, а подписчик не узнал бы о стопе); last_bar всё равно едет
+    вперёд — иначе при возврате стратегии в бой step объявил бы вход по пробою,
+    случившемуся дни назад, по цене, которой на рынке уже нет.
+    """
+    import scheduler
+    df = _df(_trend_rows([100.0] * 250 + [102.0, 102.1]))   # тот же пробой, что берёт бой
+    last, pos, events = trend.step(df, str(df.index[249]), None, allow_entries=False)
+    assert events == [] and pos is None
+    assert last == str(df.index[250])
+
+    down = _df(_trend_rows([100.0] * 250 + [98.9, 98.8]))
+    _, pos2, events2 = trend.step(down, str(down.index[249]), _long_position(down),
+                                  allow_entries=False)
+    assert [e["type"] for e in events2] == ["stop"]     # стоп отработал, разворота нет
+    assert pos2 is None
+
+    # Задачу monitor_trend при этом НЕ снимаем — она и ведёт открытые, и двигает last_bar.
+    saved = config.TREND_SIGNALS
+    try:
+        config.TREND_SIGNALS = False
+        assert scheduler.monitor_trend in {f for f, _ in scheduler.jobs()}
+    finally:
+        config.TREND_SIGNALS = saved
+
+
 # ── Ложный пробой выключен (15 сентября 2026) ────────────────────────────────
 
 def test_spring_switch_controls_scheduler_jobs():

@@ -536,6 +536,11 @@ async def monitor_trend(bot) -> None:
     Сообщения уходят подписчикам инструмента из /subscribe (решение владельца 14.09.2026),
     подписанным на него именно по тренду (с 15.09.2026). Валютные пары вне сессии на паузе:
     запрос свечей падает, инструмент пропускается до следующего раза.
+
+    При config.TREND_SIGNALS = False (выключено 17.09.2026) задача продолжает
+    работать, но НОВЫХ позиций не открывает: она доводит уже открытые до исхода и
+    двигает last_bar, чтобы при возврате стратегии в бой вход не объявился по
+    пробою, случившемуся дни назад. Подробности — в комментарии к константе.
     """
     for code in engine_codes():
         try:
@@ -550,7 +555,8 @@ async def monitor_trend(bot) -> None:
             print(f"[monitor_trend] {code}: бот не видел рынок дольше окна свечей "
                   f"(с {last_bar}) — часть часов пропущена")
         open_id = position["id"] if position else None
-        new_last, _, events = channel_trend.step(df, last_bar, position)
+        new_last, _, events = channel_trend.step(df, last_bar, position,
+                                                 config.TREND_SIGNALS)
         if new_last == last_bar and not events:
             continue
         database.save_trend_step(code, new_last, events, open_id)
@@ -630,6 +636,11 @@ async def trend_overview() -> str:
         "приходят по инструментам, отмеченным для тренда в /subscribe.",
         "",
     ]
+    # Выключенная стратегия обязана сказать об этом здесь: иначе человек читает
+    # правила и ждёт сигналов, которых не будет.
+    if not config.TREND_SIGNALS:
+        lines.insert(1, "⛔ Стратегия ВЫКЛЮЧЕНА — новых входов не будет. Уже открытые "
+                        "позиции доводятся до стопа или выхода по каналу.")
     if opened:
         lines.append("Открытые позиции:")
         for p in opened:
@@ -768,5 +779,8 @@ def setup(bot) -> AsyncIOScheduler:
     if not config.SPRING_SIGNALS:
         print("[scheduler] ложный пробой выключен (SPRING_SIGNALS = False): "
               "run_analysis и monitor_signals не запущены")
+    if not config.TREND_SIGNALS:
+        print("[scheduler] тренд выключен (TREND_SIGNALS = False): новых позиций "
+              "не открываем, открытые доводим до стопа или выхода по каналу")
     sched.start()
     return sched
