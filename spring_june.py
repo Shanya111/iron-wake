@@ -65,14 +65,22 @@ def _broke_and_returned(side: str, h: float, l: float, c: float,
     return h > price * (1 + config.BREAK_PCT), c < price
 
 
-def _stop(side: str, h: float, l: float, atr: float) -> float:
-    """Стоп за фитилём свечи плюс JUNE_STOP_ATR × ATR (с 17 сентября 2026).
+def _stop(side: str, h: float, l: float, atr: float, tick: float = 0.0) -> float:
+    """Стоп за фитилём свечи. Чем отмеряется запас — решает config.JUNE_STOP_MODE.
 
-    До этого дня запас считался долей цены (STOP_SPREAD, 0.1%). Замер и цена решения —
-    в комментарии к config.JUNE_STOP_ATR. Без ATR (плоские свечи) откатываемся на
-    прежнюю мерку: движок не должен замолкать из-за того, что волатильность нулевая.
+    "ticks" (с вечера 17 сентября 2026) — JUNE_STOP_TICKS тиков цены инструмента;
+    "atr"  (утро того же дня)          — JUNE_STOP_ATR × ATR.
+    Замеры обоих правил и цена решения — в комментарии к config.JUNE_STOP_MODE.
+
+    Тик кладёт вызывающий (settings["TICK"], instruments.tick_size): детектор про
+    реестр инструментов не знает и знать не должен. Нет тика или нет ATR — откат на
+    прежнюю мерку в долях цены: движок не должен замолкать оттого, что мерку не
+    передали или волатильность нулевая.
     """
-    if atr and atr > 0:
+    if config.JUNE_STOP_MODE == "ticks" and tick and tick > 0:
+        gap = config.JUNE_STOP_TICKS * tick
+        return l - gap if side == "long" else h + gap
+    if config.JUNE_STOP_MODE == "atr" and atr and atr > 0:
         return l - config.JUNE_STOP_ATR * atr if side == "long" else h + config.JUNE_STOP_ATR * atr
     return l * (1 - config.STOP_SPREAD) if side == "long" else h * (1 + config.STOP_SPREAD)
 
@@ -145,7 +153,8 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
         if not (broke and returned):
             continue
 
-        stop = _stop(side, h, l, pattern_detector._atr(df, pos))
+        stop = _stop(side, h, l, pattern_detector._atr(df, pos),
+                     float((settings or {}).get("TICK", 0.0) or 0.0))
         target = _target_level(levels, side, c, _min_gap(settings, side, h, l, c))
         if side == "long":
             tp = target if target is not None else c + (c - stop) * config.FALLBACK_RR
@@ -215,7 +224,7 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
             blockers.append(break_note)
 
         # Профит/риск при входе прямо сейчас — справка, как и в сентябрьском отчёте.
-        stop = _stop(side, h, l, atr)
+        stop = _stop(side, h, l, atr, float((settings or {}).get("TICK", 0.0) or 0.0))
         risk = (c - stop) if side == "long" else (stop - c)
         target = _target_level(levels, side, c, _min_gap(settings, side, h, l, c))
         rr = risk_atr = None

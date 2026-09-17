@@ -1421,17 +1421,20 @@ _JUNE_LONG = [{"price": 100.0, "type": "support", "strength": "strong"},
               {"price": 110.0, "type": "resistance", "strength": "weak"}]
 _JUNE_SHORT = [{"price": 100.0, "type": "resistance", "strength": "weak"},
                {"price": 90.0, "type": "support", "strength": "weak"}]
+# Шаг цены фикстур — как у инструмента с двумя знаками (BTC, GOLD). Тик и минимальную
+# цель кладёт вызывающий: детектор про реестр не знает (см. spring_june._stop).
+_TICK = 0.01
+_JUNE_ST = {"TICK": _TICK}
 
 
 def test_june_takes_weak_rebound():
     """Силы отбоя в июне не было: вялый выкуп прокола — тоже сигнал."""
     df = _weak_rebound_spring_df()
     assert pattern_detector.detect_spring(df, _JUNE_LONG, trend="up") is None
-    sig = spring_june.detect_spring(df, _JUNE_LONG, trend="up")
+    sig = spring_june.detect_spring(df, _JUNE_LONG, trend="up", settings=_JUNE_ST)
     assert sig is not None and sig["direction"] == "long" and sig["priority"] == "high"
     assert abs(sig["entry_price"] - 100.2) < 1e-9
-    atr = pattern_detector._atr(df, len(df) - 2)
-    assert abs(sig["stop_loss"] - (99.0 - config.JUNE_STOP_ATR * atr)) < 1e-9
+    assert abs(sig["stop_loss"] - (99.0 - config.JUNE_STOP_TICKS * _TICK)) < 1e-9
     assert abs(sig["take_profit"] - 110.0) < 1e-9
 
 
@@ -1455,11 +1458,10 @@ def test_june_needs_volume_and_trend():
 
 def test_june_upthrust_stop_behind_wick():
     df = _upthrust_df()
-    sig = spring_june.detect_upthrust(df, _JUNE_SHORT, trend="down")
+    sig = spring_june.detect_upthrust(df, _JUNE_SHORT, trend="down", settings=_JUNE_ST)
     assert sig is not None and sig["direction"] == "short"
     assert abs(sig["entry_price"] - 99.5) < 1e-9
-    atr = pattern_detector._atr(df, len(df) - 2)
-    assert abs(sig["stop_loss"] - (101.0 + config.JUNE_STOP_ATR * atr)) < 1e-9
+    assert abs(sig["stop_loss"] - (101.0 + config.JUNE_STOP_TICKS * _TICK)) < 1e-9
     assert abs(sig["take_profit"] - 90.0) < 1e-9
     assert spring_june.detect_upthrust(df, _JUNE_SHORT, trend="up") is None
 
@@ -1475,24 +1477,44 @@ def test_june_target_takes_closest_level():
 def test_june_fallback_target_two_risks():
     df = _spring_df()
     levels = [{"price": 100.0, "type": "support", "strength": "weak"}]
-    sig = spring_june.detect_spring(df, levels, trend="up")
-    atr = pattern_detector._atr(df, len(df) - 2)
-    risk = 100.5 - (99.0 - config.JUNE_STOP_ATR * atr)
+    sig = spring_june.detect_spring(df, levels, trend="up", settings=_JUNE_ST)
+    risk = 100.5 - (99.0 - config.JUNE_STOP_TICKS * _TICK)
     assert abs(sig["take_profit"] - (100.5 + risk * config.FALLBACK_RR)) < 1e-9
 
 
-def test_june_stop_is_one_atr_behind_wick():
-    """Стоп июньского движка — за фитилём плюс JUNE_STOP_ATR × ATR (с 17.09.2026).
+def test_june_stop_is_two_ticks_behind_wick():
+    """Боевое правило с вечера 17.09.2026: стоп за фитилём плюс JUNE_STOP_TICKS тика.
 
-    Тест падает, если кто-нибудь вернёт запас в процентах цены: старое правило дало бы
-    стоп В РАЗЫ ближе."""
+    Тест падает и при возврате на проценты цены, и при возврате на ATR: обе прежние
+    мерки дали бы стоп заметно ДАЛЬШЕ."""
     df = _spring_df()
-    sig = spring_june.detect_spring(df, _JUNE_LONG, trend="up")
+    sig = spring_june.detect_spring(df, _JUNE_LONG, trend="up", settings=_JUNE_ST)
+    assert abs(sig["stop_loss"] - (99.0 - config.JUNE_STOP_TICKS * _TICK)) < 1e-9
+    assert sig["stop_loss"] > 99.0 * (1 - config.STOP_SPREAD)      # ближе, чем 0.1% цены
     atr = pattern_detector._atr(df, len(df) - 2)
-    assert atr > 0
-    assert abs(sig["stop_loss"] - (99.0 - config.JUNE_STOP_ATR * atr)) < 1e-9
-    old = 99.0 * (1 - config.STOP_SPREAD)
-    assert sig["stop_loss"] < old - 0.01        # новый стоп заметно ДАЛЬШЕ прежнего
+    assert sig["stop_loss"] > 99.0 - config.JUNE_STOP_ATR * atr    # и ближе, чем 1 ATR
+
+
+def test_june_stop_falls_back_when_tick_not_passed():
+    """Тик кладёт вызывающий. Не передали — стоп считается ПРЕЖНЕЙ меркой (доля цены),
+    а не тиком нулевого размера. Поведение закреплено тестом, чтобы молчаливый откат
+    был виден: сигнал в этом случае всё равно уходит, просто со старым стопом."""
+    df = _spring_df()
+    sig = spring_june.detect_spring(df, _JUNE_LONG, trend="up")      # settings нет вовсе
+    assert abs(sig["stop_loss"] - 99.0 * (1 - config.STOP_SPREAD)) < 1e-9
+
+
+def test_june_stop_atr_mode_still_works():
+    """Прежнее правило из кода не убрано: JUNE_STOP_MODE возвращает стоп в долях ATR."""
+    df = _spring_df()
+    mode = config.JUNE_STOP_MODE
+    try:
+        config.JUNE_STOP_MODE = "atr"
+        sig = spring_june.detect_spring(df, _JUNE_LONG, trend="up", settings=_JUNE_ST)
+        atr = pattern_detector._atr(df, len(df) - 2)
+        assert abs(sig["stop_loss"] - (99.0 - config.JUNE_STOP_ATR * atr)) < 1e-9
+    finally:
+        config.JUNE_STOP_MODE = mode
 
 
 def test_june_min_target_skips_close_level():
@@ -1505,11 +1527,12 @@ def test_june_min_target_skips_close_level():
     levels = _JUNE_LONG + [{"price": near, "type": "resistance", "strength": "weak"},
                            {"price": far, "type": "resistance", "strength": "weak"}]
     # Без правила берётся ближайший уровень.
-    assert abs(spring_june.detect_spring(df, levels, trend="up")["take_profit"] - near) < 1e-9
+    assert abs(spring_june.detect_spring(df, levels, trend="up",
+                                        settings=_JUNE_ST)["take_profit"] - near) < 1e-9
     # С правилом «не ближе одного риска» — следующий за ним.
     old_risk = 100.5 - 99.0 * (1 - config.STOP_SPREAD)
     assert near - 100.5 < old_risk < far - 100.5        # фикстура различает варианты
-    sig = spring_june.detect_spring(df, levels, trend="up", settings={"MIN_TP_R": 1.0})
+    sig = spring_june.detect_spring(df, levels, trend="up", settings={**_JUNE_ST, "MIN_TP_R": 1.0})
     assert abs(sig["take_profit"] - far) < 1e-9
     # Сигнал при этом остаётся — двигается только цель.
     assert sig["direction"] == "long"
@@ -1519,15 +1542,17 @@ def test_june_min_target_measured_by_old_risk_not_new_stop():
     """Мерка цели — старый риск. Будь она от нынешнего стопа (1 ATR), дальний уровень
     тоже оказался бы «слишком близко», и цель уехала бы на запасную."""
     df = _spring_df()
-    # Уровень нарочно лежит МЕЖДУ старым риском (1.60) и новым (2.36): по старой мерке
-    # он далёкий и годится в цель, по новой — близкий и был бы пропущен.
-    far = 102.5
+    # Средний уровень лежит МЕЖДУ тиковым риском (1.52) и старым (1.60): по нынешнему
+    # стопу он «далёкий» и годился бы в цель, по старой мерке — близкий и пропускается.
+    mid, far = 102.05, 103.0
     levels = _JUNE_LONG + [{"price": 100.55, "type": "resistance", "strength": "weak"},
+                           {"price": mid, "type": "resistance", "strength": "weak"},
                            {"price": far, "type": "resistance", "strength": "weak"}]
-    sig = spring_june.detect_spring(df, levels, trend="up", settings={"MIN_TP_R": 1.0})
+    st = {**_JUNE_ST, "MIN_TP_R": 1.0}
+    sig = spring_june.detect_spring(df, levels, trend="up", settings=st)
     old_risk = 100.5 - 99.0 * (1 - config.STOP_SPREAD)
     new_risk = 100.5 - sig["stop_loss"]
-    assert old_risk < far - 100.5 < new_risk    # фикстура различает две мерки
+    assert new_risk < mid - 100.5 < old_risk     # фикстура различает две мерки
     assert abs(sig["take_profit"] - far) < 1e-9  # цель выбрана по СТАРОМУ риску
 
 
@@ -1551,7 +1576,7 @@ def test_june_explain_uses_same_min_target_as_detector():
                            {"price": 103.0, "type": "resistance", "strength": "weak"}]
     targets = {}
     for k in (0.0, 0.5, 1.0):
-        st = {"MIN_TP_R": k}
+        st = {**_JUNE_ST, "MIN_TP_R": k}
         sig = spring_june.detect_spring(df, levels, trend="up", settings=st)
         ex = spring_june.explain(df, levels, "up", st)
         assert abs(ex["sides"]["long"]["target"] - sig["take_profit"]) < 1e-9
