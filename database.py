@@ -235,6 +235,72 @@ def init_db() -> None:
                 last_bar   TEXT
             )
         """)
+        # ── Стратегия №5 — пробой сильного уровня (17.09.2026), СЛЕЖКА ────────
+        # Сигналы считаются и ведутся, но никому не рассылаются
+        # (config.BREAKOUT_SIGNALS = False). Сигнал общий для всех, как у тренда:
+        # личных настроек у стратегии нет, поэтому user_id тут не нужен.
+        # vol_ratio и trend — признаки МОМЕНТА, а не правила: по ним через месяц
+        # считается, что дали бы фильтры объёма и направления, без прогона истории.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS breakout_signals (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                instrument  TEXT    NOT NULL,
+                direction   TEXT    NOT NULL,                 -- 'long' | 'short'
+                level_price REAL    NOT NULL,                 -- пробитый уровень
+                entry_price REAL    NOT NULL,
+                stop_loss   REAL    NOT NULL,
+                take_profit REAL    NOT NULL,
+                bar_time    TEXT    NOT NULL,                 -- свеча пробоя, UTC
+                vol_ratio   REAL,                             -- объём свечи к среднему
+                trend       TEXT,                             -- направление 6-часовых
+                status      TEXT    NOT NULL DEFAULT 'open',  -- open | hit_tp | hit_sl | expired
+                result_r    REAL,
+                created_at  TEXT    NOT NULL,
+                closed_at   TEXT,
+                UNIQUE(instrument, direction, bar_time)
+            )
+        """)
+        # ── Стратегия №6 — ICT: свип ликвидности и разрыв на M15 (18.09.2026) ─
+        # Заняла место стратегии №4 (тренд) решением владельца. Сигнал общий для
+        # всех подписчиков инструмента, как у тренда и пробоя: личных настроек у
+        # стратегии нет, поэтому user_id тут не нужен — рассылка идёт по подписке.
+        # pool_price/sweep_time — что именно сняли и когда; gap_atr/disp_atr/risk_atr
+        # пишутся признаками момента: по ним потом считается, что дали бы фильтры,
+        # без нового прогона истории (так же заведена слежка пробоя).
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS ict_signals (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                instrument  TEXT    NOT NULL,
+                direction   TEXT    NOT NULL,                 -- 'long' | 'short'
+                pool_price  REAL    NOT NULL,                 -- снятый пул ликвидности
+                entry_price REAL    NOT NULL,
+                stop_loss   REAL    NOT NULL,
+                take_profit REAL    NOT NULL,
+                bar_time    TEXT    NOT NULL,                 -- свеча решения (M15), UTC
+                sweep_time  TEXT,                             -- свеча, снявшая ликвидность
+                gap_atr     REAL,                             -- ширина разрыва в ATR
+                disp_atr    REAL,                             -- тело импульса в ATR
+                risk_atr    REAL,                             -- риск сделки в ATR
+                status      TEXT    NOT NULL DEFAULT 'open',  -- open | hit_tp | hit_sl | expired
+                result_r    REAL,
+                created_at  TEXT    NOT NULL,
+                closed_at   TEXT,
+                UNIQUE(instrument, direction, bar_time)
+            )
+        """)
+        # Подписки тренда переезжают на ICT: стратегия №4 снята с боя 17.09.2026, её
+        # место занял ICT (18.09.2026), и человек, подписанный на вторую стратегию,
+        # должен остаться подписанным на вторую стратегию, а не молча её потерять.
+        #
+        # Миграция САМООГРАНИЧЕННАЯ: после переноса строк со strategy = 'trend' не
+        # остаётся, поэтому при следующем старте она не сработает и не вернёт подписку
+        # тому, кто от ICT отписался. Флаг «уже отработала» для этого не нужен — тот же
+        # приём, что у миграции доавгустовских алертов.
+        conn.execute("""
+            UPDATE OR IGNORE signal_subscriptions SET strategy = 'ict'
+            WHERE strategy = 'trend'
+        """)
+        conn.execute("DELETE FROM signal_subscriptions WHERE strategy = 'trend'")
         conn.commit()
 
 
@@ -583,6 +649,133 @@ def save_trend_step(instrument: str, last_bar: str | None, events: list[dict],
             conn.execute("INSERT OR REPLACE INTO trend_state (instrument, last_bar) VALUES (?, ?)",
                          (instrument, last_bar))
         conn.commit()
+
+
+# ── Стратегия №5 — пробой сильного уровня (слежка) ──────────────────────────
+
+def add_breakout_signal(instrument: str, sig: dict) -> int | None:
+    """Пишет сигнал пробоя. Возвращает id, а None — если такой уже записан.
+
+    Дедуп делает сам UNIQUE(instrument, direction, bar_time): задача крутится каждые
+    5 минут, а свеча закрывается раз в час, значит один и тот же пробой она увидит
+    двенадцать раз подряд. Проверять отдельным SELECT было бы гонкой.
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute("""
+            INSERT OR IGNORE INTO breakout_signals
+                (instrument, direction, level_price, entry_price, stop_loss, take_profit,
+                 bar_time, vol_ratio, trend, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+        """, (instrument, sig["direction"], sig["level_price"], sig["entry_price"],
+              sig["stop_loss"], sig["take_profit"], sig["bar_time"],
+              sig.get("vol_ratio"), sig.get("trend"), now))
+        conn.commit()
+        return cur.lastrowid if cur.rowcount else None
+
+
+def get_open_breakout_signals() -> list[dict]:
+    """Открытые сигналы пробоя — их ведёт monitor_breakout."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, instrument, direction, level_price, entry_price, stop_loss,
+                   take_profit, bar_time, created_at
+            FROM breakout_signals WHERE status = 'open' ORDER BY id
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def close_breakout_signal(signal_id: int, status: str, result_r: float | None) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            UPDATE breakout_signals SET status = ?, result_r = ?, closed_at = ?
+            WHERE id = ?
+        """, (status, result_r, datetime.now().isoformat(timespec="seconds"), signal_id))
+        conn.commit()
+
+
+def add_ict_signal(instrument: str, sig: dict) -> int | None:
+    """Пишет сигнал ICT. Возвращает id, а None — если это повтор.
+
+    ДЕДУП ДВОЙНОЙ, и оба нужны. UNIQUE(instrument, direction, bar_time) ловит одну и
+    ту же свечу: задача крутится каждые 5 минут, а пятнадцатиминутка закрывается раз в
+    15, значит один сетап она увидит трижды. Окно config.ICT_DEDUP_MIN ловит ДРУГОЕ —
+    серию соседних свечей одной стороны: разрыв за разрывом на импульсе дают сигнал
+    каждые 15 минут, а в замере то же правило стояло на 90 минутах.
+    """
+    now = datetime.now().isoformat(timespec="seconds")
+    with sqlite3.connect(DB_PATH) as conn:
+        last = conn.execute("""
+            SELECT bar_time FROM ict_signals
+            WHERE instrument = ? AND direction = ? ORDER BY bar_time DESC LIMIT 1
+        """, (instrument, sig["direction"])).fetchone()
+        if last:
+            gap = datetime.fromisoformat(sig["bar_time"]) - datetime.fromisoformat(last[0])
+            if gap.total_seconds() < config.ICT_DEDUP_MIN * 60:
+                return None
+        cur = conn.execute("""
+            INSERT OR IGNORE INTO ict_signals
+                (instrument, direction, pool_price, entry_price, stop_loss, take_profit,
+                 bar_time, sweep_time, gap_atr, disp_atr, risk_atr, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?)
+        """, (instrument, sig["direction"], sig["pool_price"], sig["entry_price"],
+              sig["stop_loss"], sig["take_profit"], sig["bar_time"], sig.get("sweep_time"),
+              sig.get("gap_atr"), sig.get("disp_atr"), sig.get("risk_atr"), now))
+        conn.commit()
+        return cur.lastrowid if cur.rowcount else None
+
+
+def get_open_ict_signals() -> list[dict]:
+    """Открытые сигналы ICT — их ведёт monitor_ict."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT id, instrument, direction, pool_price, entry_price, stop_loss,
+                   take_profit, bar_time, created_at
+            FROM ict_signals WHERE status = 'open' ORDER BY id
+        """).fetchall()
+    return [dict(r) for r in rows]
+
+
+def close_ict_signal(signal_id: int, status: str, result_r: float | None) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            UPDATE ict_signals SET status = ?, result_r = ?, closed_at = ?
+            WHERE id = ?
+        """, (status, result_r, datetime.now().isoformat(timespec="seconds"), signal_id))
+        conn.commit()
+
+
+def get_ict_signals(since: str | None = None) -> list[dict]:
+    """Сигналы ICT для сводки /ict, новые первыми."""
+    sql = """SELECT id, instrument, direction, pool_price, entry_price, stop_loss,
+                    take_profit, bar_time, sweep_time, gap_atr, disp_atr, risk_atr,
+                    status, result_r, created_at
+             FROM ict_signals"""
+    args: tuple = ()
+    if since:
+        sql += " WHERE created_at >= ?"
+        args = (since,)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(sql + " ORDER BY id DESC", args).fetchall()
+    return [dict(r) for r in rows]
+
+
+def get_breakout_signals(since: str | None = None) -> list[dict]:
+    """Сигналы пробоя для сводки /breakout, новые первыми."""
+    sql = """SELECT id, instrument, direction, level_price, entry_price, stop_loss,
+                    take_profit, bar_time, vol_ratio, trend, status, result_r, created_at
+             FROM breakout_signals"""
+    args: tuple = ()
+    if since:
+        sql += " WHERE created_at >= ?"
+        args = (since,)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(sql + " ORDER BY id DESC", args).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_trend_positions() -> list[dict]:

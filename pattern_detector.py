@@ -901,7 +901,8 @@ def evaluate_fill(signal: dict, df: pd.DataFrame, wait_bars: int | None = None,
     return {"status": "waiting_fill", "fill_time": None, "stopped_at_fill": False}
 
 
-def evaluate_signal(signal: dict, df: pd.DataFrame) -> str:
+def evaluate_signal(signal: dict, df: pd.DataFrame,
+                    expire_hours: int | None = None) -> str:
     """Исход ОТКРЫТОЙ сделки по свечам, появившимся ПОСЛЕ входа.
 
     Точка отсчёта — момент входа: `fill_time` (когда исполнилась лимитная заявка),
@@ -942,6 +943,8 @@ def evaluate_signal(signal: dict, df: pd.DataFrame) -> str:
                 return "hit_tp"
 
     age_hours = (after.index[-1] - pd.Timestamp(anchor)).total_seconds() / 3600
-    if age_hours >= config.SIGNAL_EXPIRE_HOURS:
+    # Срок жизни по умолчанию общий (SIGNAL_EXPIRE_HOURS, 48 ч). Свой передаёт только
+    # пробой сильного уровня (breakout.outcome): у него горизонт 120 ч, так мерилось.
+    if age_hours >= (config.SIGNAL_EXPIRE_HOURS if expire_hours is None else expire_hours):
         return "expired"
     return "pending"

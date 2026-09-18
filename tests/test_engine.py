@@ -16,6 +16,8 @@ import alerts  # noqa: E402
 import analyzer  # noqa: E402
 import config  # noqa: E402
 import instruments
+import breakout  # noqa: E402
+import ict  # noqa: E402
 import pattern_detector  # noqa: E402
 import spring_june  # noqa: E402
 import trend  # noqa: E402
@@ -1404,8 +1406,8 @@ def test_spring_switch_controls_scheduler_jobs():
         on = {f for f, _ in scheduler.jobs()}
     finally:
         config.SPRING_SIGNALS = saved
-    always = {scheduler.monitor_trend, scheduler.track_signals,
-              scheduler.track_trades, scheduler.check_alerts}
+    always = {scheduler.monitor_trend, scheduler.monitor_breakout, scheduler.monitor_ict,
+              scheduler.track_signals, scheduler.track_trades, scheduler.check_alerts}
     assert off == always
     assert on == always | {scheduler.run_analysis, scheduler.monitor_signals}
 
@@ -1419,7 +1421,7 @@ def test_spring_switch_controls_scheduler_jobs():
 
 _JUNE_LONG = [{"price": 100.0, "type": "support", "strength": "strong"},
               {"price": 110.0, "type": "resistance", "strength": "weak"}]
-_JUNE_SHORT = [{"price": 100.0, "type": "resistance", "strength": "weak"},
+_JUNE_SHORT = [{"price": 100.0, "type": "resistance", "strength": "strong"},
                {"price": 90.0, "type": "support", "strength": "weak"}]
 
 
@@ -1437,7 +1439,7 @@ def test_june_takes_weak_rebound():
 
 def test_june_break_depth_is_share_of_level_price():
     """Прокол мерится долей ЦЕНЫ уровня: 0.04% мало, 0.06% хватает."""
-    levels = [{"price": 100.0, "type": "support", "strength": "weak"}]
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
     df = _spring_df()
     low = df.columns.get_loc("low")
     df.iloc[23, low] = 100.0 * (1 - 0.0004)
@@ -1474,7 +1476,7 @@ def test_june_target_takes_closest_level():
 
 def test_june_fallback_target_two_risks():
     df = _spring_df()
-    levels = [{"price": 100.0, "type": "support", "strength": "weak"}]
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
     sig = spring_june.detect_spring(df, levels, trend="up")
     atr = pattern_detector._atr(df, len(df) - 2)
     risk = 100.5 - (99.0 - config.JUNE_STOP_ATR * atr)
@@ -1567,9 +1569,64 @@ def test_june_explain_uses_same_min_target_as_detector():
 def test_june_no_fresh_cross_needed():
     """Выкуп уровня снизу сентябрьский движок свипом не считает, июньский — берёт."""
     df = _below_level_df(fresh=False)
-    levels = [_LVL_SUPPORT, _LVL_RESIST]
+    # Уровень СИЛЬНЫЙ: с 17.09.2026 июньский движок слабые не берёт, а предмет
+    # этого теста — свежесть пересечения, а не сила.
+    levels = [{**_LVL_SUPPORT, "strength": "strong"}, _LVL_RESIST]
     assert pattern_detector.detect_spring(df, levels, trend="sideways") is None
     assert spring_june.detect_spring(df, levels, trend="sideways") is not None
+
+
+def test_june_takes_only_strong_levels():
+    """Отбор по силе (17.09.2026): слабый проколотый уровень сигнала не даёт.
+
+    Двигаем ТОЛЬКО силу — свечи, объём и прокол те же, — значит тест меряет именно
+    это правило. Падает, если config.JUNE_STRONG_ONLY обнулить."""
+    df = _spring_df()
+    weak = [{"price": 100.0, "type": "support", "strength": "weak"},
+            {"price": 110.0, "type": "resistance", "strength": "weak"}]
+    assert spring_june.detect_spring(df, weak, trend="up") is None
+    strong = [{**weak[0], "strength": "strong"}, weak[1]]
+    assert spring_june.detect_spring(df, strong, trend="up") is not None
+
+    up = _upthrust_df()
+    weak_s = [{"price": 100.0, "type": "resistance", "strength": "weak"},
+              {"price": 90.0, "type": "support", "strength": "weak"}]
+    assert spring_june.detect_upthrust(up, weak_s, trend="down") is None
+    strong_s = [{**weak_s[0], "strength": "strong"}, weak_s[1]]
+    assert spring_june.detect_upthrust(up, strong_s, trend="down") is not None
+
+
+def test_june_picks_deepest_broken_level():
+    """Из проколотых берётся САМЫЙ ГЛУБОКИЙ (17.09.2026), а не первый по списку.
+
+    Для лонга это нижняя поддержка, для шорта — верхнее сопротивление. Слабые
+    уровни при этом не мешают: они просто не рассматриваются."""
+    df = _spring_df()                       # закрытие 100.5, фитиль 99.0
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"},
+              {"price": 99.5, "type": "support", "strength": "strong"},
+              {"price": 110.0, "type": "resistance", "strength": "weak"}]
+    assert abs(spring_june.detect_spring(df, levels, trend="up")["level_price"] - 99.5) < 1e-9
+    # Самый глубокий слабый — берётся сильный, что выше, а не отказ от сигнала.
+    mixed = [dict(levels[0]), {**levels[1], "strength": "weak"}, levels[2]]
+    assert abs(spring_june.detect_spring(df, mixed, trend="up")["level_price"] - 100.0) < 1e-9
+
+    up = _upthrust_df()                     # закрытие 99.5, фитиль 101.0
+    levels_s = [{"price": 100.0, "type": "resistance", "strength": "strong"},
+                {"price": 100.5, "type": "resistance", "strength": "strong"},
+                {"price": 90.0, "type": "support", "strength": "weak"}]
+    sig = spring_june.detect_upthrust(up, levels_s, trend="down")
+    assert abs(sig["level_price"] - 100.5) < 1e-9
+
+
+def test_june_explain_names_weak_level_as_blocker():
+    """/analyze обязан назвать ИМЕННО эту причину, иначе отчёт пообещает сигнал."""
+    df = _spring_df()
+    weak = [{"price": 100.0, "type": "support", "strength": "weak"},
+            {"price": 110.0, "type": "resistance", "strength": "weak"}]
+    ex = spring_june.explain(df, weak, "up")
+    long_side = ex["sides"]["long"]
+    assert not long_side["ready"]
+    assert any("СЛАБЫЙ" in b for b in long_side["blockers"]), long_side["blockers"]
 
 
 def test_june_explain_agrees_with_detector():
@@ -1583,7 +1640,8 @@ def test_june_explain_agrees_with_detector():
         (_weak_rebound_spring_df(), _JUNE_LONG, "down"),
         (_upthrust_df(), _JUNE_SHORT, "down"),
         (_upthrust_df(), _JUNE_SHORT, "sideways"),
-        (_below_level_df(fresh=False), [_LVL_SUPPORT, _LVL_RESIST], "sideways"),
+        (_below_level_df(fresh=False),
+         [{**_LVL_SUPPORT, "strength": "strong"}, _LVL_RESIST], "sideways"),
     ]
     fired = 0
     for df, levels, tr in cases:
@@ -1644,20 +1702,20 @@ def test_subscription_is_per_instrument_and_strategy():
     with _temp_db() as (database, _):
         database.init_db()
         database.add_subscription(1, "BTC", "spring")
-        database.add_subscription(1, "ETH", "trend")
+        database.add_subscription(1, "ETH", "ict")
         database.add_subscription(2, "BTC")
         assert sorted(database.get_subscribers("BTC", "spring")) == [1, 2]
-        assert database.get_subscribers("BTC", "trend") == [2]
-        assert database.get_subscribers("ETH", "trend") == [1]
+        assert database.get_subscribers("BTC", "ict") == [2]
+        assert database.get_subscribers("ETH", "ict") == [1]
         assert database.get_subscribers("ETH", "spring") == []
         assert database.get_user_subscriptions(1, "spring") == ["BTC"]
         assert sorted(database.get_user_subscriptions(1)) == ["BTC", "ETH"]
         assert database.get_subscribed_instruments("spring") == ["BTC"]
-        database.remove_subscription(2, "BTC", "trend")
-        assert database.get_subscribers("BTC", "trend") == []
+        database.remove_subscription(2, "BTC", "ict")
+        assert database.get_subscribers("BTC", "ict") == []
         assert sorted(database.get_subscribers("BTC", "spring")) == [1, 2]
-        database.set_strategy_instruments(1, "trend", ["SOL", "XRP"])
-        assert sorted(database.get_user_subscriptions(1, "trend")) == ["SOL", "XRP"]
+        database.set_strategy_instruments(1, "ict", ["SOL", "XRP"])
+        assert sorted(database.get_user_subscriptions(1, "ict")) == ["SOL", "XRP"]
         assert database.get_user_subscriptions(1, "spring") == ["BTC"]
         database.remove_subscription(2, "BTC")
         assert database.get_subscribers("BTC", "spring") == [1]
@@ -1678,12 +1736,273 @@ def test_old_subscriptions_migrate_once_to_both_strategies():
             conn.commit()
         database.init_db()
         assert database.get_subscribers("BTC", "spring") == [1]
-        assert sorted(database.get_subscribers("BTC", "trend")) == [1, 2]
+        assert sorted(database.get_subscribers("BTC", "ict")) == [1, 2]
         assert database.get_subscribers("ETH", "spring") == [1]
         database.remove_subscription(1, "ETH")
         database.init_db()
         assert database.get_subscribers("ETH", "spring") == []
-        assert database.get_subscribers("ETH", "trend") == []
+        assert database.get_subscribers("ETH", "ict") == []
+
+
+# ── Стратегия №5 — пробой сильного уровня (breakout.py, 17 сентября 2026) ────
+#
+# Стратегия в СЛЕЖКЕ: сигналы считаются и ведутся, но никому не шлются. Тесты
+# проверяют сами правила — их предмет от рассылки не зависит.
+
+def _breakout_df() -> pd.DataFrame:
+    """Цена под сопротивлением 110, последняя закрытая свеча закрылась ВЫШЕ него."""
+    rows = [(108.0, 109.0, 107.0, 108.0, 100.0) for _ in range(25)]
+    rows[23] = (108.0, 111.5, 107.5, 111.0, 200.0)   # пробой вверх с закрытием за уровнем
+    rows[24] = (111.0, 111.6, 110.8, 111.2, 50.0)    # формирующаяся
+    return _df(rows)
+
+
+_BRK_LEVELS = [{"price": 110.0, "type": "resistance", "strength": "strong"},
+               {"price": 100.0, "type": "support", "strength": "strong"}]
+
+
+def test_breakout_takes_close_beyond_strong_level():
+    """Свеча закрылась за сильным уровнем — сигнал ПО направлению пробоя."""
+    sigs = breakout.detect(_breakout_df(), _BRK_LEVELS)
+    assert len(sigs) == 1
+    sig = sigs[0]
+    assert sig["direction"] == "long" and abs(sig["level_price"] - 110.0) < 1e-9
+    assert abs(sig["entry_price"] - 111.0) < 1e-9        # вход по закрытию
+    atr = pattern_detector._atr(_breakout_df(), 23)
+    assert abs(sig["stop_loss"] - (107.5 - config.BREAKOUT_STOP_ATR * atr)) < 1e-9
+    # Цель не ближе BREAKOUT_MIN_TP_R рисков; встречного уровня впереди нет —
+    # значит ровно столько рисков и берётся.
+    risk = sig["entry_price"] - sig["stop_loss"]
+    assert abs(sig["take_profit"] - (111.0 + config.BREAKOUT_MIN_TP_R * risk)) < 1e-9
+
+
+def test_breakout_ignores_weak_level():
+    """Слабый уровень сигнала не даёт: по замеру на слабых уровнях эффекта нет вовсе."""
+    weak = [{**_BRK_LEVELS[0], "strength": "weak"}, _BRK_LEVELS[1]]
+    assert breakout.detect(_breakout_df(), weak) == []
+
+
+def test_breakout_needs_fresh_cross():
+    """Цена уже жила выше уровня — это не пробой, а продолжение.
+
+    Ровно та ошибка, на которой сгорел первый прогон momentum.py 21 августа 2026:
+    без этого требования «пробоем» становится любая свеча выше уровня."""
+    df = _breakout_df()
+    close = df.columns.get_loc("close")
+    df.iloc[22, close] = 110.5              # предыдущая свеча уже закрылась за уровнем
+    assert breakout.detect(df, _BRK_LEVELS) == []
+
+
+def test_breakout_picks_farthest_level():
+    """Из пробитых берётся САМЫЙ ДАЛЬНИЙ — для лонга верхнее сопротивление."""
+    levels = _BRK_LEVELS + [{"price": 110.6, "type": "resistance", "strength": "strong"}]
+    sig = breakout.detect(_breakout_df(), levels)[0]
+    assert abs(sig["level_price"] - 110.6) < 1e-9
+
+
+def test_breakout_target_takes_level_far_enough():
+    """Цель — встречный уровень не ближе BREAKOUT_MIN_TP_R рисков; ближний пропускается."""
+    df = _breakout_df()
+    atr = pattern_detector._atr(df, 23)
+    risk = 111.0 - (107.5 - config.BREAKOUT_STOP_ATR * atr)
+    near = 111.0 + risk * 0.5                          # ближе порога
+    far = 111.0 + risk * (config.BREAKOUT_MIN_TP_R + 0.5)
+    levels = _BRK_LEVELS + [
+        {"price": near, "type": "resistance", "strength": "weak"},
+        {"price": far, "type": "resistance", "strength": "weak"},
+    ]
+    sig = breakout.detect(df, levels)[0]
+    assert abs(sig["take_profit"] - far) < 1e-9
+
+
+def test_breakout_short_mirrors_long():
+    """Шорт — зеркало: свеча закрылась НИЖЕ сильной поддержки."""
+    rows = [(101.0, 102.0, 100.5, 101.0, 100.0) for _ in range(25)]
+    rows[23] = (101.0, 101.5, 98.5, 99.0, 200.0)
+    rows[24] = (99.0, 99.4, 98.8, 99.1, 50.0)
+    df = _df(rows)
+    sigs = breakout.detect(df, _BRK_LEVELS)
+    assert len(sigs) == 1 and sigs[0]["direction"] == "short"
+    atr = pattern_detector._atr(df, 23)
+    assert abs(sigs[0]["stop_loss"] - (101.5 + config.BREAKOUT_STOP_ATR * atr)) < 1e-9
+    assert sigs[0]["take_profit"] < sigs[0]["entry_price"]
+
+
+def test_breakout_outcome_uses_its_own_horizon():
+    """Срок жизни у пробоя свой (120 ч), а не общий 48 — иначе сделка закрывалась бы
+    «истёкшей» там, где по правилам стратегии она ещё идёт."""
+    rows = [(100.0, 100.4, 99.6, 100.0, 100.0) for _ in range(80)]
+    df = _df(rows)
+    sig = {"direction": "long", "entry_price": 100.0, "stop_loss": 95.0,
+           "take_profit": 115.0, "bar_time": str(df.index[0])}
+    assert config.SIGNAL_EXPIRE_HOURS < 79 < config.BREAKOUT_EXPIRE_HOURS
+    assert pattern_detector.evaluate_signal(sig, df) == "expired"      # по общему сроку
+    assert breakout.outcome(sig, df) == "pending"                      # по своему — ещё идёт
+
+
+def test_breakout_result_in_risks():
+    sig = {"direction": "long", "entry_price": 100.0, "stop_loss": 98.0, "take_profit": 106.0}
+    assert abs(breakout.result_r(sig, "hit_tp") - 3.0) < 1e-9
+    assert breakout.result_r(sig, "hit_sl") == -1.0
+    assert breakout.result_r(sig, "expired") is None
+
+
+# ── Стратегия №6 — ICT: свип ликвидности и разрыв на M15 (ict.py, 18.09.2026) ──
+#
+# Свечи в фикстурах часовые, как во всех тестах файла: детектор считает по БАРАМ, а
+# не по минутам, и правила от длины свечи не зависят. Зависит только пересчёт срока
+# жизни пула — на короткой фикстуре он не успевает сработать.
+
+def _ict_rows() -> list[tuple]:
+    """Фон с размахом 1.0, свинговый максимум для слома структуры и пул снизу."""
+    rows = [(100.0, 100.5, 99.5, 100.0, 100.0) for _ in range(29)]
+    rows[18] = (100.0, 101.5, 99.5, 100.0, 100.0)   # свинг-максимум — цель слома структуры
+    rows[20] = (100.0, 100.5, 98.0, 100.0, 100.0)   # пул ликвидности снизу: 98.0
+    rows[25] = (100.0, 100.2, 97.5, 99.0, 100.0)    # свип: ушли под пул
+    rows[26] = (99.0, 100.4, 98.9, 100.3, 100.0)    # импульс телом 1.3
+    rows[27] = (100.5, 101.8, 100.5, 101.6, 100.0)  # разрыв виден: low 100.5 > high[25] 100.2
+    return rows
+
+
+def test_ict_atr_matches_pattern_detector():
+    """Векторный ATR детектора ICT обязан совпасть с общим помощником на каждом баре.
+
+    Разойдутся — и пороги импульса, разрыва и запас стопа поедут молча: в правилах
+    ICT всё задано в долях ATR."""
+    df = _df(_ict_rows())
+    fast = ict.atr_series(df)
+    for pos in range(len(df)):
+        assert abs(fast[pos] - pattern_detector._atr(df, pos)) < 1e-9
+
+
+def test_ict_long_setup():
+    """Сняли пул 98.0, следом импульс с разрывом и слом структуры → лонг по рынку."""
+    df = _df(_ict_rows())
+    sigs = ict.detect(df)
+    assert len(sigs) == 1
+    sig = sigs[0]
+    assert sig["direction"] == "long"
+    assert sig["pool_price"] == 98.0
+    assert sig["entry_price"] == 101.6                 # вход по закрытию свечи решения
+    atr = ict.atr_series(df)[25]                       # ATR свечи СВИПА, как в замере
+    assert abs(sig["stop_loss"] - (97.5 - config.ICT_STOP_ATR * atr)) < 1e-9
+    assert sig["sweep_time"] == str(df.index[25])
+
+
+def test_ict_short_mirrors_long():
+    """Зеркальные свечи дают зеркальный сигнал — ловит одностороннюю ошибку в правилах."""
+    rows = [(200.0 - o, 200.0 - l, 200.0 - h, 200.0 - c, v)
+            for o, h, l, c, v in _ict_rows()]
+    sigs = ict.detect(_df(rows))
+    assert len(sigs) == 1 and sigs[0]["direction"] == "short"
+    assert sigs[0]["pool_price"] == 102.0              # зеркало пула 98.0
+    assert sigs[0]["stop_loss"] > sigs[0]["entry_price"]
+
+
+def test_ict_needs_sweep():
+    """Без снятия ликвидности сигнала нет, даже когда импульс и разрыв на месте.
+
+    Это главное требование школы, и оно же единственное, что отличает сетап ICT от
+    обычного разрыва после импульса."""
+    rows = _ict_rows()
+    rows[25] = (100.0, 100.2, 99.0, 99.0, 100.0)       # свеча не дошла до пула 98.0
+    assert ict.detect(_df(rows)) == []
+
+
+def test_ict_needs_gap():
+    """Разрыв обязателен: закрыли его — сетапа нет."""
+    rows = _ict_rows()
+    rows[27] = (100.5, 101.8, 100.0, 101.6, 100.0)     # low 100.0 < high[25] 100.2
+    assert ict.detect(_df(rows)) == []
+
+
+def test_ict_needs_displacement():
+    """Импульс слабее порога — сетапа нет (тело меньше ICT_DISP_ATR × ATR)."""
+    rows = _ict_rows()
+    rows[26] = (99.0, 100.4, 98.9, 99.2, 100.0)        # тело 0.2 при пороге ~0.56
+    assert ict.detect(_df(rows)) == []
+
+
+def test_ict_needs_mss():
+    """Без слома структуры сигнала нет: цена не забрала последний свинг-максимум."""
+    rows = _ict_rows()
+    rows[18] = (100.0, 103.0, 99.5, 100.0, 100.0)      # свинг выше, чем дотянулись
+    assert ict.detect(_df(rows)) == []
+
+
+def test_ict_target_skips_liquidity_closer_than_min_r():
+    """Ликвидность ближе ICT_MIN_TP_R рисков целью не становится.
+
+    Проверяется снятием: при обнулённом пороге целью встаёт именно близкий уровень,
+    а с боевым — дальний. Без этого теста порог можно потерять незаметно."""
+    rows = _ict_rows()
+    # Порядок важен: свинг окна 2 требует соседей ниже, поэтому дальний пул ставим
+    # раньше близкого — иначе близкий перестанет быть свингом и тест проверит не то.
+    rows[10] = (100.0, 112.0, 99.5, 100.0, 100.0)      # дальняя ликвидность сверху: 112.0
+    rows[14] = (100.0, 103.0, 99.5, 100.0, 100.0)      # близкая: 103.0
+    df = _df(rows)
+    sig = ict.detect(df)[0]
+    assert sig["take_profit"] == 112.0
+    saved = config.ICT_MIN_TP_R
+    try:
+        config.ICT_MIN_TP_R = 0.0
+        assert ict.detect(df)[0]["take_profit"] == 103.0
+    finally:
+        config.ICT_MIN_TP_R = saved
+
+
+def test_ict_target_falls_back_to_two_risks():
+    """Подходящей ликвидности впереди нет — цель ровно ICT_FALLBACK_RR риска."""
+    df = _df(_ict_rows())
+    sig = ict.detect(df)[0]
+    risk = sig["entry_price"] - sig["stop_loss"]
+    assert abs(sig["take_profit"] - (sig["entry_price"] + config.ICT_FALLBACK_RR * risk)) < 1e-9
+
+
+def test_ict_result_in_risks():
+    sig = {"direction": "long", "entry_price": 100.0, "stop_loss": 98.0, "take_profit": 104.0}
+    assert abs(ict.result_r(sig, "hit_tp") - 2.0) < 1e-9
+    assert ict.result_r(sig, "hit_sl") == -1.0
+    assert ict.result_r(sig, "expired") is None
+
+
+def test_ict_switch_controls_scheduler_jobs():
+    """ICT_SIGNALS снимает ровно свою задачу и не задевает остальные стратегии."""
+    import scheduler
+    saved = config.ICT_SIGNALS
+    try:
+        config.ICT_SIGNALS = False
+        off = {f for f, _ in scheduler.jobs()}
+        config.ICT_SIGNALS = True
+        on = {f for f, _ in scheduler.jobs()}
+    finally:
+        config.ICT_SIGNALS = saved
+    assert scheduler.monitor_ict not in off
+    assert on == off | {scheduler.monitor_ict}
+
+
+def test_trend_subscriptions_migrate_to_ict_once():
+    """Подписка на снятый с боя тренд переезжает на ICT — и ровно один раз.
+
+    Второй init_db не должен вернуть подписку тому, кто от ICT отписался: миграция
+    самоограничена тем, что строк 'trend' после неё не остаётся."""
+    with _temp_db() as (database, sqlite3):
+        database.init_db()
+        with sqlite3.connect(database.DB_PATH) as conn:
+            conn.execute("INSERT INTO signal_subscriptions VALUES (5, 'BTC', 'trend', 'now')")
+            conn.commit()
+        database.init_db()
+        assert database.get_subscribers("BTC", "ict") == [5]
+        database.remove_subscription(5, "BTC", "ict")
+        database.init_db()
+        assert database.get_subscribers("BTC", "ict") == []
+
+
+def test_strategies_offer_spring_and_ict():
+    """В /subscribe ровно две стратегии, и у каждой есть метка на кнопке."""
+    import bot
+    assert set(config.STRATEGIES) == {"spring", "ict"}
+    assert set(bot.STRATEGY_MARK) == set(config.STRATEGIES)
 
 
 if __name__ == "__main__":

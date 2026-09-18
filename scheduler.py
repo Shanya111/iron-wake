@@ -1,11 +1,15 @@
 """Фоновые задачи бота. Планировщик в проекте ровно один — этот.
 
-Шесть задач:
+Семь задач:
   • run_analysis  (раз в час) — пересчитывает тренд/уровни/зоны и пишет в БД (levels);
   • monitor_signals (каждые 5 мин) — ищет Spring/Upthrust по свежим H1-свечам, пишет
     в signals и рассылает подписчикам;
   • monitor_trend (каждые 5 мин) — стратегия №4, тренд по недельному каналу: ведёт
     общую позицию модели по всем инструментам движка (правила — trend.py);
+  • monitor_breakout (каждые 5 мин) — стратегия №5, пробой сильного уровня: считает
+    сигналы и ведёт их исходы, но НИКОМУ НЕ ШЛЁТ, пока config.BREAKOUT_SIGNALS =
+    False (слежка, решение владельца 17.09.2026; правила — breakout.py, сводка —
+    команда /breakout);
   • track_signals (каждые 5 мин) — ведёт сигнал по двум ступеням: исполнилась ли
     лимитная заявка, а потом — дошла ли сделка до цели/стопа; сообщает владельцу;
   • track_trades (каждые 5 мин) — исход сделок журнала;
@@ -33,9 +37,11 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import alerts
 import analyzer
+import breakout
 import config
 import data_fetcher
 import database
+import ict
 import llm
 import pattern_detector
 import spring_june
@@ -79,7 +85,7 @@ async def engine_candles(code: str):
     return analyzer.rolling_hours(m15, config.H1_LIMIT)
 
 
-def _subscribed_engine() -> list[str]:
+def _subscribed_engine(strategy: str = "spring") -> list[str]:
     """Инструменты с подпиской, входящие в движок.
 
     Спрашиваем engine_codes(), а не «есть ли источник данных», хотя с 3 сентября
@@ -87,10 +93,12 @@ def _subscribed_engine() -> list[str]:
     осталось. Вопрос всё равно задаём составом движка — состав может снова
     измениться, а подписки в базе живут дольше любого решения о нём.
 
-    Своя пара сюда не попадает никогда: подписки ставятся только по реестру."""
+    Своя пара сюда не попадает никогда: подписки ставятся только по реестру.
+
+    strategy — чьи подписки спрашиваем: ложного пробоя (по умолчанию) или ICT.
+    Стратегии живут в одном движке, но подписки у них раздельные с 15.09.2026."""
     engine = set(engine_codes())
-    # Задачи ложного пробоя — поэтому и подписки берутся только по нему.
-    return [c for c in database.get_subscribed_instruments("spring") if c in engine]
+    return [c for c in database.get_subscribed_instruments(strategy) if c in engine]
 
 
 def spring_rules():
@@ -526,6 +534,161 @@ async def _notify(bot, code: str, signal: dict, user_id: int, comment: str | Non
         print(f"[monitor_signals] не отправить {user_id}: {e}")
 
 
+async def monitor_breakout(bot) -> None:
+    """Стратегия №5 — пробой сильного уровня (каждые 5 минут). Правила — breakout.py.
+
+    В СЛЕЖКЕ: считает сигналы и доводит их до цели, стопа или истечения, но НИКОМУ
+    НЕ ШЛЁТ, пока config.BREAKOUT_SIGNALS = False (решение владельца 17.09.2026 —
+    сначала посмотреть на живых данных). Сводка — команда /breakout.
+
+    Идёт по ВСЕМ инструментам движка, а не только по подписанным: смысл слежки в
+    статистике, а она не должна зависеть от того, кто на что подписан.
+
+    Уровни берутся из таблицы levels — те же, что видит человек в /analyze, их раз
+    в час пересчитывает run_analysis. Значит при выключенном ложном пробое
+    (SPRING_SIGNALS = False) run_analysis не работает и уровни устаревают: об этом
+    печатается предупреждение, а не тихо считаются сигналы по вчерашним уровням.
+    """
+    if config.SPRING_SIGNALS is False:
+        print("[monitor_breakout] уровни не пересчитываются (run_analysis выключен) — пропуск")
+        return
+    for code in engine_codes():
+        try:
+            df = await engine_candles(code)
+            h1_trend = await fetch_candles(code, config.H1_TIMEFRAME, config.TREND_TF_H1_LIMIT)
+        except Exception as e:
+            print(f"[monitor_breakout] {code}: ошибка данных: {e}")
+            continue
+        levels = database.get_levels(code)
+        if not levels:
+            continue
+        for sig in breakout.detect(df, levels, analyzer.engine_trend(h1_trend)):
+            sig_id = database.add_breakout_signal(code, sig)
+            if sig_id is None:          # тот же пробой уже записан на прошлом круге
+                continue
+            print(f"[monitor_breakout] ПРОБОЙ {code} {sig['direction']} "
+                  f"уровень {sig['level_price']} вход {sig['entry_price']} "
+                  f"стоп {sig['stop_loss']} цель {sig['take_profit']}")
+
+    # Исходы открытых сигналов — по тем же часовым свечам из общего кеша.
+    for sig in database.get_open_breakout_signals():
+        code = sig["instrument"]
+        try:
+            df = await fetch_candles(code, config.H1_TIMEFRAME, config.H1_LIMIT)
+        except Exception as e:
+            print(f"[monitor_breakout] {code}: ошибка данных при трекинге: {e}")
+            continue
+        status = breakout.outcome(sig, df)
+        if status == "pending":
+            continue
+        database.close_breakout_signal(sig["id"], status, breakout.result_r(sig, status))
+        print(f"[monitor_breakout] {code} #{sig['id']}: {status}")
+
+
+async def monitor_ict(bot) -> None:
+    """Стратегия №6 — ICT на пятнадцатиминутках (каждые 5 минут). Правила — ict.py.
+
+    Идёт по инструментам, У КОТОРЫХ ЕСТЬ ПОДПИСКА НА ICT, — в отличие от тренда и
+    пробоя, которые считаются по всему движку. Причина в том, что состояния между
+    свечами у ICT нет: сигнал рождается и закрывается сам, и пропущенный сетап по
+    инструменту без подписчиков ничего не ломает.
+
+    Свечи M15 берутся одним запросом на config.ICT_M15_LIMIT (960 = 10 суток). Этого
+    хватает и пулам ликвидности (живут config.ICT_POOL_AGE_H = 240 ч), и трекингу
+    исхода (горизонт 48 ч). Валютные пары вне форекс-сессии на паузе: запрос падает,
+    инструмент пропускается до следующего раза — как у всех остальных задач.
+    """
+    if not config.ICT_SIGNALS:
+        return
+    for code in _subscribed_engine("ict"):
+        try:
+            df = await fetch_candles(code, config.ICT_TIMEFRAME, config.ICT_M15_LIMIT)
+        except Exception as e:
+            print(f"[monitor_ict] {code}: ошибка данных: {e}")
+            continue
+        for sig in ict.detect(df):
+            if database.add_ict_signal(code, sig) is None:
+                continue        # тот же сетап уже записан либо дедуп по времени
+            print(f"[monitor_ict] СИГНАЛ {code} {sig['direction']} "
+                  f"пул {sig['pool_price']} вход {sig['entry_price']} "
+                  f"стоп {sig['stop_loss']} цель {sig['take_profit']}")
+            await _notify_ict(bot, code, sig)
+
+    # Исходы открытых сигналов — по тем же пятнадцатиминуткам из общего кеша.
+    for sig in database.get_open_ict_signals():
+        code = sig["instrument"]
+        try:
+            df = await fetch_candles(code, config.ICT_TIMEFRAME, config.ICT_M15_LIMIT)
+        except Exception as e:
+            print(f"[monitor_ict] {code}: ошибка данных при трекинге: {e}")
+            continue
+        status = ict.outcome(sig, df)
+        if status == "pending":
+            continue
+        result_r = ict.result_r(sig, status)
+        database.close_ict_signal(sig["id"], status, result_r)
+        print(f"[monitor_ict] {code} #{sig['id']}: {status}")
+        await _notify_ict_outcome(bot, code, sig, status, result_r)
+
+
+async def _notify_ict(bot, code: str, sig: dict) -> None:
+    """Сигнал ICT — подписчикам инструмента по этой стратегии. Коротко, цифрами."""
+    info = resolve(code)
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(sig["entry_price"])
+    long_ = sig["direction"] == "long"
+    arrow = "🟢 ЛОНГ" if long_ else "🔴 ШОРТ"
+    risk = abs(sig["entry_price"] - sig["stop_loss"])
+    risk_pct = risk / sig["entry_price"] if sig["entry_price"] else 0.0
+    rr = abs(sig["take_profit"] - sig["entry_price"]) / risk if risk else 0.0
+    # Объём под риск 1% депозита — как в сообщении тренда. Стоп у ICT узкий, поэтому
+    # объём почти всегда больше депозита, и плечо называется прямо.
+    size = 0.01 / risk_pct if risk_pct else 0.0
+    size_txt = (f"{size:.0%} депозита" if size <= 1
+                else f"{size:.1f} депозита, плечо x{math.ceil(size)}")
+    late = ""
+    age = pd.Timestamp.now(tz="UTC") - pd.Timestamp(sig["bar_time"])
+    if age > timedelta(minutes=30):
+        late = (f"⚠️ Сообщение запоздало на {age.total_seconds() / 60:.0f} мин — "
+                "цена могла уйти.\n")
+    took = "минимум" if long_ else "максимум"
+    text = (
+        f"💧 ICT — {info['short']} {arrow}\n"
+        f"Сняли {took} {fmt(sig['pool_price'], d)}, разрыв не закрыт\n\n"
+        f"Вход: {fmt(sig['entry_price'], d)} по рынку\n"
+        f"Стоп: {fmt(sig['stop_loss'], d)} ({'−' if long_ else '+'}{risk_pct:.1%})\n"
+        f"Цель: {fmt(sig['take_profit'], d)} (1:{rr:.1f})\n"
+        f"Объём: {size_txt} = риск 1%\n"
+        f"{late}"
+    ).rstrip()
+    for user_id in database.get_subscribers(code, "ict"):
+        try:
+            await bot.send_message(user_id, text)
+        except Exception as e:
+            print(f"[monitor_ict] не отправить {user_id}: {e}")
+
+
+async def _notify_ict_outcome(bot, code: str, sig: dict, status: str,
+                              result_r: float | None) -> None:
+    """Итог сделки ICT — тем же подписчикам инструмента."""
+    info = resolve(code)
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(sig["entry_price"])
+    arrow = "🟢 ЛОНГ" if sig["direction"] == "long" else "🔴 ШОРТ"
+    if status == "hit_tp":
+        text = (f"✅ ICT — {info['short']} {arrow}: цель {fmt(sig['take_profit'], d)} взята, "
+                f"итог {result_r:+.1f}R (без комиссии).")
+    elif status == "hit_sl":
+        text = (f"🛑 ICT — {info['short']} {arrow}: стоп {fmt(sig['stop_loss'], d)}, "
+                f"итог −1.0R (без комиссии).")
+    else:
+        text = (f"⌛ ICT — {info['short']} {arrow}: за {config.ICT_EXPIRE_HOURS} ч "
+                f"не дошло ни до цели, ни до стопа. Сделка снята со счёта.")
+    for user_id in database.get_subscribers(code, "ict"):
+        try:
+            await bot.send_message(user_id, text)
+        except Exception as e:
+            print(f"[monitor_ict] не отправить {user_id}: {e}")
+
+
 async def monitor_trend(bot) -> None:
     """Стратегия №4 — тренд по недельному каналу (каждые 5 минут). Правила — trend.py.
 
@@ -626,6 +789,114 @@ async def _notify_trend(bot, code: str, ev: dict) -> None:
             await bot.send_message(user_id, text)
         except Exception as e:
             print(f"[monitor_trend] не отправить {user_id}: {e}")
+
+
+def ict_overview() -> str:
+    """Текст /ict: что настреляла стратегия №6 с момента включения.
+
+    Сети не требует, как и сводка пробоя: у сигнала ICT стоп и цель заданы при входе,
+    показывать текущую цену незачем — сделка либо закрыта, либо ждёт своего часа.
+    """
+    rows = database.get_ict_signals()
+    head = ("💧 ICT — свип ликвидности и разрыв на 15-минутках (стратегия №6).\n"
+            f"Правило: сняли пул ликвидности → импульс с разрывом (FVG) → слом "
+            f"структуры → вход по рынку, стоп за манипуляцией + "
+            f"{config.ICT_STOP_ATR:g} ATR, цель — встречная ликвидность не ближе "
+            f"{config.ICT_MIN_TP_R:g} риска, срок {config.ICT_EXPIRE_HOURS} ч.")
+    if not config.ICT_SIGNALS:
+        head = "⛔ Стратегия ВЫКЛЮЧЕНА — новых сигналов не будет.\n" + head
+    if not rows:
+        return (head + "\n\nПока ни одного сигнала. Сетап редкий: мало снять "
+                "ликвидность — нужен ещё импульс с незакрытым разрывом и слом структуры.")
+    opened = [r for r in rows if r["status"] == "open"]
+    closed = [r for r in rows if r["status"] != "open"]
+    done = [r for r in closed if r["status"] in ("hit_tp", "hit_sl")]
+    lines = [head, "",
+             f"Всего сигналов: {len(rows)} · открыто: {len(opened)} · "
+             f"закрыто: {len(closed)}"]
+    if done:
+        wins = [r for r in done if r["status"] == "hit_tp"]
+        total = sum(r["result_r"] or 0.0 for r in done)
+        lines.append(f"Из закрытых дошли до цели {len(wins)} из {len(done)} "
+                     f"({len(wins) / len(done) * 100:.0f}%), итог {total:+.1f}R "
+                     f"(без комиссии и фандинга)")
+    expired = sum(1 for r in closed if r["status"] == "expired")
+    if expired:
+        lines.append(f"Истекло, не дойдя ни до цели, ни до стопа: {expired}")
+    if opened:
+        lines += ["", "Открытые:"]
+        for r in opened[:10]:
+            info = resolve(r["instrument"])
+            d = (info["decimals"] if info["decimals"] is not None
+                 else infer_decimals(r["entry_price"]))
+            arrow = "🟢" if r["direction"] == "long" else "🔴"
+            lines.append(f"{arrow} {info['short']} пул {fmt(r['pool_price'], d)} · вход "
+                         f"{fmt(r['entry_price'], d)} · стоп {fmt(r['stop_loss'], d)} · "
+                         f"цель {fmt(r['take_profit'], d)} ({r['bar_time'][:16]} UTC)")
+    if done:
+        lines += ["", "Последние закрытые:"]
+        mark = {"hit_tp": "✅", "hit_sl": "🛑"}
+        for r in done[:5]:
+            info = resolve(r["instrument"])
+            lines.append(f"{mark.get(r['status'], '⌛')} {info['short']} "
+                         f"{'лонг' if r['direction'] == 'long' else 'шорт'} "
+                         f"{(r['result_r'] or 0.0):+.1f}R ({r['bar_time'][:16]} UTC)")
+    return "\n".join(lines)
+
+
+def breakout_overview() -> str:
+    """Текст /breakout: что стратегия №5 насчитала, пока она в слежке.
+
+    Сети не требует (в отличие от trend_overview): у пробоя цель и стоп заданы при
+    входе, текущую цену показывать незачем — сделка либо уже закрыта, либо ждёт.
+    """
+    rows = database.get_breakout_signals()
+    if not rows:
+        return ("🧪 Пробой сильного уровня — стратегия в СЛЕЖКЕ: бот считает сигналы, "
+                "но никому их не шлёт.\nПока ни одного сигнала не набралось — "
+                "часовая свеча должна закрыться за сильным уровнем (⭐ в /analyze).")
+    opened = [r for r in rows if r["status"] == "open"]
+    closed = [r for r in rows if r["status"] != "open"]
+    done = [r for r in closed if r["status"] in ("hit_tp", "hit_sl")]
+    lines = [
+        "🧪 Пробой сильного уровня — стратегия №5, В СЛЕЖКЕ.",
+        "Сигналы считаются и ведутся, но НИКОМУ НЕ ШЛЮТСЯ: смотрим на живых данных, "
+        "что она даёт.",
+        f"Правило: часовая свеча закрылась за СИЛЬНЫМ уровнем (⭐), вход по закрытию, "
+        f"стоп за фитилём + {config.BREAKOUT_STOP_ATR:g} ATR, цель — встречный уровень "
+        f"не ближе {config.BREAKOUT_MIN_TP_R:g} рисков, срок {config.BREAKOUT_EXPIRE_HOURS} ч.",
+        "",
+        f"Всего сигналов: {len(rows)} · открыто: {len(opened)} · закрыто: {len(closed)}",
+    ]
+    if done:
+        wins = [r for r in done if r["status"] == "hit_tp"]
+        total = sum(r["result_r"] or 0.0 for r in done)
+        lines.append(f"Из закрытых дошли до цели {len(wins)} из {len(done)} "
+                     f"({len(wins) / len(done) * 100:.0f}%), итог {total:+.1f}R "
+                     f"(без комиссии и фандинга)")
+    expired = sum(1 for r in closed if r["status"] == "expired")
+    if expired:
+        lines.append(f"Истекло, не дойдя ни до цели, ни до стопа: {expired}")
+    if opened:
+        lines.append("")
+        lines.append("Открытые:")
+        for r in opened[:10]:
+            info = resolve(r["instrument"])
+            d = info["decimals"] if info["decimals"] is not None else infer_decimals(r["entry_price"])
+            arrow = "🟢" if r["direction"] == "long" else "🔴"
+            lines.append(f"{arrow} {info['short']} от {fmt(r['level_price'], d)} · вход "
+                         f"{fmt(r['entry_price'], d)} · стоп {fmt(r['stop_loss'], d)} · "
+                         f"цель {fmt(r['take_profit'], d)} ({r['bar_time'][:16]} UTC)")
+    if done:
+        lines.append("")
+        lines.append("Последние закрытые:")
+        mark = {"hit_tp": "✅", "hit_sl": "🛑"}
+        for r in done[:5]:
+            info = resolve(r["instrument"])
+            lines.append(f"{mark.get(r['status'], '⌛')} {info['short']} "
+                         f"{'лонг' if r['direction'] == 'long' else 'шорт'} "
+                         f"{(r['result_r'] or 0.0):+.1f}R ({r['bar_time'][:16]} UTC)")
+    return "\n".join(lines)
 
 
 async def trend_overview() -> str:
@@ -772,8 +1043,11 @@ def jobs() -> list[tuple]:
     if config.SPRING_SIGNALS:
         out += [(run_analysis, config.ANALYZE_EVERY_MIN),
                 (monitor_signals, config.MONITOR_EVERY_MIN)]
+    if config.ICT_SIGNALS:
+        out.append((monitor_ict, config.MONITOR_EVERY_MIN))
     out += [
         (monitor_trend, config.MONITOR_EVERY_MIN),
+        (monitor_breakout, config.MONITOR_EVERY_MIN),
         (track_signals, config.MONITOR_EVERY_MIN),
         (track_trades, config.MONITOR_EVERY_MIN),
         (check_alerts, config.ALERT_EVERY_MIN),

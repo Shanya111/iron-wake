@@ -4,16 +4,23 @@
 менялся. Вернул их в бой владелец 15 сентября 2026 (config.SPRING_ENGINE = "june23"):
 
   • решение — по последней ЗАКРЫТОЙ часовой свече (df.iloc[-2]);
-  • тренд дневки: лонг не берётся в нисходящем, шорт — в восходящем, в боковике обе;
-  • объём этой свечи ≥ среднего за VOL_LOOKBACK (20) предыдущих × VOL_MULT (1.5);
+  • направление: лонг не берётся в нисходящем, шорт — в восходящем, в боковике обе.
+    Тренд с 16.09.2026 считается по 6-часовым свечам (analyzer.engine_trend), а не по
+    дневным, как было в июне;
+  • объём этой свечи ≥ среднего за VOL_LOOKBACK предыдущих × VOL_MULT (1.5). Окно
+    среднего с 17.09.2026 — 12 часов вместо 20 (на качество не влияет, см. config);
   • свеча проколола уровень глубже BREAK_PCT (0.05%) цены уровня и закрылась обратно
-    за него; уровни перебираются по порядку, берётся первый подошедший;
-  • вход — закрытие свечи; стоп — за её фитилём плюс STOP_SPREAD (0.1%) цены;
-  • цель — ближайший встречный уровень, какой есть; нет его — FALLBACK_RR (2) риска.
+    за него. С 17.09.2026 уровень обязан быть СИЛЬНЫМ (config.JUNE_STRONG_ONLY), а из
+    проколотых берётся САМЫЙ ГЛУБОКИЙ; в июне брался первый подошедший по списку;
+  • вход — закрытие свечи; стоп — за её фитилём плюс JUNE_STOP_ATR (1) ATR. В июне
+    запас был долей цены (STOP_SPREAD, 0.1%), он остался запасной меркой без ATR;
+  • цель — ближайший встречный уровень не ближе JUNE_MIN_TP_R своего класса
+    (крипта 1 риск, валюта/золото/нефть 0.5); нет такого — FALLBACK_RR (2) риска.
 
 Чего здесь НЕТ по сравнению с правилами сентября (pattern_detector): силы отбоя,
 свежего пересечения, пулов равных экстремумов, ожидания возврата до трёх часов, стопа
-за парой свечей, порогов в долях ATR, минимальной цели и фильтров строгости.
+за парой свечей, порогов в долях ATR и фильтров строгости. Минимальная цель, наоборот,
+появилась и здесь — своя, в долях старого риска.
 Сентябрьский движок остаётся в pattern_detector нетронутым, константа возвращает его.
 
 Функции — те же, что у pattern_detector, и с теми же сигнатурами (detect_spring,
@@ -54,8 +61,8 @@ def _avg_volume(df: pd.DataFrame, end_pos: int) -> float:
     return float(window.mean()) if len(window) else 0.0
 
 
-# Три помощника ниже общие для _detect и explain: разъедутся — и /analyze начнёт
-# называть пробой, стоп или цель не так, как их считает движок.
+# Помощники ниже общие для _detect и explain: разъедутся — и /analyze начнёт
+# называть пробой, уровень, стоп или цель не так, как их считает движок.
 
 def _broke_and_returned(side: str, h: float, l: float, c: float,
                         price: float) -> tuple[bool, bool]:
@@ -88,6 +95,35 @@ def _old_risk(side: str, h: float, l: float, c: float) -> float:
     return abs(c - stop)
 
 
+def _broken_levels(levels: list[dict], side: str, h: float, l: float,
+                   c: float) -> list[dict]:
+    """Уровни нужного типа, которые свеча проколола и закрылась обратно за них."""
+    level_type = "support" if side == "long" else "resistance"
+    return [lvl for lvl in levels if lvl["type"] == level_type
+            and all(_broke_and_returned(side, h, l, c, lvl["price"]))]
+
+
+def _pick_level(broken: list[dict], side: str) -> dict | None:
+    """Уровень, от которого берётся сигнал: САМЫЙ ГЛУБОКИЙ из проколотых.
+
+    При config.JUNE_STRONG_ONLY среди проколотых сначала остаются только СИЛЬНЫЕ
+    (часовой уровень, совпавший с дневным, либо сам дневной) — нет таких, сигнала
+    нет вовсе. Из оставшихся берётся самый глубокий вынос: для лонга нижняя
+    поддержка, для шорта верхнее сопротивление.
+
+    До 17 сентября 2026 брался ПЕРВЫЙ подошедший по порядку списка. Сам по себе
+    выбор уровня ни одной сделки не менял (стоп стоит за фитилём свечи, цель
+    ищется от закрытия), но с отбором по силе он стал важен: сильный уровень надо
+    искать среди ВСЕХ проколотых, а не только среди первого.
+    """
+    if config.JUNE_STRONG_ONLY:
+        broken = [lvl for lvl in broken if lvl.get("strength") == "strong"]
+    if not broken:
+        return None
+    return (min(broken, key=lambda x: x["price"]) if side == "long"
+            else max(broken, key=lambda x: x["price"]))
+
+
 def _target_level(levels: list[dict], side: str, c: float,
                   min_gap: float = 0.0) -> float | None:
     """Ближайший встречный уровень НЕ БЛИЖЕ min_gap от закрытия.
@@ -109,7 +145,7 @@ def _min_gap(settings: dict | None, side: str, h: float, l: float, c: float) -> 
     """Минимальное расстояние до цели в ЦЕНЕ.
 
     MIN_TP_R кладёт вызывающий по классу инструмента (instruments.asset_class →
-    config.JUNE_MIN_TP_R): у крипты 1 риск, у валюты 0.5, у золота и нефти правила нет.
+    config.JUNE_MIN_TP_R): у крипты 1 риск, у валюты, золота и нефти 0.5.
     Общий помощник для _detect и explain — разъедутся, и /analyze назовёт целью
     уровень, который движок целью не считает.
     """
@@ -137,14 +173,8 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     if avg_vol <= 0 or vol < avg_vol * config.VOL_MULT:
         return None
 
-    level_type = "support" if side == "long" else "resistance"
-    for lvl in levels:
-        if lvl["type"] != level_type:
-            continue
-        broke, returned = _broke_and_returned(side, h, l, c, lvl["price"])
-        if not (broke and returned):
-            continue
-
+    lvl = _pick_level(_broken_levels(levels, side, h, l, c), side)
+    if lvl is not None:
         stop = _stop(side, h, l, pattern_detector._atr(df, pos))
         target = _target_level(levels, side, c, _min_gap(settings, side, h, l, c))
         if side == "long":
@@ -195,23 +225,30 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
             blockers.append(f"объём {base['vol_ratio']:.1f}× среднего — порог ×{config.VOL_MULT:g}")
 
         level_type = "support" if side == "long" else "resistance"
-        broken, closed_wrong = None, False
-        for lvl in levels:
-            if lvl["type"] != level_type:
-                continue
-            broke, returned = _broke_and_returned(side, h, l, c, lvl["price"])
-            if not broke:
-                continue
-            if not returned:
-                closed_wrong = True
-                continue
-            broken = {"price": lvl["price"], "strength": lvl.get("strength", "weak"),
-                      "dist_atr": abs(c - lvl["price"]) / atr if atr > 0 else None}
-            break
+        # Прокол был, но свеча осталась за уровнем — это не ложный пробой, а обычный.
+        closed_wrong = any(
+            _broke_and_returned(side, h, l, c, lvl["price"]) == (True, False)
+            for lvl in levels if lvl["type"] == level_type
+        )
+        all_broken = _broken_levels(levels, side, h, l, c)
+        picked = _pick_level(all_broken, side)
+        broken = None if picked is None else {
+            "price": picked["price"], "strength": picked.get("strength", "weak"),
+            "dist_atr": abs(c - picked["price"]) / atr if atr > 0 else None,
+        }
         break_note = None
         if broken is None:
-            break_note = ("уровень проколот, но цена НЕ вернулась за него — пробой не ложный"
-                          if closed_wrong else "свеча не заходила за уровень")
+            if all_broken:
+                # Проколотые уровни есть, но все слабые — именно это движок и
+                # отбраковывает с 17 сентября 2026 (config.JUNE_STRONG_ONLY).
+                weakest = (min(all_broken, key=lambda x: x["price"]) if side == "long"
+                           else max(all_broken, key=lambda x: x["price"]))
+                break_note = (f"уровень {weakest['price']:g} проколот и выкуплен, но он "
+                              f"СЛАБЫЙ — движок берёт только сильные (совпавшие с дневным)")
+            elif closed_wrong:
+                break_note = "уровень проколот, но цена НЕ вернулась за него — пробой не ложный"
+            else:
+                break_note = "свеча не заходила за уровень"
             blockers.append(break_note)
 
         # Профит/риск при входе прямо сейчас — справка, как и в сентябрьском отчёте.

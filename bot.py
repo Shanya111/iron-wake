@@ -399,10 +399,10 @@ HELP_TEXT = (
     "/alert — алерт: уведомлю, когда цена коснётся уровня\n"
     "/myalerts — мои алерты (посмотреть и удалить)\n"
     "/analyze — разбор инструмента глазами движка: что видит, чего не хватает\n"
-    "/subscribe — подписка на сигналы: стратегии (ложный пробой, тренд) и инструменты\n"
+    "/subscribe — подписка на сигналы: стратегии (ложный пробой, ICT) и инструменты\n"
     "/signals — последние сигналы\n"
     "/stats — статистика сигналов (винрейт, итог в R) за 30 дней / всё время\n"
-    "/trend — тренд по недельному каналу: позиции модели и итог\n"
+    "/ict — ICT: свип ликвидности и разрыв на 15-минутках, сводка сигналов\n"
     "/trades — журнал сделок (статус цель/стоп, закрытие)\n"
     "/cancel — отменить текущий сценарий\n\n"
     "Можно просто писать словами — я пойму:\n"
@@ -426,8 +426,9 @@ ABOUT_TEXT = (
     "Разбирает рынок по методике VSA: тренд по 6-часовым свечам, уровни, объём, стакан. "
     "Ищет ложные пробои Spring и Upthrust и присылает сигнал с ценой лимитной "
     "заявки, стопом и целью — а потом сам доводит его до исхода.\n\n"
-    "Вторая стратегия — тренд по недельному каналу: вход на пробое недели, выход "
-    "по встречному каналу, без цели (/trend).\n\n"
+    "Вторая стратегия — ICT на пятнадцатиминутках: сняли пул ликвидности, следом "
+    "импульс с незакрытым разрывом и слом структуры — вход по рынку, стоп за "
+    "манипуляцией, цель — встречная ликвидность (/ict).\n\n"
     "Умеет алерты: скажет, когда цена дойдёт до уровня, который выбрал ты.\n\n"
     "Это подсказка, а не авто-торговля. Решение и риск — на трейдере.\n\n"
     "Автор: Аким."
@@ -1065,9 +1066,13 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
         min_tp_r = ex.get("min_tp_r", 0.0)
         lines += ["", "⚙️ Правила движка — редакция 23 июня 2026:",
                   f"     Прокол уровня глубже {config.BREAK_PCT * 100:g}% его цены и закрытие "
-                  f"обратно, объём ×{config.VOL_MULT:g} на этой же свече, "
-                  f"по тренду {config.TREND_TF_HOURS}-часовых свечей",
-                  f"     Стоп — за фитилём свечи плюс {config.JUNE_STOP_ATR:g} ATR",
+                  f"обратно, объём ×{config.VOL_MULT:g} на этой же свече "
+                  f"(среднее за {config.VOL_LOOKBACK} ч), "
+                  f"по тренду {config.TREND_TF_HOURS}-часовых свечей"]
+        if config.JUNE_STRONG_ONLY:
+            lines.append("     Уровень — только СИЛЬНЫЙ (⭐, совпал с дневным); из "
+                         "проколотых берётся самый глубокий")
+        lines += [f"     Стоп — за фитилём свечи плюс {config.JUNE_STOP_ATR:g} ATR",
                   "     Цель — ближайший встречный уровень" + (
                       f", но не ближе {min_tp_r:g} риска"
                       if min_tp_r else ", какой есть")]
@@ -1185,8 +1190,11 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
         out.append(
             f"ВАЖНО: движок работает по правилам 23 июня 2026 — прокол уровня глубже "
             f"{config.BREAK_PCT * 100:g}% его цены с закрытием обратно, объём "
-            f"×{config.VOL_MULT:g} на этой же свече, сделка по тренду "
-            f"{config.TREND_TF_HOURS}-часовых свечей; стоп за фитилём "
+            f"×{config.VOL_MULT:g} на этой же свече (среднее за {config.VOL_LOOKBACK} ч), "
+            f"сделка по тренду {config.TREND_TF_HOURS}-часовых свечей"
+            + (", и уровень обязан быть СИЛЬНЫМ — совпавшим с дневным; из проколотых "
+               "берётся самый глубокий" if config.JUNE_STRONG_ONLY else "")
+            + f"; стоп за фитилём "
             f"свечи плюс {config.JUNE_STOP_ATR:g} ATR; цель — ближайший встречный уровень"
             + (f" не ближе {ex.get('min_tp_r', 0):g} риска сделки"
                if ex.get("min_tp_r") else ", какой есть")
@@ -1347,8 +1355,9 @@ async def cb_analyze(call: CallbackQuery):
 
 
 # Метка стратегии на кнопке инструмента в /subscribe. Красной галочки среди эмодзи нет,
-# поэтому ложный пробой помечен красным кругом, тренд — обычной зелёной галочкой.
-STRATEGY_MARK = {"spring": "🔴", "trend": "✅"}
+# поэтому ложный пробой помечен красным кругом, а ICT — каплей: она же стоит у пулов
+# ликвидности в /analyze. Тренд ушёл из подписок 18.09.2026 вместе с выходом ICT в бой.
+STRATEGY_MARK = {"spring": "🔴", "ict": "💧"}
 
 
 def subscribe_keyboard(user_id: int, strategy: str = "spring") -> InlineKeyboardMarkup:
@@ -1394,10 +1403,10 @@ async def _redraw_subscribe(call: CallbackQuery, strategy: str) -> None:
 async def cmd_subscribe(message: Message):
     await message.answer(
         "Подписка на торговые сигналы — отдельно по каждой стратегии:\n"
-        "🔴 ложный пробой — Spring/Upthrust по правилам 23 июня\n"
-        "✅ тренд по недельному каналу — вход на пробое недели, выход по каналу (/trend)\n\n"
+        "🔴 ложный пробой — Spring/Upthrust по правилам 23 июня, часовые свечи\n"
+        "💧 ICT — свип ликвидности и разрыв на 15-минутках (/ict)\n\n"
         "Выбери стратегию верхней кнопкой (👉 — выбрана) и отмечай инструменты под ней. "
-        "Метки у инструмента показывают, по каким стратегиям он приходит: «🔴✅ BTC» — "
+        "Метки у инструмента показывают, по каким стратегиям он приходит: «🔴💧 BTC» — "
         "по обеим, «🔴 ETH» — только ложный пробой.",
         reply_markup=subscribe_keyboard(message.from_user.id),
     )
@@ -1502,6 +1511,20 @@ async def cmd_trend(message: Message):
     # Стратегия №4 — тренд по недельному каналу. Позиции модели общие для всех, поэтому
     # и сводка одна; в /signals и /stats они не попадают — там сигналы Spring/Upthrust.
     await message.answer(await engine.trend_overview())
+
+
+@dp.message(Command("ict"))
+async def cmd_ict(message: Message):
+    # Стратегия №6 — ICT на пятнадцатиминутках. Сигналы приходят подписчикам
+    # инструмента по этой стратегии (/subscribe), здесь — общая сводка по всем.
+    await message.answer(engine.ict_overview())
+
+
+@dp.message(Command("breakout"))
+async def cmd_breakout(message: Message):
+    # Стратегия №5 — пробой сильного уровня. Пока она в слежке, это единственный
+    # способ её увидеть: сигналы никому не рассылаются (config.BREAKOUT_SIGNALS).
+    await message.answer(engine.breakout_overview())
 
 
 # ── Сводная статистика по сигналам (/stats) ────────────────────────────────────
@@ -1954,7 +1977,7 @@ async def main():
         BotCommand(command="subscribe",   description="Подписка на торговые сигналы"),
         BotCommand(command="signals",     description="Последние сигналы"),
         BotCommand(command="stats",       description="Статистика сигналов (винрейт, R)"),
-        BotCommand(command="trend",       description="Тренд по недельному каналу"),
+        BotCommand(command="ict",         description="ICT: свип ликвидности на M15"),
         BotCommand(command="trades",      description="Журнал сделок"),
         BotCommand(command="write",       description="Написать администратору"),
         BotCommand(command="cancel",      description="Отмена"),
@@ -1982,7 +2005,10 @@ async def main():
                 BotCommand(command="subscribe", description="Подписка на торговые сигналы"),
                 BotCommand(command="signals",   description="Последние сигналы"),
                 BotCommand(command="stats",     description="Статистика сигналов (винрейт, R)"),
-                BotCommand(command="trend",     description="Тренд по недельному каналу"),
+                BotCommand(command="ict",       description="ICT: свип ликвидности на M15"),
+                # Только в админском меню: стратегия №5 в слежке и сигналов никому не
+                # шлёт, обычному подписчику предлагать её незачем.
+                BotCommand(command="breakout",  description="Пробой уровня (слежка)"),
                 BotCommand(command="trades",    description="Журнал сделок"),
                 BotCommand(command="help",      description="Помощь"),
                 BotCommand(command="cancel",    description="Отмена"),
