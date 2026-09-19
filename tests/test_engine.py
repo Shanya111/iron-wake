@@ -1998,6 +1998,42 @@ def test_trend_subscriptions_migrate_to_ict_once():
         assert database.get_subscribers("BTC", "ict") == []
 
 
+def test_ict_candle_window_covers_pool_lifetime():
+    """Свечей за запрос должно хватать на весь срок жизни пула.
+
+    Это страховка от рассинхрона при смене таймфрейма: часы заданы в ICT_POOL_AGE_H,
+    а индексы — в барах, и если окно окажется короче, бот молча потеряет часть уровней
+    (и разойдётся с замером — на M15 это дало два расхождения по цели из 88)."""
+    bars_needed = config.ICT_POOL_AGE_H * 60 / config.ICT_TF_MINUTES
+    assert config.ICT_CANDLE_LIMIT >= bars_needed
+    # и запас на разогрев ATR со свингами — иначе первые бары окна бесполезны
+    warm = config.ATR_PERIOD + config.ICT_POOL_W + config.ICT_SWEEP_BARS + 6
+    assert config.ICT_CANDLE_LIMIT >= bars_needed or config.ICT_CANDLE_LIMIT > warm
+
+
+def test_m15_ict_signals_are_cancelled_once():
+    """Сигналы, выданные на M15, снимаются при переносе стратегии на часовик — и только они.
+
+    Проверяется обеими сторонами: часовой сигнал (минуты :00) остаётся открытым, а
+    свежая запись на M15 (если стратегию вернут на пятнадцатиминутки) миграцией не
+    задевается — иначе она снимала бы живые сигналы при каждом рестарте."""
+    with _temp_db() as (database, sqlite3):
+        database.init_db()
+        ins = ("INSERT INTO ict_signals (instrument, direction, pool_price, entry_price,"
+               " stop_loss, take_profit, bar_time, status, created_at)"
+               " VALUES (?, ?, 1, 2, 1, 3, ?, 'open', ?)")
+        with sqlite3.connect(database.DB_PATH) as conn:
+            conn.execute(ins, ("BTC", "long", "2026-09-18 14:15:00+00:00", "2026-09-18"))
+            conn.execute(ins, ("ETH", "long", "2026-09-19 10:00:00+00:00", "2026-09-19"))
+            conn.execute(ins, ("SOL", "long", "2026-09-25 10:15:00+00:00", "2026-09-25"))
+            conn.commit()
+        database.init_db()
+        status = {r["instrument"]: r["status"] for r in database.get_ict_signals()}
+        assert status["BTC"] == "manual"        # M15 до переноса — снят
+        assert status["ETH"] == "open"          # часовой — ведётся
+        assert status["SOL"] == "open"          # M15 после возврата — не задет
+
+
 def test_strategies_offer_spring_and_ict():
     """В /subscribe ровно две стратегии, и у каждой есть метка на кнопке."""
     import bot

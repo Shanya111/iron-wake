@@ -586,23 +586,26 @@ async def monitor_breakout(bot) -> None:
 
 
 async def monitor_ict(bot) -> None:
-    """Стратегия №6 — ICT на пятнадцатиминутках (каждые 5 минут). Правила — ict.py.
+    """Стратегия №6 — ICT на часовых свечах (каждые 5 минут). Правила — ict.py.
 
     Идёт по инструментам, У КОТОРЫХ ЕСТЬ ПОДПИСКА НА ICT, — в отличие от тренда и
     пробоя, которые считаются по всему движку. Причина в том, что состояния между
     свечами у ICT нет: сигнал рождается и закрывается сам, и пропущенный сетап по
     инструменту без подписчиков ничего не ломает.
 
-    Свечи M15 берутся одним запросом на config.ICT_M15_LIMIT (960 = 10 суток). Этого
-    хватает и пулам ликвидности (живут config.ICT_POOL_AGE_H = 240 ч), и трекингу
-    исхода (горизонт 48 ч). Валютные пары вне форекс-сессии на паузе: запрос падает,
-    инструмент пропускается до следующего раза — как у всех остальных задач.
+    Свечи берутся одним запросом на config.ICT_CANDLE_LIMIT в таймфрейме
+    config.ICT_TIMEFRAME (с 19.09.2026 — часовые; первый день стратегия работала на
+    M15). Этого хватает и пулам ликвидности (живут config.ICT_POOL_AGE_H = 240 ч), и
+    трекингу исхода (горизонт 48 ч), а число свечей совпадает с TREND_H1_LIMIT —
+    значит запрос попадает в тот же ключ кеша, что у тренда, без похода на биржу.
+    Валютные пары вне форекс-сессии на паузе: запрос падает, инструмент пропускается
+    до следующего раза — как у всех остальных задач.
     """
     if not config.ICT_SIGNALS:
         return
     for code in _subscribed_engine("ict"):
         try:
-            df = await fetch_candles(code, config.ICT_TIMEFRAME, config.ICT_M15_LIMIT)
+            df = await fetch_candles(code, config.ICT_TIMEFRAME, config.ICT_CANDLE_LIMIT)
         except Exception as e:
             print(f"[monitor_ict] {code}: ошибка данных: {e}")
             continue
@@ -618,7 +621,7 @@ async def monitor_ict(bot) -> None:
     for sig in database.get_open_ict_signals():
         code = sig["instrument"]
         try:
-            df = await fetch_candles(code, config.ICT_TIMEFRAME, config.ICT_M15_LIMIT)
+            df = await fetch_candles(code, config.ICT_TIMEFRAME, config.ICT_CANDLE_LIMIT)
         except Exception as e:
             print(f"[monitor_ict] {code}: ошибка данных при трекинге: {e}")
             continue
@@ -646,9 +649,12 @@ async def _notify_ict(bot, code: str, sig: dict) -> None:
     size_txt = (f"{size:.0%} депозита" if size <= 1
                 else f"{size:.1f} депозита, плечо x{math.ceil(size)}")
     late = ""
+    # Порог — как у тренда: два часа. На часовой свече «полчаса» ловили бы
+    # каждый второй сигнал (закрытие свечи + интервал задачи + кеш), и пометка
+    # потеряла бы смысл.
     age = pd.Timestamp.now(tz="UTC") - pd.Timestamp(sig["bar_time"])
-    if age > timedelta(minutes=30):
-        late = (f"⚠️ Сообщение запоздало на {age.total_seconds() / 60:.0f} мин — "
+    if age > timedelta(hours=2):
+        late = (f"⚠️ Сообщение запоздало на {age.total_seconds() / 3600:.0f} ч — "
                 "цена могла уйти.\n")
     took = "минимум" if long_ else "максимум"
     text = (
@@ -798,7 +804,7 @@ def ict_overview() -> str:
     показывать текущую цену незачем — сделка либо закрыта, либо ждёт своего часа.
     """
     rows = database.get_ict_signals()
-    head = ("💧 ICT — свип ликвидности и разрыв на 15-минутках (стратегия №6).\n"
+    head = ("💧 ICT — свип ликвидности и разрыв на часовых свечах (стратегия №6).\n"
             f"Правило: сняли пул ликвидности → импульс с разрывом (FVG) → слом "
             f"структуры → вход по рынку, стоп за манипуляцией + "
             f"{config.ICT_STOP_ATR:g} ATR, цель — встречная ликвидность не ближе "
@@ -823,6 +829,12 @@ def ict_overview() -> str:
     expired = sum(1 for r in closed if r["status"] == "expired")
     if expired:
         lines.append(f"Истекло, не дойдя ни до цели, ни до стопа: {expired}")
+    # Снятые с ведения (статус manual) — сигналы первого дня, выданные на M15: их
+    # геометрия считалась по пятнадцатиминуткам, и на часовике вести их нельзя.
+    manual = sum(1 for r in closed if r["status"] == "manual")
+    if manual:
+        lines.append(f"Снято при переносе на часовик: {manual} "
+                     f"(сигналы на 15-минутках, итог не считается)")
     if opened:
         lines += ["", "Открытые:"]
         for r in opened[:10]:
