@@ -590,7 +590,7 @@ async def monitor_breakout(bot) -> None:
         result_r = breakout.result_r(sig, status)
         database.close_breakout_signal(sig["id"], status, result_r)
         print(f"[monitor_breakout] {code} #{sig['id']}: {status}")
-        if _breakout_sends(code):
+        if _breakout_outcome_sends(code, sig):
             await _notify_breakout_outcome(bot, code, sig, status, result_r)
 
 
@@ -608,6 +608,17 @@ def strategy_covers(strategy: str, code: str) -> bool:
     if strategy == "breakout":
         return asset_class(code) in config.BREAKOUT_SIGNAL_CLASSES
     return True
+
+
+def _breakout_outcome_sends(code: str, sig: dict) -> bool:
+    """Шлём ли ИТОГ по этой сделке пробоя.
+
+    Условий два. Первое — то же покрытие, что у самого сигнала. Второе — сделка
+    должна быть выдана уже ПОСЛЕ выкатки (config.BREAKOUT_LIVE_SINCE): восемь
+    сделок, открытых в молчаливой слежке, человеку не приходили, и сообщение об их
+    исходе выглядело бы как отчёт по чужой позиции.
+    """
+    return _breakout_sends(code) and str(sig.get("created_at") or "") > config.BREAKOUT_LIVE_SINCE
 
 
 def _breakout_sends(code: str) -> bool:

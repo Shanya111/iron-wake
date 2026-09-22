@@ -2105,9 +2105,18 @@ def test_breakout_sends_only_to_measured_classes():
         assert not scheduler._breakout_sends("EURUSD")
         assert not scheduler._breakout_sends("USDJPY")
 
+        # Итог по сделке, посчитанной в молчаливой слежке, не рассылается: о ней
+        # человеку не сообщали. Свежая — рассылается.
+        old_sig = {"created_at": "2026-09-20T10:00:00"}
+        new_sig = {"created_at": "2026-09-23T10:00:00"}
+        assert not scheduler._breakout_outcome_sends("BTC", old_sig)
+        assert scheduler._breakout_outcome_sends("BTC", new_sig)
+        assert not scheduler._breakout_outcome_sends("EURUSD", new_sig)
+
         config.BREAKOUT_SIGNALS = False
         assert not scheduler._breakout_sends("BTC")
         assert not scheduler._breakout_sends("GOLD")
+        assert not scheduler._breakout_outcome_sends("BTC", new_sig)
     finally:
         config.BREAKOUT_SIGNALS = saved
 
