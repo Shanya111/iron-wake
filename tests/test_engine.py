@@ -1576,24 +1576,40 @@ def test_june_no_fresh_cross_needed():
     assert spring_june.detect_spring(df, levels, trend="sideways") is not None
 
 
-def test_june_takes_only_strong_levels():
-    """Отбор по силе (17.09.2026): слабый проколотый уровень сигнала не даёт.
+def test_june_strong_only_switch_decides_weak_levels():
+    """Отбор по силе — ВЫКЛЮЧАТЕЛЬ, и тест проверяет обе его стороны.
 
-    Двигаем ТОЛЬКО силу — свечи, объём и прокол те же, — значит тест меряет именно
-    это правило. Падает, если config.JUNE_STRONG_ONLY обнулить."""
+    Правило вводили 17.09.2026 и сняли 22.09.2026 (config.JUNE_STRONG_ONLY): оно
+    стоило 98.6% сигналов. Механизм остался в коде, поэтому тест не спрашивает
+    боевое значение константы, а ставит оба и требует РАЗНЫХ вердиктов на ОДНИХ
+    свечах: со слабым уровнем True молчит, False даёт сигнал. Сломай `_pick_level`
+    в любую сторону — падает одна из половин.
+
+    Двигаем ТОЛЬКО силу: свечи, объём и прокол во всех четырёх случаях те же."""
     df = _spring_df()
     weak = [{"price": 100.0, "type": "support", "strength": "weak"},
             {"price": 110.0, "type": "resistance", "strength": "weak"}]
-    assert spring_june.detect_spring(df, weak, trend="up") is None
     strong = [{**weak[0], "strength": "strong"}, weak[1]]
-    assert spring_june.detect_spring(df, strong, trend="up") is not None
-
     up = _upthrust_df()
     weak_s = [{"price": 100.0, "type": "resistance", "strength": "weak"},
               {"price": 90.0, "type": "support", "strength": "weak"}]
-    assert spring_june.detect_upthrust(up, weak_s, trend="down") is None
     strong_s = [{**weak_s[0], "strength": "strong"}, weak_s[1]]
-    assert spring_june.detect_upthrust(up, strong_s, trend="down") is not None
+
+    saved = config.JUNE_STRONG_ONLY
+    try:
+        config.JUNE_STRONG_ONLY = True
+        assert spring_june.detect_spring(df, weak, trend="up") is None
+        assert spring_june.detect_spring(df, strong, trend="up") is not None
+        assert spring_june.detect_upthrust(up, weak_s, trend="down") is None
+        assert spring_june.detect_upthrust(up, strong_s, trend="down") is not None
+
+        # Боевое значение с 22.09.2026: сила больше не отбирает, слабый уровень
+        # сигнал даёт — ровно как в исходных правилах 23 июня.
+        config.JUNE_STRONG_ONLY = False
+        assert spring_june.detect_spring(df, weak, trend="up") is not None
+        assert spring_june.detect_upthrust(up, weak_s, trend="down") is not None
+    finally:
+        config.JUNE_STRONG_ONLY = saved
 
 
 def test_june_picks_deepest_broken_level():
@@ -1606,9 +1622,16 @@ def test_june_picks_deepest_broken_level():
               {"price": 99.5, "type": "support", "strength": "strong"},
               {"price": 110.0, "type": "resistance", "strength": "weak"}]
     assert abs(spring_june.detect_spring(df, levels, trend="up")["level_price"] - 99.5) < 1e-9
-    # Самый глубокий слабый — берётся сильный, что выше, а не отказ от сигнала.
+    # При ВКЛЮЧЁННОМ отборе по силе самый глубокий слабый пропускается, и берётся
+    # сильный повыше, а не отказ от сигнала. Константу ставим сами: с 22.09.2026
+    # боевое значение False, а предмет проверки — работа пары «сила + глубина».
     mixed = [dict(levels[0]), {**levels[1], "strength": "weak"}, levels[2]]
-    assert abs(spring_june.detect_spring(df, mixed, trend="up")["level_price"] - 100.0) < 1e-9
+    saved = config.JUNE_STRONG_ONLY
+    try:
+        config.JUNE_STRONG_ONLY = True
+        assert abs(spring_june.detect_spring(df, mixed, trend="up")["level_price"] - 100.0) < 1e-9
+    finally:
+        config.JUNE_STRONG_ONLY = saved
 
     up = _upthrust_df()                     # закрытие 99.5, фитиль 101.0
     levels_s = [{"price": 100.0, "type": "resistance", "strength": "strong"},
@@ -1619,14 +1642,28 @@ def test_june_picks_deepest_broken_level():
 
 
 def test_june_explain_names_weak_level_as_blocker():
-    """/analyze обязан назвать ИМЕННО эту причину, иначе отчёт пообещает сигнал."""
+    """/analyze обязан назвать ИМЕННО эту причину, иначе отчёт пообещает сигнал.
+
+    Блокер существует только при включённом отборе по силе, поэтому константу тест
+    ставит сам (боевое значение с 22.09.2026 — False). Вторая половина сторожит
+    обратное: с выключенным отбором отчёт НЕ должен ссылаться на слабость уровня —
+    иначе человек будет ждать сигнала, который движку ничто не мешает дать."""
     df = _spring_df()
     weak = [{"price": 100.0, "type": "support", "strength": "weak"},
             {"price": 110.0, "type": "resistance", "strength": "weak"}]
-    ex = spring_june.explain(df, weak, "up")
-    long_side = ex["sides"]["long"]
-    assert not long_side["ready"]
-    assert any("СЛАБЫЙ" in b for b in long_side["blockers"]), long_side["blockers"]
+    saved = config.JUNE_STRONG_ONLY
+    try:
+        config.JUNE_STRONG_ONLY = True
+        long_side = spring_june.explain(df, weak, "up")["sides"]["long"]
+        assert not long_side["ready"]
+        assert any("СЛАБЫЙ" in b for b in long_side["blockers"]), long_side["blockers"]
+
+        config.JUNE_STRONG_ONLY = False
+        open_side = spring_june.explain(df, weak, "up")["sides"]["long"]
+        assert open_side["ready"], open_side["blockers"]
+        assert not any("СЛАБЫЙ" in b for b in open_side["blockers"])
+    finally:
+        config.JUNE_STRONG_ONLY = saved
 
 
 def test_june_explain_agrees_with_detector():
