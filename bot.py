@@ -399,10 +399,11 @@ HELP_TEXT = (
     "/alert — алерт: уведомлю, когда цена коснётся уровня\n"
     "/myalerts — мои алерты (посмотреть и удалить)\n"
     "/analyze — разбор инструмента глазами движка: что видит, чего не хватает\n"
-    "/subscribe — подписка на сигналы: стратегии (ложный пробой, ICT) и инструменты\n"
+    "/subscribe — подписка на сигналы: стратегии (ложный пробой, ICT, пробой) и инструменты\n"
     "/signals — последние сигналы\n"
     "/stats — статистика сигналов (винрейт, итог в R) за 30 дней / всё время\n"
     "/ict — ICT: свип ликвидности и разрыв на часовых свечах, сводка сигналов\n"
+    "/breakout — пробой сильного уровня: сводка сигналов и итог в R\n"
     "/trades — журнал сделок (статус цель/стоп, закрытие)\n"
     "/cancel — отменить текущий сценарий\n\n"
     "Можно просто писать словами — я пойму:\n"
@@ -429,6 +430,8 @@ ABOUT_TEXT = (
     "Вторая стратегия — ICT на часовых свечах: сняли пул ликвидности, следом "
     "импульс с незакрытым разрывом и слом структуры — вход по рынку, стоп за "
     "манипуляцией, цель — встречная ликвидность (/ict).\n\n"
+    "Третья — пробой сильного уровня: часовая свеча закрылась за уровнем, который "
+    "совпал с дневным; вход по рынку, цель не ближе двух рисков (/breakout).\n\n"
     "Умеет алерты: скажет, когда цена дойдёт до уровня, который выбрал ты.\n\n"
     "Это подсказка, а не авто-торговля. Решение и риск — на трейдере.\n\n"
     "Автор: Аким."
@@ -1357,7 +1360,7 @@ async def cb_analyze(call: CallbackQuery):
 # Метка стратегии на кнопке инструмента в /subscribe. Красной галочки среди эмодзи нет,
 # поэтому ложный пробой помечен красным кругом, а ICT — каплей: она же стоит у пулов
 # ликвидности в /analyze. Тренд ушёл из подписок 18.09.2026 вместе с выходом ICT в бой.
-STRATEGY_MARK = {"spring": "🔴", "ict": "💧"}
+STRATEGY_MARK = {"spring": "🔴", "ict": "💧", "breakout": "📈"}
 
 
 def subscribe_keyboard(user_id: int, strategy: str = "spring") -> InlineKeyboardMarkup:
@@ -1383,6 +1386,10 @@ def subscribe_keyboard(user_id: int, strategy: str = "spring") -> InlineKeyboard
         row = []
         for c in codes[i:i + 2]:
             marks = "".join(STRATEGY_MARK[s] for s in config.STRATEGIES if c in subs[s])
+            # Инструмент, по которому выбранная стратегия молчит (пробой по валюте),
+            # помечаем замком: галочка на нём всё равно ничего не даст.
+            if not engine.strategy_covers(strategy, c):
+                marks = (marks + " 🔒").strip()
             row.append(InlineKeyboardButton(text=f"{marks} {short(c)}".strip(),
                                             callback_data=f"sub:{strategy}:{c}"))
         rows.append(row)
@@ -1404,7 +1411,9 @@ async def cmd_subscribe(message: Message):
     await message.answer(
         "Подписка на торговые сигналы — отдельно по каждой стратегии:\n"
         "🔴 ложный пробой — Spring/Upthrust по правилам 23 июня, часовые свечи\n"
-        "💧 ICT — свип ликвидности и разрыв на часовых свечах (/ict)\n\n"
+        "💧 ICT — свип ликвидности и разрыв на часовых свечах (/ict)\n"
+        "📈 пробой уровня — закрытие за сильным уровнем, цель от двух рисков "
+        "(/breakout). По валютным парам эта стратегия молчит: её на них не мерили\n\n"
         "Выбери стратегию верхней кнопкой (👉 — выбрана) и отмечай инструменты под ней. "
         "Метки у инструмента показывают, по каким стратегиям он приходит: «🔴💧 BTC» — "
         "по обеим, «🔴 ETH» — только ложный пробой.",
@@ -1434,8 +1443,11 @@ async def cb_suball(call: CallbackQuery):
     if strategy not in config.STRATEGIES:
         await call.answer()
         return
-    database.set_strategy_instruments(call.from_user.id, strategy,
-                                      engine_codes() if on == "1" else [])
+    # «Отметить все» отмечает только те, по которым стратегия и правда шлёт:
+    # иначе кнопка пообещала бы сигналы по валютным парам, где пробой молчит.
+    database.set_strategy_instruments(
+        call.from_user.id, strategy,
+        [c for c in engine_codes() if engine.strategy_covers(strategy, c)] if on == "1" else [])
     await call.answer(("Отмечены все: " if on == "1" else "Сняты все: ")
                       + config.STRATEGIES[strategy])
     await _redraw_subscribe(call, strategy)
@@ -1451,6 +1463,13 @@ async def cb_sub(call: CallbackQuery):
         return
     if strategy not in config.STRATEGIES or code not in engine_codes():
         await call.answer()
+        return
+    # Галочку на инструмент, по которому стратегия молчит, не ставим вовсе — вместо
+    # молчаливого «ничего не произошло» объясняем, почему. Правило одно на бота:
+    # engine.strategy_covers, оно же решает, кому слать сигнал.
+    if not engine.strategy_covers(strategy, code):
+        await call.answer(f"{short(code)}: по валютным парам «{config.STRATEGIES[strategy]}» "
+                          "молчит — стратегию на них не измеряли", show_alert=True)
         return
     user_id = call.from_user.id
     name = config.STRATEGIES[strategy]
@@ -1522,8 +1541,10 @@ async def cmd_ict(message: Message):
 
 @dp.message(Command("breakout"))
 async def cmd_breakout(message: Message):
-    # Стратегия №5 — пробой сильного уровня. Пока она в слежке, это единственный
-    # способ её увидеть: сигналы никому не рассылаются (config.BREAKOUT_SIGNALS).
+    # Стратегия №5 — пробой сильного уровня. С 22.09.2026 сигналы рассылаются
+    # подписчикам по крипте, золоту и нефти, поэтому команда переехала из админского
+    # меню в общее: сводка нужна тому, кто эти сигналы получает. По валютным парам
+    # стратегия молчит и только копит статистику — она тут же, в сводке.
     await message.answer(engine.breakout_overview())
 
 
@@ -1978,6 +1999,7 @@ async def main():
         BotCommand(command="signals",     description="Последние сигналы"),
         BotCommand(command="stats",       description="Статистика сигналов (винрейт, R)"),
         BotCommand(command="ict",         description="ICT: свип ликвидности и разрыв"),
+        BotCommand(command="breakout",    description="Пробой сильного уровня"),
         BotCommand(command="trades",      description="Журнал сделок"),
         BotCommand(command="write",       description="Написать администратору"),
         BotCommand(command="cancel",      description="Отмена"),
@@ -2008,7 +2030,7 @@ async def main():
                 BotCommand(command="ict",       description="ICT: свип ликвидности и разрыв"),
                 # Только в админском меню: стратегия №5 в слежке и сигналов никому не
                 # шлёт, обычному подписчику предлагать её незачем.
-                BotCommand(command="breakout",  description="Пробой уровня (слежка)"),
+                BotCommand(command="breakout",  description="Пробой сильного уровня"),
                 BotCommand(command="trades",    description="Журнал сделок"),
                 BotCommand(command="help",      description="Помощь"),
                 BotCommand(command="cancel",    description="Отмена"),

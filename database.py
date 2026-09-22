@@ -3,6 +3,7 @@ from datetime import datetime
 from pathlib import Path
 
 import config
+import instruments
 
 DB_PATH = Path(__file__).parent / "bot.db"
 
@@ -317,6 +318,42 @@ def init_db() -> None:
             WHERE strategy = 'trend'
         """)
         conn.execute("DELETE FROM signal_subscriptions WHERE strategy = 'trend'")
+
+        # ── Разовые миграции с отметкой о выполнении ────────────────────────────
+        # Миграции выше самоограничены собственным условием: после них не остаётся
+        # строк, которые они ищут. КОПИРУЮЩЕЙ миграции так нельзя — источник никуда
+        # не девается, и при каждом рестарте она возвращала бы подписку тому, кто
+        # от неё отписался. Поэтому отметка «отработала» хранится явно.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS migrations (
+                name       TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            )
+        """)
+
+        def _once(name: str) -> bool:
+            """True — миграция ещё не выполнялась; отметку ставим сразу."""
+            if conn.execute("SELECT 1 FROM migrations WHERE name = ?", (name,)).fetchone():
+                return False
+            conn.execute("INSERT INTO migrations (name, applied_at) VALUES (?, ?)",
+                         (name, datetime.now().isoformat(timespec="seconds")))
+            return True
+
+        # Подписка на ПРОБОЙ УРОВНЯ (стратегия №5) выдаётся тем, кто уже подписан на
+        # ложный пробой, — по тем же инструментам, КРОМЕ ВАЛЮТНЫХ ПАР (решение
+        # владельца 22.09.2026: по валюте стратегия не мерилась и остаётся в
+        # молчаливой слежке, см. config.BREAKOUT_SIGNAL_CLASSES). Без этой миграции
+        # выкатка означала бы тишину, пока каждый не сходит в /subscribe.
+        if _once("breakout_subscriptions_2026_09_22"):
+            rows = conn.execute(
+                "SELECT user_id, instrument FROM signal_subscriptions WHERE strategy = 'spring'"
+            ).fetchall()
+            created_at = datetime.now().isoformat(timespec="seconds")
+            conn.executemany("""
+                INSERT OR IGNORE INTO signal_subscriptions (user_id, instrument, strategy, created_at)
+                VALUES (?, ?, 'breakout', ?)
+            """, [(uid, code, created_at) for uid, code in rows
+                  if not instruments.is_fx(code)])
         conn.commit()
 
 

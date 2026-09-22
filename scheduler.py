@@ -537,12 +537,16 @@ async def _notify(bot, code: str, signal: dict, user_id: int, comment: str | Non
 async def monitor_breakout(bot) -> None:
     """Стратегия №5 — пробой сильного уровня (каждые 5 минут). Правила — breakout.py.
 
-    В СЛЕЖКЕ: считает сигналы и доводит их до цели, стопа или истечения, но НИКОМУ
-    НЕ ШЛЁТ, пока config.BREAKOUT_SIGNALS = False (решение владельца 17.09.2026 —
-    сначала посмотреть на живых данных). Сводка — команда /breakout.
+    В БОЮ С 22.09.2026 (config.BREAKOUT_SIGNALS), но НЕ ПО ВСЕМУ ДВИЖКУ: сигнал
+    уходит подписчикам только по классам из config.BREAKOUT_SIGNAL_CLASSES — крипта,
+    золото и нефть. ВАЛЮТНЫЕ ПАРЫ ОСТАЮТСЯ В МОЛЧАЛИВОЙ СЛЕЖКЕ: считаются и ведутся
+    в базу наравне со всеми, но никому не шлются — их не было в замере вовсе, и
+    статистику по ним надо копить, а не рассылать. Решение владельца 22.09.2026;
+    False у BREAKOUT_SIGNALS возвращает молчание всей стратегии. Сводка — /breakout.
 
-    Идёт по ВСЕМ инструментам движка, а не только по подписанным: смысл слежки в
-    статистике, а она не должна зависеть от того, кто на что подписан.
+    СЧИТАЕТСЯ по ВСЕМ инструментам движка, а не только по подписанным: смысл слежки
+    в статистике, а она не должна зависеть от того, кто на что подписан. Подписка
+    решает только, кому ОТПРАВИТЬ, — тем же приёмом, что у ложного пробоя.
 
     Уровни берутся из таблицы levels — те же, что видит человек в /analyze, их раз
     в час пересчитывает run_analysis. Значит при выключенном ложном пробое
@@ -569,6 +573,8 @@ async def monitor_breakout(bot) -> None:
             print(f"[monitor_breakout] ПРОБОЙ {code} {sig['direction']} "
                   f"уровень {sig['level_price']} вход {sig['entry_price']} "
                   f"стоп {sig['stop_loss']} цель {sig['take_profit']}")
+            if _breakout_sends(code):
+                await _notify_breakout(bot, code, {**sig, "id": sig_id})
 
     # Исходы открытых сигналов — по тем же часовым свечам из общего кеша.
     for sig in database.get_open_breakout_signals():
@@ -581,8 +587,101 @@ async def monitor_breakout(bot) -> None:
         status = breakout.outcome(sig, df)
         if status == "pending":
             continue
-        database.close_breakout_signal(sig["id"], status, breakout.result_r(sig, status))
+        result_r = breakout.result_r(sig, status)
+        database.close_breakout_signal(sig["id"], status, result_r)
         print(f"[monitor_breakout] {code} #{sig['id']}: {status}")
+        if _breakout_sends(code):
+            await _notify_breakout_outcome(bot, code, sig, status, result_r)
+
+
+def strategy_covers(strategy: str, code: str) -> bool:
+    """Шлёт ли стратегия сигналы по этому инструменту вообще.
+
+    Сейчас правило одно: ПРОБОЙ УРОВНЯ молчит по валютным парам — его на них не
+    мерили (см. config.BREAKOUT_SIGNAL_CLASSES). Остальные стратегии покрывают
+    весь движок.
+
+    Живёт здесь и спрашивается ИЗ ДВУХ МЕСТ: рассылка (_breakout_sends) и
+    клавиатура /subscribe в bot.py. Разъедутся — и человек поставит галочку на
+    инструмент, по которому сигнал не придёт, то есть бот пообещает несуществующее.
+    """
+    if strategy == "breakout":
+        return asset_class(code) in config.BREAKOUT_SIGNAL_CLASSES
+    return True
+
+
+def _breakout_sends(code: str) -> bool:
+    """Шлём ли сигнал пробоя по этому инструменту (а не только считаем).
+
+    Два условия: общий выключатель стратегии и покрытие по классу рынка.
+    Спрашивают его ОБА места — и новый сигнал, и его исход: иначе человек получил
+    бы «стоп» по сделке, о которой ему не сообщали.
+    """
+    return bool(config.BREAKOUT_SIGNALS) and strategy_covers("breakout", code)
+
+
+async def _notify_breakout(bot, code: str, sig: dict) -> None:
+    """Сигнал пробоя — подписчикам инструмента по этой стратегии. Цифрами, как у ICT.
+
+    ИИ-комментария здесь нет намеренно, по той же причине, что и у ICT: промпты
+    описывают правила ложного пробоя, и модель объясняла бы чужую стратегию.
+    """
+    info = resolve(code)
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(sig["entry_price"])
+    long_ = sig["direction"] == "long"
+    arrow = "🟢 ЛОНГ" if long_ else "🔴 ШОРТ"
+    risk = abs(sig["entry_price"] - sig["stop_loss"])
+    risk_pct = risk / sig["entry_price"] if sig["entry_price"] else 0.0
+    rr = abs(sig["take_profit"] - sig["entry_price"]) / risk if risk else 0.0
+    # Объём под риск 1% депозита — как в сообщении ICT и тренда.
+    size = 0.01 / risk_pct if risk_pct else 0.0
+    size_txt = (f"{size:.0%} депозита" if size <= 1
+                else f"{size:.1f} депозита, плечо x{math.ceil(size)}")
+    late = ""
+    # Порог запоздания — два часа, как у ICT и тренда: на часовой свече полчаса
+    # набегает само из закрытия свечи, интервала задачи и кеша.
+    age = pd.Timestamp.now(tz="UTC") - pd.Timestamp(sig["bar_time"])
+    if age > timedelta(hours=2):
+        late = (f"⚠️ Сообщение запоздало на {age.total_seconds() / 3600:.0f} ч — "
+                "цена могла уйти.\n")
+    side = "выше" if long_ else "ниже"
+    text = (
+        f"📈 Пробой уровня — {info['short']} {arrow}\n"
+        f"Свеча закрылась {side} сильного уровня {fmt(sig['level_price'], d)} ⭐\n\n"
+        f"Вход: {fmt(sig['entry_price'], d)} по рынку\n"
+        f"Стоп: {fmt(sig['stop_loss'], d)} ({'−' if long_ else '+'}{risk_pct:.1%})\n"
+        f"Цель: {fmt(sig['take_profit'], d)} (1:{rr:.1f})\n"
+        f"Объём: {size_txt} = риск 1%\n"
+        f"Срок сделки: {config.BREAKOUT_EXPIRE_HOURS} ч\n"
+        f"{late}"
+    ).rstrip()
+    for user_id in database.get_subscribers(code, "breakout"):
+        try:
+            await bot.send_message(user_id, text)
+        except Exception as e:
+            print(f"[monitor_breakout] не отправить {user_id}: {e}")
+
+
+async def _notify_breakout_outcome(bot, code: str, sig: dict, status: str,
+                                   result_r: float | None) -> None:
+    """Итог сделки пробоя — тем же подписчикам инструмента."""
+    info = resolve(code)
+    d = info["decimals"] if info["decimals"] is not None else infer_decimals(sig["entry_price"])
+    arrow = "🟢 ЛОНГ" if sig["direction"] == "long" else "🔴 ШОРТ"
+    if status == "hit_tp":
+        text = (f"✅ Пробой — {info['short']} {arrow}: цель {fmt(sig['take_profit'], d)} взята, "
+                f"итог {result_r:+.1f}R (без комиссии).")
+    elif status == "hit_sl":
+        text = (f"🛑 Пробой — {info['short']} {arrow}: стоп {fmt(sig['stop_loss'], d)}, "
+                f"итог −1.0R (без комиссии).")
+    else:
+        text = (f"⌛ Пробой — {info['short']} {arrow}: за {config.BREAKOUT_EXPIRE_HOURS} ч "
+                f"не дошло ни до цели, ни до стопа. Сделка снята со счёта.")
+    for user_id in database.get_subscribers(code, "breakout"):
+        try:
+            await bot.send_message(user_id, text)
+        except Exception as e:
+            print(f"[monitor_breakout] не отправить {user_id}: {e}")
 
 
 async def monitor_ict(bot) -> None:
@@ -857,23 +956,26 @@ def ict_overview() -> str:
 
 
 def breakout_overview() -> str:
-    """Текст /breakout: что стратегия №5 насчитала, пока она в слежке.
+    """Текст /breakout: что насчитала стратегия №5.
 
     Сети не требует (в отличие от trend_overview): у пробоя цель и стоп заданы при
     входе, текущую цену показывать незачем — сделка либо уже закрыта, либо ждёт.
     """
     rows = database.get_breakout_signals()
     if not rows:
-        return ("🧪 Пробой сильного уровня — стратегия в СЛЕЖКЕ: бот считает сигналы, "
-                "но никому их не шлёт.\nПока ни одного сигнала не набралось — "
-                "часовая свеча должна закрыться за сильным уровнем (⭐ в /analyze).")
+        return ("📈 Пробой сильного уровня — стратегия №5.\nПока ни одного сигнала "
+                "не набралось — часовая свеча должна закрыться за сильным уровнем "
+                "(⭐ в /analyze).")
     opened = [r for r in rows if r["status"] == "open"]
     closed = [r for r in rows if r["status"] != "open"]
     done = [r for r in closed if r["status"] in ("hit_tp", "hit_sl")]
     lines = [
-        "🧪 Пробой сильного уровня — стратегия №5, В СЛЕЖКЕ.",
-        "Сигналы считаются и ведутся, но НИКОМУ НЕ ШЛЮТСЯ: смотрим на живых данных, "
-        "что она даёт.",
+        "📈 Пробой сильного уровня — стратегия №5.",
+        ("Сигналы приходят подписчикам по КРИПТЕ, ЗОЛОТУ и НЕФТИ (📈 в /subscribe). "
+         "По валютным парам стратегия молчит — её на них не мерили, — но считает: "
+         "ниже они учтены."
+         if config.BREAKOUT_SIGNALS else
+         "В СЛЕЖКЕ: сигналы считаются и ведутся, но НИКОМУ НЕ ШЛЮТСЯ."),
         f"Правило: часовая свеча закрылась за СИЛЬНЫМ уровнем (⭐), вход по закрытию, "
         f"стоп за фитилём + {config.BREAKOUT_STOP_ATR:g} ATR, цель — встречный уровень "
         f"не ближе {config.BREAKOUT_MIN_TP_R:g} рисков, срок {config.BREAKOUT_EXPIRE_HOURS} ч.",

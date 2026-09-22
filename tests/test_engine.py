@@ -2071,11 +2071,74 @@ def test_m15_ict_signals_are_cancelled_once():
         assert status["SOL"] == "open"          # M15 после возврата — не задет
 
 
-def test_strategies_offer_spring_and_ict():
-    """В /subscribe ровно две стратегии, и у каждой есть метка на кнопке."""
+def test_strategies_offer_spring_ict_and_breakout():
+    """В /subscribe три стратегии, и у каждой есть метка на кнопке.
+
+    Метка без стратегии (или наоборот) роняет клавиатуру /subscribe на KeyError у
+    живого пользователя — дешевле поймать здесь."""
     import bot
-    assert set(config.STRATEGIES) == {"spring", "ict"}
+    assert set(config.STRATEGIES) == {"spring", "ict", "breakout"}
     assert set(bot.STRATEGY_MARK) == set(config.STRATEGIES)
+
+
+def test_breakout_sends_only_to_measured_classes():
+    """Пробой шлёт сигналы по крипте и товарам, но НЕ по валюте (22.09.2026).
+
+    Валюты не было в замере june_break.py, поэтому по ней стратегия считает молча.
+    Тест держит оба конца: общий выключатель гасит всех, а при включённом выключателе
+    валюта всё равно молчит. Сломается ровно тогда, когда кто-то решит, что
+    BREAKOUT_SIGNALS хватает одного."""
+    import scheduler
+    # Правило покрытия одно на бота: его же спрашивает клавиатура /subscribe, чтобы не
+    # предлагать галочку на инструмент, по которому сигнала не будет.
+    assert scheduler.strategy_covers("breakout", "BTC")
+    assert not scheduler.strategy_covers("breakout", "EURUSD")
+    assert scheduler.strategy_covers("spring", "EURUSD")
+    assert scheduler.strategy_covers("ict", "EURUSD")
+
+    saved = config.BREAKOUT_SIGNALS
+    try:
+        config.BREAKOUT_SIGNALS = True
+        assert scheduler._breakout_sends("BTC")
+        assert scheduler._breakout_sends("GOLD")
+        assert scheduler._breakout_sends("BRENT")
+        assert not scheduler._breakout_sends("EURUSD")
+        assert not scheduler._breakout_sends("USDJPY")
+
+        config.BREAKOUT_SIGNALS = False
+        assert not scheduler._breakout_sends("BTC")
+        assert not scheduler._breakout_sends("GOLD")
+    finally:
+        config.BREAKOUT_SIGNALS = saved
+
+
+def test_breakout_subscriptions_migrate_once_and_skip_fx():
+    """Подписка на пробой выдаётся подписчикам ложного пробоя — один раз и без валюты.
+
+    Миграция КОПИРУЮЩАЯ: строки-источники ('spring') никуда не деваются, поэтому
+    самоограничиться условием запроса она не может — отметка хранится в таблице
+    migrations. Вторая половина теста именно это и сторожит: человек, отписавшийся
+    от пробоя, не должен получить подписку обратно при следующем рестарте."""
+    with _temp_db() as (database, sqlite3):
+        database.init_db()
+        with sqlite3.connect(database.DB_PATH) as conn:
+            conn.execute("INSERT INTO signal_subscriptions VALUES (7, 'BTC', 'spring', 'now')")
+            conn.execute("INSERT INTO signal_subscriptions VALUES (7, 'EURUSD', 'spring', 'now')")
+            # Первый init_db на ПУСТОЙ базе уже отметил миграцию выполненной (копировать
+            # было нечего). Снимаем отметку — так выглядит боевая база, где подписки
+            # появились раньше самой миграции.
+            conn.execute("DELETE FROM migrations WHERE name LIKE 'breakout%'")
+            conn.commit()
+        database.init_db()
+        assert database.get_subscribers("BTC", "breakout") == [7]
+        # Валютная пара не переезжает: по ней стратегия молчит.
+        assert database.get_subscribers("EURUSD", "breakout") == []
+        # Ложный пробой при этом не тронут — миграция копирующая, а не переносящая.
+        assert database.get_subscribers("EURUSD", "spring") == [7]
+
+        database.remove_subscription(7, "BTC", "breakout")
+        database.init_db()
+        assert database.get_subscribers("BTC", "breakout") == []
 
 
 if __name__ == "__main__":
