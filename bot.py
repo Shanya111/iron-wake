@@ -401,7 +401,7 @@ HELP_TEXT = (
     "/analyze — разбор инструмента глазами движка: что видит, чего не хватает\n"
     "/subscribe — подписка на сигналы: стратегии (ложный пробой, ICT, пробой) и инструменты\n"
     "/signals — последние сигналы\n"
-    "/stats — статистика сигналов (винрейт, итог в R) за 30 дней / всё время\n"
+    "/stats — статистика по каждой стратегии: итог в R, винрейт, за 30 дней / всё время\n"
     "/ict — ICT: свип ликвидности и разрыв на часовых свечах, сводка сигналов\n"
     "/breakout — пробой сильного уровня: сводка сигналов и итог в R\n"
     "/trades — журнал сделок (статус цель/стоп, закрытие)\n"
@@ -409,7 +409,7 @@ HELP_TEXT = (
     "Можно просто писать словами — я пойму:\n"
     "• «что по биткоину» — сделаю разбор\n"
     "• «подпиши на эфир» / «мои сигналы» — подписка и список\n"
-    "• «статистика за месяц» — сводка по сигналам (винрейт, итог в R)\n"
+    "• «статистика за месяц» — сводка по стратегиям (итог в R, винрейт)\n"
     "• «взял золото по 2390, стоп 2380, цель 2410» — запишу сделку в журнал\n"
     "• «алерт золото 2400» / «мои алерты» — поставлю алерт и покажу список\n"
     "Остальное (вопросы, разбор пересланного анализа) — отвечу как ассистент."
@@ -1548,29 +1548,41 @@ async def cmd_breakout(message: Message):
     await message.answer(engine.breakout_overview())
 
 
-# ── Сводная статистика по сигналам (/stats) ────────────────────────────────────
+# ── Статистика по стратегиям (/stats) ──────────────────────────────────────────
+# Три стратегии хранят сделки в трёх таблицах, но меряются одинаково: риск сделки
+# = 1R, цель даёт фактический R:R, стоп — ровно −1R, комиссии и фандинга нет.
+# Поэтому подсчёт один (compute_signal_stats), а разница только в том, откуда
+# брать строки: сигналы ложного пробоя персональные (свои пороги у каждого),
+# сигналы ICT и пробоя общие для всех подписчиков.
+
+STATS_STRATEGIES = ("spring", "ict", "breakout")
+STATS_BUTTONS = {"sum": "📊 Сводка", "spring": "🔴 Ложный", "ict": "💧 ICT",
+                 "breakout": "📈 Пробой"}
+
 
 def compute_signal_stats(rows: list[dict]) -> dict:
-    """Считает агрегаты по списку сигналов. Денег не храним → меряем в R
-    (риск на сделку = 1R): цель дала +R:R, стоп = −1R.
+    """Считает агрегаты по списку сигналов любой стратегии. Денег не храним →
+    меряем в R (риск на сделку = 1R): цель дала +R:R, стоп = −1R.
 
-    В винрейт и профит-фактор не входят три состояния, и по разным причинам:
+    В винрейт и профит-фактор не входят четыре состояния, и по разным причинам:
       • ждём (заявка стоит / сделка открыта) и истёк — исход ещё не определён;
-      • НЕ ИСПОЛНЕНА (expired_unfilled) — сделки не было вообще. Это не ноль в
-        статистике, а отсутствие сделки: цена до лимитной заявки не дошла. Считать
-        её нулевым результатом значило бы разбавлять винрейт событиями, которых не
-        было. Показываем отдельным счётчиком — по нему видно, не слишком ли далеко
-        от рынка стоят заявки.
+      • НЕ ИСПОЛНЕНА (expired_unfilled, только ложный пробой) — сделки не было
+        вообще: цена до лимитной заявки не дошла. Считать её нулём значило бы
+        разбавлять винрейт событиями, которых не было. Показываем отдельно — по
+        счётчику видно, не слишком ли далеко от рынка стоят заявки;
+      • СНЯТ РУКАМИ (manual, ICT и пробой) — сигналы первого дня на 15-минутках,
+        которые нельзя было вести на часовике.
     Разбивка по инструментам — только по закрытым (цель/стоп)."""
-    tp = sl = pending = expired = unfilled = 0
+    tp = sl = pending = expired = unfilled = manual = 0
     gross_profit = 0.0            # сумма плюсов в R (по факт. R:R достигших цели)
     gross_loss = 0.0             # сумма минусов в R (каждый стоп = 1R)
     by_instrument: dict[str, dict] = {}
 
     for s in rows:
         status = s["status"]
-        # 'pending' — старые сигналы рыночного входа (до перехода на лимитный).
-        if status in ("waiting_fill", "filled", "pending"):
+        # 'pending' — старые сигналы рыночного входа (до перехода на лимитный),
+        # 'open' — открытая сделка ICT и пробоя.
+        if status in ("waiting_fill", "filled", "pending", "open"):
             pending += 1
             continue
         if status == "expired_unfilled":
@@ -1578,6 +1590,9 @@ def compute_signal_stats(rows: list[dict]) -> dict:
             continue
         if status == "expired":
             expired += 1
+            continue
+        if status == "manual":
+            manual += 1
             continue
         # закрытые: hit_tp / hit_sl
         risk = abs(s["entry_price"] - s["stop_loss"])
@@ -1600,10 +1615,13 @@ def compute_signal_stats(rows: list[dict]) -> dict:
     return {
         "total": len(rows),
         "tp": tp, "sl": sl, "pending": pending, "expired": expired,
-        "unfilled": unfilled,
+        "unfilled": unfilled, "manual": manual,
         "decided": decided,
         "winrate": (tp / decided) if decided else None,
         "net_r": gross_profit - gross_loss,
+        # средний итог одной закрытой сделки — главное число: плюс здесь и значит,
+        # что стратегия зарабатывает (до комиссий)
+        "avg_r": ((gross_profit - gross_loss) / decided) if decided else None,
         "gross_profit": gross_profit,
         "gross_loss": gross_loss,
         # профит-фактор: плюсы ÷ минусы; нет стопов при наличии плюсов → бесконечность
@@ -1613,80 +1631,185 @@ def compute_signal_stats(rows: list[dict]) -> dict:
     }
 
 
-def render_stats(user_id: int, period: str) -> tuple[str, InlineKeyboardMarkup]:
-    """Текст + кнопка-переключатель периода для /stats. period: '30' | 'all'."""
-    since = None
-    if period == "30":
-        since = (datetime.now() - timedelta(days=30)).isoformat(timespec="seconds")
-    rows = database.get_signals_since(user_id, since)
-    st = compute_signal_stats(rows)
+def _strategy_rows(strategy: str, user_id: int, since: str | None) -> list[dict]:
+    """Сделки стратегии за период. Ложный пробой — свои, остальные — общие."""
+    if strategy == "spring":
+        return database.get_signals_since(user_id, since)
+    if strategy == "ict":
+        return database.get_ict_signals(since)
+    return database.get_breakout_signals(since)
 
-    head = "за 30 дней" if period == "30" else "за всё время"
-    # Кнопка ведёт на противоположный период.
-    if period == "30":
-        btn = InlineKeyboardButton(text="📅 За всё время", callback_data="stats:all")
+
+def _stats_keyboard(current: str, period: str) -> InlineKeyboardMarkup:
+    """Кнопки /stats: сводка и три стратегии в ряд, ниже — смена периода.
+    callback: stats:<экран>:<период>, экран — 'sum' или код стратегии."""
+    row = []
+    for key in ("sum",) + STATS_STRATEGIES:
+        label = STATS_BUTTONS[key]
+        if key == current:
+            label = "· " + label + " ·"
+        row.append(InlineKeyboardButton(text=label, callback_data=f"stats:{key}:{period}"))
+    other = "all" if period == "30" else "30"
+    period_btn = InlineKeyboardButton(
+        text="📅 За всё время" if other == "all" else "📅 За 30 дней",
+        callback_data=f"stats:{current}:{other}",
+    )
+    return InlineKeyboardMarkup(inline_keyboard=[row, [period_btn]])
+
+
+def _verdict(st: dict) -> str:
+    """Одна строка простыми словами: в плюсе стратегия или в минусе и можно ли
+    этому верить. 20 закрытых сделок — порог, ниже которого итог решает случай."""
+    if not st["decided"]:
+        return "Закрытых сделок пока нет — судить не о чем."
+    avg = st["avg_r"]
+    if avg > 0:
+        word = f"🟢 В плюсе: в среднем {avg:+.2f}R на сделку"
+    elif avg < 0:
+        word = f"🔴 В минусе: в среднем {avg:+.2f}R на сделку"
     else:
-        btn = InlineKeyboardButton(text="📅 За 30 дней", callback_data="stats:30")
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[btn]])
+        word = "⚪ В ноль"
+    if st["decided"] < 20:
+        word += f" — но сделок всего {st['decided']}, это ещё может быть случайность"
+    return word + "."
+
+
+def _stats_line(st: dict) -> str:
+    """Короткая строка стратегии для сводки."""
+    if not st["decided"]:
+        if st["pending"]:
+            return f"закрытых нет, ждём исхода: {st['pending']}"
+        return "сделок не было"
+    return (f"{st['decided']} закрыто · до цели {st['winrate'] * 100:.0f}% · "
+            f"итог {st['net_r']:+.1f}R ({st['avg_r']:+.2f}R на сделку)")
+
+
+def render_stats_summary(user_id: int, head: str, since: str | None) -> str:
+    """Экран «Сводка»: по строке на стратегию и памятка, как читать числа."""
+    lines = [f"📊 Статистика по стратегиям — {head}", ""]
+    for key in STATS_STRATEGIES:
+        st = compute_signal_stats(_strategy_rows(key, user_id, since))
+        lines.append(f"{STRATEGY_MARK[key]} {config.STRATEGIES[key]}")
+        lines.append(f"   {_stats_line(st)}")
+    lines += [
+        "",
+        "Как читать:",
+        "• R — риск одной сделки. Стоп = −1R. Цель = +столько R, во сколько раз "
+        "она дальше стопа (цель в 2 раза дальше → +2R).",
+        "• «На сделку» — главное число: больше нуля — стратегия зарабатывает, "
+        "меньше — теряет.",
+        "• До цели % — сколько сделок дошли до цели. Сам по себе ничего не решает: "
+        "30% при цели +3R — это плюс, 60% при цели +0.5R — минус.",
+        "• Всё без комиссии и фандинга — в жизни результат немного хуже.",
+        "",
+        "Подробно по стратегии — кнопки ниже.",
+    ]
+    return "\n".join(lines)
+
+
+def render_stats_strategy(strategy: str, user_id: int, head: str,
+                          since: str | None) -> str:
+    """Экран одной стратегии: исходы, итог, вердикт и разбивка по инструментам."""
+    rows = _strategy_rows(strategy, user_id, since)
+    st = compute_signal_stats(rows)
+    lines = [f"{STRATEGY_MARK[strategy]} {config.STRATEGIES[strategy]} — {head}"]
+    # Чьи это сделки: у ложного пробоя сигналы свои у каждого, у остальных общие.
+    if strategy == "spring":
+        lines.append("Твои сигналы — по твоим подпискам и настройкам.")
+    else:
+        lines.append("Все сигналы стратегии по всем инструментам — они общие для всех.")
+    lines.append("")
 
     if st["total"] == 0:
-        return (
-            f"📊 Статистика сигналов — {head}\n\n"
-            "За период сигналов не было. Подписаться на инструменты — /subscribe.",
-            keyboard,
-        )
+        lines.append("За период сигналов не было.")
+        if strategy == "spring":
+            lines.append("Подписаться на инструменты — /subscribe.")
+        return "\n".join(lines)
 
-    lines = [
-        f"📊 Статистика сигналов — {head}\n",
-        f"Всего: {st['total']}",
-        f"✅ Цель: {st['tp']}   🛑 Стоп: {st['sl']}   "
-        f"⏳ Ждём: {st['pending']}   ⌛ Истекло: {st['expired']}",
-    ]
+    lines.append(f"Сигналов: {st['total']}")
+    lines.append(f"✅ Дошли до цели: {st['tp']}")
+    lines.append(f"🛑 Выбило стопом: {st['sl']}")
+    if st["pending"]:
+        lines.append(f"⏳ Ещё в работе: {st['pending']}")
+    if st["expired"]:
+        lines.append(f"⌛ Истёк срок, не дойдя ни до цели, ни до стопа: {st['expired']}")
     if st["unfilled"]:
-        share = st["unfilled"] / st["total"]
-        lines.append(f"⏹ Заявка не исполнилась: {st['unfilled']} ({share:.0%}) — "
-                     "сделки не было, в винрейт не входит")
+        lines.append(f"⏹ Заявка не исполнилась (сделки не было): {st['unfilled']}")
+    if st["manual"]:
+        lines.append(f"✋ Сняты при переносе на часовик: {st['manual']}")
     lines.append("")
 
     if st["decided"]:
-        lines.append(f"Винрейт: {st['winrate'] * 100:.0f}% "
+        lines.append(f"До цели: {st['winrate'] * 100:.0f}% "
                      f"({st['tp']} из {st['decided']} закрытых)")
-        lines.append(f"Итог: {st['net_r']:+.1f}R")
+        lines.append(f"Итог: {st['net_r']:+.1f}R — заработано {st['gross_profit']:.1f}R, "
+                     f"потеряно {st['gross_loss']:.1f}R")
         pf = st["profit_factor"]
-        if pf is None:
-            pf_str = "—"
-        elif pf == float("inf"):
-            pf_str = "∞ (без стопов)"
+        if pf == float("inf"):
+            pf_str = "∞ (стопов не было)"
         else:
-            pf_str = f"{pf:.2f}"
+            pf_str = f"{pf:.2f} (больше 1 — плюс)"
         lines.append(f"Профит-фактор: {pf_str}")
-    else:
-        lines.append("Закрытых сигналов пока нет — винрейт посчитаю, когда "
-                     "сработают цель/стоп.")
+        lines.append("")
+    lines.append(_verdict(st))
+
+    # Пробой по валюте молчит: сигналы считаются, но никому не приходят.
+    if strategy == "breakout":
+        silent = sum(1 for r in rows
+                     if asset_class(r["instrument"]) not in config.BREAKOUT_SIGNAL_CLASSES)
+        if silent:
+            lines.append(f"\nИз них по валютным парам {silent} — эти сигналы не "
+                         "рассылаются, стратегия по ним только копит статистику.")
 
     # Разбивка по инструментам (по закрытым), сильнейшие сверху.
     if st["by_instrument"]:
-        lines.append("\nПо инструментам:")
+        lines.append("\nПо инструментам (закрытые):")
         for code, d in sorted(st["by_instrument"].items(),
                               key=lambda kv: kv[1]["net"], reverse=True):
-            info = resolve(code)
-            lines.append(f"  • {info['short']}: {d['net']:+.1f}R "
+            lines.append(f"  • {short(code)}: {d['net']:+.1f}R "
                          f"({d['tp']}✅/{d['sl']}🛑)")
 
-    return "\n".join(lines), keyboard
+    lines.append("\nВсё в R без комиссии и фандинга. Что такое R — в «📊 Сводке».")
+    return "\n".join(lines)
+
+
+def render_stats(user_id: int, screen: str, period: str) -> tuple[str, InlineKeyboardMarkup]:
+    """Текст + кнопки /stats. screen: 'sum' | код стратегии; period: '30' | 'all'."""
+    if period not in ("30", "all"):
+        period = "30"
+    if screen != "sum" and screen not in STATS_STRATEGIES:
+        screen = "sum"
+    since = None
+    if period == "30":
+        since = (datetime.now() - timedelta(days=30)).isoformat(timespec="seconds")
+    head = "за 30 дней" if period == "30" else "за всё время"
+    if screen == "sum":
+        text = render_stats_summary(user_id, head, since)
+    else:
+        text = render_stats_strategy(screen, user_id, head, since)
+    return text, _stats_keyboard(screen, period)
 
 
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
-    text, keyboard = render_stats(message.from_user.id, "30")
+    text, keyboard = render_stats(message.from_user.id, "sum", "30")
     await message.answer(text, reply_markup=keyboard)
 
 
 @dp.callback_query(F.data.startswith("stats:"))
 async def cb_stats(call: CallbackQuery):
-    period = call.data.removeprefix("stats:")   # '30' | 'all'
-    text, keyboard = render_stats(call.from_user.id, period)
-    await call.message.edit_text(text, reply_markup=keyboard)
+    # stats:<экран>:<период>. Старые сообщения несут кнопку stats:<период> —
+    # её открываем как сводку за этот период.
+    parts = call.data.split(":")
+    if len(parts) == 3:
+        screen, period = parts[1], parts[2]
+    else:
+        screen, period = "sum", parts[-1]
+    text, keyboard = render_stats(call.from_user.id, screen, period)
+    try:
+        await call.message.edit_text(text, reply_markup=keyboard)
+    except TelegramBadRequest:
+        pass   # нажали кнопку текущего экрана — текст не изменился
     await call.answer()
 
 
@@ -1997,7 +2120,7 @@ async def main():
         BotCommand(command="analyze",     description="Разбор инструмента глазами движка"),
         BotCommand(command="subscribe",   description="Подписка на торговые сигналы"),
         BotCommand(command="signals",     description="Последние сигналы"),
-        BotCommand(command="stats",       description="Статистика сигналов (винрейт, R)"),
+        BotCommand(command="stats",       description="Статистика по стратегиям"),
         BotCommand(command="ict",         description="ICT: свип ликвидности и разрыв"),
         BotCommand(command="breakout",    description="Пробой сильного уровня"),
         BotCommand(command="trades",      description="Журнал сделок"),
@@ -2026,7 +2149,7 @@ async def main():
                 BotCommand(command="analyze",   description="Разбор инструмента глазами движка"),
                 BotCommand(command="subscribe", description="Подписка на торговые сигналы"),
                 BotCommand(command="signals",   description="Последние сигналы"),
-                BotCommand(command="stats",     description="Статистика сигналов (винрейт, R)"),
+                BotCommand(command="stats",     description="Статистика по стратегиям"),
                 BotCommand(command="ict",       description="ICT: свип ликвидности и разрыв"),
                 # Только в админском меню: стратегия №5 в слежке и сигналов никому не
                 # шлёт, обычному подписчику предлагать её незачем.
