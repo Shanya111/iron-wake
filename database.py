@@ -319,6 +319,18 @@ def init_db() -> None:
         """)
         conn.execute("DELETE FROM signal_subscriptions WHERE strategy = 'trend'")
 
+        # Открытый интерес BingX — тихая запись для будущего замера (27.09.2026).
+        # Пишет scheduler.record_open_interest, читает пока только лаборатория.
+        # value — в долларах, как отдаёт биржа; ts — время замера биржи, UTC.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS open_interest (
+                instrument TEXT NOT NULL,
+                ts         TEXT NOT NULL,
+                value      REAL NOT NULL,
+                PRIMARY KEY (instrument, ts)
+            )
+        """)
+
         # ── Разовые миграции с отметкой о выполнении ────────────────────────────
         # Миграции выше самоограничены собственным условием: после них не остаётся
         # строк, которые они ищут. КОПИРУЮЩЕЙ миграции так нельзя — источник никуда
@@ -798,6 +810,23 @@ def close_ict_signal(signal_id: int, status: str, result_r: float | None) -> Non
             WHERE id = ?
         """, (status, result_r, datetime.now().isoformat(timespec="seconds"), signal_id))
         conn.commit()
+
+
+def add_open_interest(instrument: str, ts: str, value: float) -> None:
+    """Одна точка открытого интереса. Повтор того же времени молча пропускается."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR IGNORE INTO open_interest (instrument, ts, value) "
+                     "VALUES (?, ?, ?)", (instrument, ts, value))
+        conn.commit()
+
+
+def get_open_interest(instrument: str) -> list[dict]:
+    """Все точки открытого интереса инструмента по времени."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT ts, value FROM open_interest WHERE instrument = ? "
+                            "ORDER BY ts", (instrument,)).fetchall()
+    return [dict(r) for r in rows]
 
 
 def get_ict_signals(since: str | None = None) -> list[dict]:

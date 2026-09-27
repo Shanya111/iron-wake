@@ -1,6 +1,6 @@
 """Фоновые задачи бота. Планировщик в проекте ровно один — этот.
 
-Семь задач:
+Задачи:
   • run_analysis  (раз в час) — пересчитывает тренд/уровни/зоны и пишет в БД (levels);
   • monitor_signals (каждые 5 мин) — ищет Spring/Upthrust по свежим H1-свечам, пишет
     в signals и рассылает подписчикам;
@@ -13,7 +13,9 @@
   • track_signals (каждые 5 мин) — ведёт сигнал по двум ступеням: исполнилась ли
     лимитная заявка, а потом — дошла ли сделка до цели/стопа; сообщает владельцу;
   • track_trades (каждые 5 мин) — исход сделок журнала;
-  • check_alerts (каждые 5 мин) — алерты «касание уровня» (правило — в alerts.py).
+  • check_alerts (каждые 5 мин) — алерты «касание уровня» (правило — в alerts.py);
+  • record_open_interest (каждые 15 мин) — тихо пишет открытый интерес BingX в
+    таблицу open_interest для будущего замера; никому ничего не шлёт.
 
 Первые две (run_analysis и monitor_signals) ставятся только при config.SPRING_SIGNALS,
 состав задач решает jobs(). С 15 сентября 2026 ложный пробой шлёт сигналы по правилам
@@ -1155,6 +1157,25 @@ async def check_alerts(bot) -> None:
             print(f"[check_alerts] не отправилось {a['user_id']}: {e}")
 
 
+async def record_open_interest(bot) -> None:
+    """Тихо пишет открытый интерес BingX по всем инструментам движка (27.09.2026).
+
+    Ничего не шлёт и ни на что не влияет — копит историю для замера «подтверждение
+    не по цене»: у BingX её нет, есть только текущее значение. Берутся все 21
+    инструмент, а не только подписанные — замеру нужна вся выборка. Валюта вне
+    сессии отвечает ошибкой; её пропускаем, как и любой другой сбой по инструменту.
+    """
+    for code in engine_codes():
+        sym = ccxt_symbol(code)
+        try:
+            oi = await data_fetcher.get_open_interest(sym["symbol"], sym["exchange"])
+            ts = oi["time"] or datetime.utcnow().isoformat(timespec="seconds")
+            database.add_open_interest(code, ts, oi["value"])
+        except Exception as e:
+            if asset_class(code) != "fx":
+                print(f"[record_open_interest] {code}: {e}")
+
+
 def jobs() -> list[tuple]:
     """Какие задачи ставятся в планировщик и с каким интервалом (в минутах).
 
@@ -1177,6 +1198,8 @@ def jobs() -> list[tuple]:
         (track_trades, config.MONITOR_EVERY_MIN),
         (check_alerts, config.ALERT_EVERY_MIN),
     ]
+    if config.OI_RECORD:
+        out.append((record_open_interest, config.OI_EVERY_MIN))
     return out
 
 

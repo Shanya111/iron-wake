@@ -1407,7 +1407,8 @@ def test_spring_switch_controls_scheduler_jobs():
     finally:
         config.SPRING_SIGNALS = saved
     always = {scheduler.monitor_trend, scheduler.monitor_breakout, scheduler.monitor_ict,
-              scheduler.track_signals, scheduler.track_trades, scheduler.check_alerts}
+              scheduler.track_signals, scheduler.track_trades, scheduler.check_alerts,
+              scheduler.record_open_interest}
     assert off == always
     assert on == always | {scheduler.run_analysis, scheduler.monitor_signals}
 
@@ -2148,6 +2149,42 @@ def test_breakout_subscriptions_migrate_once_and_skip_fx():
         database.remove_subscription(7, "BTC", "breakout")
         database.init_db()
         assert database.get_subscribers("BTC", "breakout") == []
+
+
+def test_open_interest_is_recorded_quietly():
+    """Тихая запись открытого интереса: выключатель снимает ровно её задачу, а в
+    таблицу пишутся точки по всем инструментам, кроме тех, где биржа ответила
+    ошибкой (валюта вне сессии), — и повтор той же точки не задваивается."""
+    import asyncio
+    import scheduler
+    saved = config.OI_RECORD
+    try:
+        config.OI_RECORD = False
+        off = {f for f, _ in scheduler.jobs()}
+        config.OI_RECORD = True
+        on = {f for f, _ in scheduler.jobs()}
+    finally:
+        config.OI_RECORD = saved
+    assert on == off | {scheduler.record_open_interest}
+
+    async def fake_oi(symbol, exchange="bingx"):
+        if symbol.startswith("NCFX"):
+            raise RuntimeError("pause currently")
+        return {"value": 123.0, "time": "2026-09-27T08:00:00.000Z"}
+
+    real = scheduler.data_fetcher.get_open_interest
+    with _temp_db() as (database, _):
+        database.init_db()
+        scheduler.data_fetcher.get_open_interest = fake_oi
+        try:
+            asyncio.run(scheduler.record_open_interest(None))
+            asyncio.run(scheduler.record_open_interest(None))
+        finally:
+            scheduler.data_fetcher.get_open_interest = real
+        assert database.get_open_interest("BTC") == [
+            {"ts": "2026-09-27T08:00:00.000Z", "value": 123.0}]
+        assert database.get_open_interest("GOLD")
+        assert database.get_open_interest("EURUSD") == []
 
 
 if __name__ == "__main__":

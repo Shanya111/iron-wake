@@ -141,6 +141,22 @@ async def get_order_book(
     return ob
 
 
+async def get_open_interest(symbol: str, exchange: str = "bingx") -> dict:
+    """Открытый интерес контракта сейчас: {'value': ..., 'time': 'ISO UTC'}.
+
+    BingX отдаёт его в долларах (сумма открытых позиций), число контрактов не даёт.
+    Истории у биржи нет — только текущее значение, поэтому бот копит его сам
+    (scheduler.record_open_interest). Без кеша: зовётся раз в config.OI_EVERY_MIN.
+    Валютные контракты вне сессии биржа держит на паузе — тогда летит исключение.
+    """
+    ex = _get_exchange(exchange)
+    r = await ex.fetch_open_interest(symbol)
+    value = r.get("openInterestValue")
+    if value is None:
+        value = float(r["info"]["openInterest"])
+    return {"value": float(value), "time": r.get("datetime")}
+
+
 async def close() -> None:
     """Закрыть соединения всех бирж. Вызывать при остановке бота."""
     for ex in _exchanges.values():
