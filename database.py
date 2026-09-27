@@ -366,6 +366,20 @@ def init_db() -> None:
                 VALUES (?, ?, 'breakout', ?)
             """, [(uid, code, created_at) for uid, code in rows
                   if not instruments.is_fx(code)])
+
+        # 27.09.2026 пробой уровня вышел в бой и по ВАЛЮТНЫМ ПАРАМ (решение владельца).
+        # Та же выдача, что выше, но теперь только по валюте: подписан на ложный пробой
+        # по EURUSD — получаешь и пробой по EURUSD. Снять можно в /subscribe.
+        if _once("breakout_fx_subscriptions_2026_09_27"):
+            rows = conn.execute(
+                "SELECT user_id, instrument FROM signal_subscriptions WHERE strategy = 'spring'"
+            ).fetchall()
+            created_at = datetime.now().isoformat(timespec="seconds")
+            conn.executemany("""
+                INSERT OR IGNORE INTO signal_subscriptions (user_id, instrument, strategy, created_at)
+                VALUES (?, ?, 'breakout', ?)
+            """, [(uid, code, created_at) for uid, code in rows
+                  if instruments.is_fx(code)])
         conn.commit()
 
 

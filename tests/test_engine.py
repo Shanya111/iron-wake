@@ -2120,47 +2120,53 @@ def test_outcome_messages_start_with_strategy_mark():
 
 
 def test_breakout_sends_only_to_measured_classes():
-    """Пробой шлёт сигналы по крипте и товарам, но НЕ по валюте (22.09.2026).
+    """Пробой шлёт сигналы только по классам из BREAKOUT_SIGNAL_CLASSES.
 
-    Валюты не было в замере june_break.py, поэтому по ней стратегия считает молча.
-    Тест держит оба конца: общий выключатель гасит всех, а при включённом выключателе
-    валюта всё равно молчит. Сломается ровно тогда, когда кто-то решит, что
-    BREAKOUT_SIGNALS хватает одного."""
+    22.09.2026 — крипта и товары, валюта молча; 27.09.2026 валюта добавлена решением
+    владельца. Тест держит все концы: класс вне списка молчит, общий выключатель
+    гасит всех, а итог по сделке из слежки не рассылается — у каждого класса свой
+    момент выкатки."""
     import scheduler
-    # Правило покрытия одно на бота: его же спрашивает клавиатура /subscribe, чтобы не
-    # предлагать галочку на инструмент, по которому сигнала не будет.
-    assert scheduler.strategy_covers("breakout", "BTC")
-    assert not scheduler.strategy_covers("breakout", "EURUSD")
-    assert scheduler.strategy_covers("spring", "EURUSD")
-    assert scheduler.strategy_covers("ict", "EURUSD")
-
-    saved = config.BREAKOUT_SIGNALS
+    saved = (config.BREAKOUT_SIGNALS, config.BREAKOUT_SIGNAL_CLASSES)
     try:
         config.BREAKOUT_SIGNALS = True
-        assert scheduler._breakout_sends("BTC")
-        assert scheduler._breakout_sends("GOLD")
-        assert scheduler._breakout_sends("BRENT")
-        assert not scheduler._breakout_sends("EURUSD")
-        assert not scheduler._breakout_sends("USDJPY")
+        # Боевой список: весь движок, валюта включена.
+        assert "fx" in config.BREAKOUT_SIGNAL_CLASSES
+        for code in ("BTC", "GOLD", "BRENT", "EURUSD", "USDJPY"):
+            assert scheduler.strategy_covers("breakout", code), code
+            assert scheduler._breakout_sends(code), code
 
         # Итог по сделке, посчитанной в молчаливой слежке, не рассылается: о ней
-        # человеку не сообщали. Свежая — рассылается.
-        old_sig = {"created_at": "2026-09-20T10:00:00"}
-        new_sig = {"created_at": "2026-09-23T10:00:00"}
-        assert not scheduler._breakout_outcome_sends("BTC", old_sig)
-        assert scheduler._breakout_outcome_sends("BTC", new_sig)
-        assert not scheduler._breakout_outcome_sends("EURUSD", new_sig)
+        # человеку не сообщали. Крипта вышла в бой 22.09, валюта — 27.09.
+        sig_0920 = {"created_at": "2026-09-20T10:00:00"}
+        sig_0923 = {"created_at": "2026-09-23T10:00:00"}
+        sig_0928 = {"created_at": "2026-09-28T10:00:00"}
+        assert not scheduler._breakout_outcome_sends("BTC", sig_0920)
+        assert scheduler._breakout_outcome_sends("BTC", sig_0923)
+        assert not scheduler._breakout_outcome_sends("EURUSD", sig_0923)
+        assert scheduler._breakout_outcome_sends("EURUSD", sig_0928)
+
+        # Класс, убранный из списка, снова молчит — и /subscribe вешает замок.
+        config.BREAKOUT_SIGNAL_CLASSES = ("crypto", "commodity")
+        assert not scheduler.strategy_covers("breakout", "EURUSD")
+        assert not scheduler._breakout_sends("EURUSD")
+        assert not scheduler._breakout_outcome_sends("EURUSD", sig_0928)
+        assert scheduler.strategy_covers("spring", "EURUSD")
+        assert scheduler.strategy_covers("ict", "EURUSD")
 
         config.BREAKOUT_SIGNALS = False
         assert not scheduler._breakout_sends("BTC")
         assert not scheduler._breakout_sends("GOLD")
-        assert not scheduler._breakout_outcome_sends("BTC", new_sig)
+        assert not scheduler._breakout_outcome_sends("BTC", sig_0923)
     finally:
-        config.BREAKOUT_SIGNALS = saved
+        config.BREAKOUT_SIGNALS, config.BREAKOUT_SIGNAL_CLASSES = saved
 
 
 def test_breakout_subscriptions_migrate_once_and_skip_fx():
-    """Подписка на пробой выдаётся подписчикам ложного пробоя — один раз и без валюты.
+    """Подписка на пробой выдаётся подписчикам ложного пробоя — один раз, в два шага.
+
+    22.09.2026 — без валюты (по ней стратегия тогда молчала), 27.09.2026 — только
+    валюта, когда пробой вышел в бой и по ней.
 
     Миграция КОПИРУЮЩАЯ: строки-источники ('spring') никуда не деваются, поэтому
     самоограничиться условием запроса она не может — отметка хранится в таблице
@@ -2171,21 +2177,30 @@ def test_breakout_subscriptions_migrate_once_and_skip_fx():
         with sqlite3.connect(database.DB_PATH) as conn:
             conn.execute("INSERT INTO signal_subscriptions VALUES (7, 'BTC', 'spring', 'now')")
             conn.execute("INSERT INTO signal_subscriptions VALUES (7, 'EURUSD', 'spring', 'now')")
-            # Первый init_db на ПУСТОЙ базе уже отметил миграцию выполненной (копировать
-            # было нечего). Снимаем отметку — так выглядит боевая база, где подписки
-            # появились раньше самой миграции.
-            conn.execute("DELETE FROM migrations WHERE name LIKE 'breakout%'")
+            # Первый init_db на ПУСТОЙ базе уже отметил миграции выполненными (копировать
+            # было нечего). Снимаем отметку с первой — так выглядела боевая база 22.09.
+            conn.execute("DELETE FROM migrations WHERE name = 'breakout_subscriptions_2026_09_22'")
             conn.commit()
         database.init_db()
         assert database.get_subscribers("BTC", "breakout") == [7]
-        # Валютная пара не переезжает: по ней стратегия молчит.
+        # Валютная пара 22.09 не переезжает: по ней стратегия тогда молчала.
         assert database.get_subscribers("EURUSD", "breakout") == []
         # Ложный пробой при этом не тронут — миграция копирующая, а не переносящая.
         assert database.get_subscribers("EURUSD", "spring") == [7]
 
+        # 27.09: вторая миграция выдаёт ровно валюту.
         database.remove_subscription(7, "BTC", "breakout")
+        with sqlite3.connect(database.DB_PATH) as conn:
+            conn.execute("DELETE FROM migrations WHERE name = 'breakout_fx_subscriptions_2026_09_27'")
+            conn.commit()
         database.init_db()
+        assert database.get_subscribers("EURUSD", "breakout") == [7]
+        # Отписка от крипты, сделанная до неё, не отменена: вторая миграция валютная.
         assert database.get_subscribers("BTC", "breakout") == []
+
+        database.remove_subscription(7, "EURUSD", "breakout")
+        database.init_db()
+        assert database.get_subscribers("EURUSD", "breakout") == []
 
 
 def test_open_interest_is_recorded_quietly():

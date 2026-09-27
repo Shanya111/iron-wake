@@ -1391,8 +1391,8 @@ def subscribe_keyboard(user_id: int, strategy: str = "spring") -> InlineKeyboard
         row = []
         for c in codes[i:i + 2]:
             marks = "".join(STRATEGY_MARK[s] for s in config.STRATEGIES if c in subs[s])
-            # Инструмент, по которому выбранная стратегия молчит (пробой по валюте),
-            # помечаем замком: галочка на нём всё равно ничего не даст.
+            # Инструмент, по которому выбранная стратегия молчит (класс вне
+            # BREAKOUT_SIGNAL_CLASSES; с 27.09.2026 таких нет), помечаем замком.
             if not engine.strategy_covers(strategy, c):
                 marks = (marks + " 🔒").strip()
             row.append(InlineKeyboardButton(text=f"{marks} {short(c)}".strip(),
@@ -1418,7 +1418,7 @@ async def cmd_subscribe(message: Message):
         "🎣 ложный пробой — Spring/Upthrust по правилам 23 июня, часовые свечи\n"
         "💧 ICT — свип ликвидности и разрыв на часовых свечах (/ict)\n"
         "📈 пробой уровня — закрытие за сильным уровнем, цель от двух рисков "
-        "(/breakout). По валютным парам эта стратегия молчит: её на них не мерили\n\n"
+        "(/breakout)\n\n"
         "Выбери стратегию верхней кнопкой (👉 — выбрана) и отмечай инструменты под ней. "
         "Метки у инструмента показывают, по каким стратегиям он приходит: «🎣💧 BTC» — "
         "по обеим, «🎣 ETH» — только ложный пробой.",
@@ -1549,7 +1549,7 @@ async def cmd_breakout(message: Message):
     # Стратегия №5 — пробой сильного уровня. С 22.09.2026 сигналы рассылаются
     # подписчикам по крипте, золоту и нефти, поэтому команда переехала из админского
     # меню в общее: сводка нужна тому, кто эти сигналы получает. По валютным парам
-    # стратегия молчит и только копит статистику — она тут же, в сводке.
+    # стратегия с 27.09.2026 тоже шлёт сигналы (до этого копила статистику молча).
     await message.answer(engine.breakout_overview())
 
 
@@ -1759,7 +1759,8 @@ def render_stats_strategy(strategy: str, user_id: int, head: str,
         lines.append("")
     lines.append(_verdict(st))
 
-    # Пробой по валюте молчит: сигналы считаются, но никому не приходят.
+    # Класс вне BREAKOUT_SIGNAL_CLASSES молчит: сигналы считаются, но никому не
+    # приходят. С 27.09.2026 таких нет, строка не выводится.
     if strategy == "breakout":
         silent = sum(1 for r in rows
                      if asset_class(r["instrument"]) not in config.BREAKOUT_SIGNAL_CLASSES)
