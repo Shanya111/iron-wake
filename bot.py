@@ -1362,10 +1362,10 @@ async def cb_analyze(call: CallbackQuery):
     await _do_analyze(call.message, code, call.from_user.id)
 
 
-# Метка стратегии на кнопке инструмента в /subscribe. Красной галочки среди эмодзи нет,
-# поэтому ложный пробой помечен красным кругом, а ICT — каплей: она же стоит у пулов
-# ликвидности в /analyze. Тренд ушёл из подписок 18.09.2026 вместе с выходом ICT в бой.
-STRATEGY_MARK = {"spring": "🔴", "ict": "💧", "breakout": "📈"}
+# Метка стратегии на кнопке инструмента в /subscribe: 🎣 ложный пробой, 💧 ICT (капля
+# стоит и у пулов ликвидности в /analyze), 📈 пробой. Сам словарь — в config, им же
+# помечаются итоги сделок в планировщике.
+STRATEGY_MARK = config.STRATEGY_MARK
 
 
 def subscribe_keyboard(user_id: int, strategy: str = "spring") -> InlineKeyboardMarkup:
@@ -1415,13 +1415,13 @@ async def _redraw_subscribe(call: CallbackQuery, strategy: str) -> None:
 async def cmd_subscribe(message: Message):
     await message.answer(
         "Подписка на торговые сигналы — отдельно по каждой стратегии:\n"
-        "🔴 ложный пробой — Spring/Upthrust по правилам 23 июня, часовые свечи\n"
+        "🎣 ложный пробой — Spring/Upthrust по правилам 23 июня, часовые свечи\n"
         "💧 ICT — свип ликвидности и разрыв на часовых свечах (/ict)\n"
         "📈 пробой уровня — закрытие за сильным уровнем, цель от двух рисков "
         "(/breakout). По валютным парам эта стратегия молчит: её на них не мерили\n\n"
         "Выбери стратегию верхней кнопкой (👉 — выбрана) и отмечай инструменты под ней. "
-        "Метки у инструмента показывают, по каким стратегиям он приходит: «🔴💧 BTC» — "
-        "по обеим, «🔴 ETH» — только ложный пробой.",
+        "Метки у инструмента показывают, по каким стратегиям он приходит: «🎣💧 BTC» — "
+        "по обеим, «🎣 ETH» — только ложный пробой.",
         reply_markup=subscribe_keyboard(message.from_user.id),
     )
 
@@ -1561,8 +1561,9 @@ async def cmd_breakout(message: Message):
 # сигналы ICT и пробоя общие для всех подписчиков.
 
 STATS_STRATEGIES = ("spring", "ict", "breakout")
-STATS_BUTTONS = {"sum": "📊 Сводка", "spring": "🔴 Ложный", "ict": "💧 ICT",
-                 "breakout": "📈 Пробой"}
+STATS_BUTTONS = {"sum": "📊 Сводка", "spring": f"{STRATEGY_MARK['spring']} Ложный",
+                 "ict": f"{STRATEGY_MARK['ict']} ICT",
+                 "breakout": f"{STRATEGY_MARK['breakout']} Пробой"}
 
 
 def compute_signal_stats(rows: list[dict]) -> dict:

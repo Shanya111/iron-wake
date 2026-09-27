@@ -2082,6 +2082,43 @@ def test_strategies_offer_spring_ict_and_breakout():
     assert set(bot.STRATEGY_MARK) == set(config.STRATEGIES)
 
 
+def test_outcome_messages_start_with_strategy_mark():
+    """Итог сделки (цель / стоп / истёк) начинается со значка своей стратегии.
+
+    Итоги трёх стратегий приходят вперемешку, и без значка не понять, к какому
+    сигналу относится этот. Ложный пробой — 🎣, а не 🔴: красный круг путался со
+    «🔴 ШОРТ» (27.09.2026)."""
+    import asyncio
+    import scheduler
+    assert config.STRATEGY_MARK["spring"] == "🎣"
+
+    class FakeBot:
+        def __init__(self):
+            self.texts = []
+
+        async def send_message(self, user_id, text):
+            self.texts.append(text)
+
+    sig = {"instrument": "BTC", "direction": "short", "entry_price": 100.0,
+           "stop_loss": 101.0, "take_profit": 98.0, "user_id": 1}
+    saved = scheduler.database.get_subscribers
+    scheduler.database.get_subscribers = lambda code, strategy: [1]
+    try:
+        for status in ("hit_tp", "hit_sl", "expired"):
+            fake = FakeBot()
+            if status != "expired":   # у ложного пробоя «истёк» не рассылается
+                asyncio.run(scheduler._notify_outcome(fake, sig, status))
+            asyncio.run(scheduler._notify_ict_outcome(fake, "BTC", sig, status, 2.0))
+            asyncio.run(scheduler._notify_breakout_outcome(fake, "BTC", sig, status, 2.0))
+            marks = ([config.STRATEGY_MARK["spring"]] if status != "expired" else []) + \
+                [config.STRATEGY_MARK["ict"], config.STRATEGY_MARK["breakout"]]
+            assert len(fake.texts) == len(marks)
+            for text, mark in zip(fake.texts, marks):
+                assert text.startswith(mark + " "), text
+    finally:
+        scheduler.database.get_subscribers = saved
+
+
 def test_breakout_sends_only_to_measured_classes():
     """Пробой шлёт сигналы по крипте и товарам, но НЕ по валюте (22.09.2026).
 

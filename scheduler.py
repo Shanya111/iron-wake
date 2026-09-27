@@ -445,8 +445,10 @@ async def _notify_outcome(bot, signal: dict, outcome: str) -> None:
         head, price = "✅ Цель достигнута", signal["take_profit"]
     else:
         head, price = "🛑 Сработал стоп", signal["stop_loss"]
+    # Первым знаком — значок стратегии: итоги трёх стратегий приходят вперемешку,
+    # и без него не понять, к какому сигналу относится этот.
     text = (
-        f"{head} — {info['short']} ({arrow})\n"
+        f"{config.STRATEGY_MARK['spring']} {head} — {info['short']} ({arrow})\n"
         f"Вход был {fmt(signal['entry_price'], d)}, цена дошла до {fmt(price, d)}.\n\n"
         "Это итог подсказки, не финсовет."
     )
@@ -679,7 +681,7 @@ async def _notify_breakout(bot, code: str, sig: dict) -> None:
 
 async def _notify_breakout_outcome(bot, code: str, sig: dict, status: str,
                                    result_r: float | None) -> None:
-    """Итог сделки пробоя — тем же подписчикам инструмента."""
+    """Итог сделки пробоя — тем же подписчикам инструмента. Первым знаком — 📈."""
     info = resolve(code)
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(sig["entry_price"])
     arrow = "🟢 ЛОНГ" if sig["direction"] == "long" else "🔴 ШОРТ"
@@ -692,6 +694,7 @@ async def _notify_breakout_outcome(bot, code: str, sig: dict, status: str,
     else:
         text = (f"⌛ Пробой — {info['short']} {arrow}: за {config.BREAKOUT_EXPIRE_HOURS} ч "
                 f"не дошло ни до цели, ни до стопа. Сделка снята со счёта.")
+    text = f"{config.STRATEGY_MARK['breakout']} {text}"
     for user_id in database.get_subscribers(code, "breakout"):
         try:
             await bot.send_message(user_id, text)
@@ -789,7 +792,7 @@ async def _notify_ict(bot, code: str, sig: dict) -> None:
 
 async def _notify_ict_outcome(bot, code: str, sig: dict, status: str,
                               result_r: float | None) -> None:
-    """Итог сделки ICT — тем же подписчикам инструмента."""
+    """Итог сделки ICT — тем же подписчикам инструмента. Первым знаком — 💧."""
     info = resolve(code)
     d = info["decimals"] if info["decimals"] is not None else infer_decimals(sig["entry_price"])
     arrow = "🟢 ЛОНГ" if sig["direction"] == "long" else "🔴 ШОРТ"
@@ -802,6 +805,7 @@ async def _notify_ict_outcome(bot, code: str, sig: dict, status: str,
     else:
         text = (f"⌛ ICT — {info['short']} {arrow}: за {config.ICT_EXPIRE_HOURS} ч "
                 f"не дошло ни до цели, ни до стопа. Сделка снята со счёта.")
+    text = f"{config.STRATEGY_MARK['ict']} {text}"
     for user_id in database.get_subscribers(code, "ict"):
         try:
             await bot.send_message(user_id, text)
