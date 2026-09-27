@@ -21,6 +21,8 @@
   • MSS: закрытие выше последнего свингового максимума, стоявшего ДО свипа;
   • вход — ПО РЫНКУ, закрытием свечи, на которой разрыв стал виден целиком;
   • стоп — за экстремумом манипуляции плюс ICT_STOP_ATR × ATR;
+  • тейк (с 27.09.2026) — не доходя до пула на config.TP_BUFFER_PCT цены,
+    buffer_pct кладёт планировщик по классу инструмента;
   • цель — противоположная ликвидность не ближе ICT_MIN_TP_R рисков; нет такой —
     ровно ICT_FALLBACK_RR риска.
 
@@ -166,17 +168,22 @@ def _mss(df: pd.DataFrame, swings: list[int], i: int, pos: int, side: str) -> bo
     return float(df["close"].iloc[i:pos + 1].min()) < float(df["low"].iloc[last])
 
 
-def _target(pools: list[float], entry: float, risk: float, side: str) -> float:
-    """Противоположная ликвидность не ближе ICT_MIN_TP_R рисков; нет — 2 риска."""
+def _target(pools: list[float], entry: float, risk: float, side: str,
+            buffer_pct: float = 0.0) -> float:
+    """Тейк у противоположной ликвидности: не доходя до пула на buffer_pct цены
+    (config.TP_BUFFER_PCT) и не ближе ICT_MIN_TP_R рисков — минимум после отступа.
+    Нет такой — ровно 2 риска, без отступа."""
     gap = config.ICT_MIN_TP_R * risk
+    shift = buffer_pct * entry
     if side == "long":
-        ahead = sorted(p for p in pools if p - entry >= gap)
+        ahead = sorted(t for t in (p - shift for p in pools) if t - entry >= gap)
         return ahead[0] if ahead else entry + config.ICT_FALLBACK_RR * risk
-    ahead = sorted((p for p in pools if entry - p >= gap), reverse=True)
+    ahead = sorted((t for t in (p + shift for p in pools) if entry - t >= gap), reverse=True)
     return ahead[0] if ahead else entry - config.ICT_FALLBACK_RR * risk
 
 
-def _setup(df, pos, k, side, atr, pools_dn, pools_up, struct_hi, struct_lo):
+def _setup(df, pos, k, side, atr, pools_dn, pools_up, struct_hi, struct_lo,
+           buffer_pct=0.0):
     """Сетап одной стороны или None. Кандидаты свипа перебираются от раннего к позднему.
 
     Порядок важен: сетап принадлежит ПЕРВОМУ свипу, после которого случился этот
@@ -228,7 +235,7 @@ def _setup(df, pos, k, side, atr, pools_dn, pools_up, struct_hi, struct_lo):
             "pool_price": pool,
             "entry_price": entry,
             "stop_loss": stop,
-            "take_profit": _target(_live_pools(other, pos), entry, risk, side),
+            "take_profit": _target(_live_pools(other, pos), entry, risk, side, buffer_pct),
             "bar_time": str(df.index[pos]),
             "sweep_time": str(df.index[i]),
             "gap_atr": gap / a,
@@ -238,7 +245,7 @@ def _setup(df, pos, k, side, atr, pools_dn, pools_up, struct_hi, struct_lo):
     return None
 
 
-def detect(df: pd.DataFrame) -> list[dict]:
+def detect(df: pd.DataFrame, buffer_pct: float = 0.0) -> list[dict]:
     """Сигналы ICT по последней закрытой свече — список из 0, 1 или 2 штук.
 
     Двух сразу не бывает (разрыв не может быть и бычьим, и медвежьим), но список
@@ -257,7 +264,8 @@ def detect(df: pd.DataFrame) -> list[dict]:
 
     out = []
     for side in ("long", "short"):
-        sig = _setup(df, pos, k, side, atr, pools_dn, pools_up, struct_hi, struct_lo)
+        sig = _setup(df, pos, k, side, atr, pools_dn, pools_up, struct_hi, struct_lo,
+                     buffer_pct)
         if sig is not None:
             out.append(sig)
     return out

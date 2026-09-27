@@ -17,7 +17,8 @@
     нижняя поддержка (тот же принцип, что у ложного пробоя);
   • вход — закрытие свечи, стоп — за её фитилём плюс BREAKOUT_STOP_ATR × ATR;
   • цель — ближайший встречный уровень НЕ БЛИЖЕ BREAKOUT_MIN_TP_R рисков, нет
-    такого — ровно BREAKOUT_MIN_TP_R риска.
+    такого — ровно BREAKOUT_MIN_TP_R риска. С 27.09.2026 тейк стоит НЕ ДОХОДЯ до
+    уровня на config.TP_BUFFER_PCT цены (buffer_pct кладёт планировщик по классу).
 
 ПОЧЕМУ ЦЕЛЬ ДАЛЬНЯЯ, А НЕ КАК У ЛОЖНОГО ПРОБОЯ. Пробойная сделка живёт редким
 длинным хвостом, и близкая цель его отрезает. Замер по целям (брутто, горизонт 120 ч):
@@ -57,18 +58,22 @@ def _crossed(side: str, close_now: float, close_prev: float, price: float) -> bo
     return close_now < price and close_prev >= price
 
 
-def _target(levels: list[dict], side: str, c: float, min_gap: float) -> float | None:
-    """Ближайший встречный уровень не ближе min_gap от закрытия (в цене)."""
+def _target(levels: list[dict], side: str, c: float, min_gap: float,
+            buffer_pct: float = 0.0) -> float | None:
+    """Тейк у ближайшего встречного уровня: не доходя до него на buffer_pct цены
+    (config.TP_BUFFER_PCT) и не ближе min_gap от закрытия. Минимум — после отступа."""
+    shift = buffer_pct * c
     if side == "long":
-        ahead = [x["price"] for x in levels
-                 if x["type"] == "resistance" and x["price"] - c >= min_gap]
+        ahead = [x["price"] - shift for x in levels if x["type"] == "resistance"]
+        ahead = [p for p in ahead if p - c >= min_gap]
         return min(ahead) if ahead else None
-    ahead = [x["price"] for x in levels
-             if x["type"] == "support" and c - x["price"] >= min_gap]
+    ahead = [x["price"] + shift for x in levels if x["type"] == "support"]
+    ahead = [p for p in ahead if c - p >= min_gap]
     return max(ahead) if ahead else None
 
 
-def detect(df: pd.DataFrame, levels: list[dict], trend: str = "sideways") -> list[dict]:
+def detect(df: pd.DataFrame, levels: list[dict], trend: str = "sideways",
+           buffer_pct: float = 0.0) -> list[dict]:
     """Сигналы пробоя по последней закрытой свече — список из 0, 1 или 2 штук.
 
     Двух сразу не бывает у нормального рынка (свеча не может закрыться и выше
@@ -109,7 +114,7 @@ def detect(df: pd.DataFrame, levels: list[dict], trend: str = "sideways") -> lis
         if risk <= 0:
             continue
         gap = config.BREAKOUT_MIN_TP_R * risk
-        target = _target(levels, side, c, gap)
+        target = _target(levels, side, c, gap, buffer_pct)
         if target is None:
             target = c + gap if side == "long" else c - gap
         out.append({

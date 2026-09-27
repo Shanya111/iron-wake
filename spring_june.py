@@ -17,6 +17,8 @@
     запас был долей цены (STOP_SPREAD, 0.1%), он остался запасной меркой без ATR;
   • цель — ближайший встречный уровень не ближе JUNE_MIN_TP_R своего класса
     (крипта 1 риск, валюта/золото/нефть 0.5); нет такого — FALLBACK_RR (2) риска.
+    С 27.09.2026 тейк стоит НЕ ДОХОДЯ до уровня на config.TP_BUFFER_PCT цены (крипта
+    0.3%, золото, нефть и валюта 0.1%); минимум проверяется после отступа.
 
 Чего здесь НЕТ по сравнению с правилами сентября (pattern_detector): силы отбоя,
 свежего пересечения, пулов равных экстремумов, ожидания возврата до трёх часов, стопа
@@ -43,15 +45,16 @@ RULES = "june23"  # метка в разборе explain: по ней отчёт
 
 def detect_spring(df: pd.DataFrame, levels: list[dict], trend: str,
                   settings: dict | None = None) -> dict | None:
-    """Лонг. Из settings читается ровно один ключ — MIN_TP_R (минимальная цель в долях
-    старого риска, кладёт вызывающий по классу инструмента). Фильтров строгости у
+    """Лонг. Из settings читаются два ключа — MIN_TP_R (минимальная цель в долях
+    старого риска) и TP_BUFFER (буфер тейка); оба кладёт вызывающий по классу
+    инструмента. Фильтров строгости у
     движка 23 июня не было и нет: MAX_ENTRY_DIST_ATR и MAX_RISK_ATR тут не смотрят."""
     return _detect(df, levels, trend, side="long", settings=settings)
 
 
 def detect_upthrust(df: pd.DataFrame, levels: list[dict], trend: str,
                     settings: dict | None = None) -> dict | None:
-    """Шорт — зеркало Spring. Из settings читается тот же MIN_TP_R, что у detect_spring."""
+    """Шорт — зеркало Spring. Из settings читаются те же MIN_TP_R и TP_BUFFER."""
     return _detect(df, levels, trend, side="short", settings=settings)
 
 
@@ -126,20 +129,29 @@ def _pick_level(broken: list[dict], side: str) -> dict | None:
 
 
 def _target_level(levels: list[dict], side: str, c: float,
-                  min_gap: float = 0.0) -> float | None:
-    """Ближайший встречный уровень НЕ БЛИЖЕ min_gap от закрытия.
+                  min_gap: float = 0.0, buffer_pct: float = 0.0) -> float | None:
+    """Тейк у ближайшего встречного уровня: НЕ ДОХОДЯ до него на buffer_pct цены и НЕ
+    БЛИЖЕ min_gap от закрытия.
 
     min_gap — доля старого риска (config.JUNE_MIN_TP_R по классу инструмента). Уровни
     ближе пропускаются, цель встаёт на следующий за ними; сигнал при этом остаётся —
     двигается только цель, число сигналов не меняется.
+    buffer_pct — буфер тейка (config.TP_BUFFER_PCT); минимум проверяется уже после
+    отступа, то есть по той цене, где тейк реально встанет.
     """
+    shift = buffer_pct * c
     if side == "long":
-        prices = [x["price"] for x in levels
-                  if x["type"] == "resistance" and x["price"] > c and x["price"] - c >= min_gap]
+        prices = [x["price"] - shift for x in levels if x["type"] == "resistance"]
+        prices = [p for p in prices if p > c and p - c >= min_gap]
         return min(prices) if prices else None
-    prices = [x["price"] for x in levels
-              if x["type"] == "support" and x["price"] < c and c - x["price"] >= min_gap]
+    prices = [x["price"] + shift for x in levels if x["type"] == "support"]
+    prices = [p for p in prices if p < c and c - p >= min_gap]
     return max(prices) if prices else None
+
+
+def _buffer(settings: dict | None) -> float:
+    """Буфер тейка из settings (ключ TP_BUFFER кладёт вызывающий по классу инструмента)."""
+    return float((settings or {}).get("TP_BUFFER", 0.0) or 0.0)
 
 
 def _min_gap(settings: dict | None, side: str, h: float, l: float, c: float) -> float:
@@ -177,7 +189,8 @@ def _detect(df: pd.DataFrame, levels: list[dict], trend: str, side: str,
     lvl = _pick_level(_broken_levels(levels, side, h, l, c), side)
     if lvl is not None:
         stop = _stop(side, h, l, pattern_detector._atr(df, pos))
-        target = _target_level(levels, side, c, _min_gap(settings, side, h, l, c))
+        target = _target_level(levels, side, c, _min_gap(settings, side, h, l, c),
+                               _buffer(settings))
         if side == "long":
             tp = target if target is not None else c + (c - stop) * config.FALLBACK_RR
         else:
@@ -255,7 +268,8 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
         # Профит/риск при входе прямо сейчас — справка, как и в сентябрьском отчёте.
         stop = _stop(side, h, l, atr)
         risk = (c - stop) if side == "long" else (stop - c)
-        target = _target_level(levels, side, c, _min_gap(settings, side, h, l, c))
+        target = _target_level(levels, side, c, _min_gap(settings, side, h, l, c),
+                               _buffer(settings))
         rr = risk_atr = None
         if risk > 0 and atr > 0:
             risk_atr = risk / atr
@@ -280,4 +294,5 @@ def explain(df: pd.DataFrame, levels: list[dict], trend: str,
     # разбор и посчитан: у крипты, валюты и товаров оно разное.
     return {**base, "rules": RULES, "pools": [],
             "min_tp_r": float((settings or {}).get("MIN_TP_R", 0.0) or 0.0),
+            "tp_buffer": _buffer(settings),
             "filters": {"MAX_ENTRY_DIST_ATR": 0, "MAX_RISK_ATR": 0}, "sides": sides}

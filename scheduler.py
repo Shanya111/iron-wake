@@ -182,7 +182,8 @@ async def monitor_signals(bot) -> None:
         min_tp_r = config.JUNE_MIN_TP_R.get(asset_class(code), 0.0)
         for user_id in subscribers:
             settings = {**config.effective(database.get_user_settings(user_id)),
-                        "MIN_TP_R": min_tp_r}
+                        "MIN_TP_R": min_tp_r,
+                        "TP_BUFFER": config.TP_BUFFER_PCT.get(asset_class(code), 0.0)}
             for detector in (rules.detect_spring, rules.detect_upthrust):
                 signal = detector(h1, levels, trend, settings)
                 if signal is None:
@@ -568,7 +569,8 @@ async def monitor_breakout(bot) -> None:
         levels = database.get_levels(code)
         if not levels:
             continue
-        for sig in breakout.detect(df, levels, analyzer.engine_trend(h1_trend)):
+        for sig in breakout.detect(df, levels, analyzer.engine_trend(h1_trend),
+                                   config.TP_BUFFER_PCT.get(asset_class(code), 0.0)):
             sig_id = database.add_breakout_signal(code, sig)
             if sig_id is None:          # тот же пробой уже записан на прошлом круге
                 continue
@@ -721,7 +723,7 @@ async def monitor_ict(bot) -> None:
         except Exception as e:
             print(f"[monitor_ict] {code}: ошибка данных: {e}")
             continue
-        for sig in ict.detect(df):
+        for sig in ict.detect(df, config.TP_BUFFER_PCT.get(asset_class(code), 0.0)):
             if database.add_ict_signal(code, sig) is None:
                 continue        # тот же сетап уже записан либо дедуп по времени
             print(f"[monitor_ict] СИГНАЛ {code} {sig['direction']} "
@@ -920,7 +922,8 @@ def ict_overview() -> str:
             f"Правило: сняли пул ликвидности → импульс с разрывом (FVG) → слом "
             f"структуры → вход по рынку, стоп за манипуляцией + "
             f"{config.ICT_STOP_ATR:g} ATR, цель — встречная ликвидность не ближе "
-            f"{config.ICT_MIN_TP_R:g} риска, срок {config.ICT_EXPIRE_HOURS} ч.")
+            f"{config.ICT_MIN_TP_R:g} риска (тейк не доходя до пула 0.3% цены, "
+            f"у золота, нефти и валюты 0.1%), срок {config.ICT_EXPIRE_HOURS} ч.")
     if not config.ICT_SIGNALS:
         head = "⛔ Стратегия ВЫКЛЮЧЕНА — новых сигналов не будет.\n" + head
     if not rows:
@@ -991,7 +994,8 @@ def breakout_overview() -> str:
          "В СЛЕЖКЕ: сигналы считаются и ведутся, но НИКОМУ НЕ ШЛЮТСЯ."),
         f"Правило: часовая свеча закрылась за СИЛЬНЫМ уровнем (⭐), вход по закрытию, "
         f"стоп за фитилём + {config.BREAKOUT_STOP_ATR:g} ATR, цель — встречный уровень "
-        f"не ближе {config.BREAKOUT_MIN_TP_R:g} рисков, срок {config.BREAKOUT_EXPIRE_HOURS} ч.",
+        f"не ближе {config.BREAKOUT_MIN_TP_R:g} рисков (тейк не доходя до уровня 0.3% "
+        f"цены, у золота и нефти 0.1%), срок {config.BREAKOUT_EXPIRE_HOURS} ч.",
         "",
         f"Всего сигналов: {len(rows)} · открыто: {len(opened)} · закрыто: {len(closed)}",
     ]

@@ -2187,6 +2187,85 @@ def test_open_interest_is_recorded_quietly():
         assert database.get_open_interest("EURUSD") == []
 
 
+# ── Буфер тейка (27.09.2026): тейк НЕ ДОХОДЯ до уровня, минимум — после отступа ──
+
+def test_tp_buffer_values_by_class():
+    """Буфер раздаётся по классу: крипта 0.3%, золото, нефть и валюта 0.1%."""
+    assert config.TP_BUFFER_PCT["crypto"] == 0.003
+    assert config.TP_BUFFER_PCT["commodity"] == 0.001
+    assert config.TP_BUFFER_PCT["fx"] == 0.001
+
+
+def test_june_tp_buffer_stops_short_of_level():
+    """Ложный пробой: тейк на 0.3% цены входа НИЖЕ сопротивления; без буфера — на нём."""
+    df = _spring_df()                       # закрытие 100.5
+    levels = _JUNE_LONG + [{"price": 103.0, "type": "resistance", "strength": "weak"}]
+    assert abs(spring_june.detect_spring(df, levels, trend="up")["take_profit"] - 103.0) < 1e-9
+    sig = spring_june.detect_spring(df, levels, trend="up", settings={"TP_BUFFER": 0.003})
+    assert abs(sig["take_profit"] - (103.0 - 0.003 * 100.5)) < 1e-9
+
+
+def test_june_tp_buffer_min_checked_after_offset():
+    """Уровень проходит минимум сам, но НЕ проходит после отступа — пропускается
+    (вариант «а» владельца), тейк встаёт у следующего."""
+    df = _spring_df()
+    old_risk = 100.5 - 99.0 * (1 - config.STOP_SPREAD)
+    shift = 0.003 * 100.5
+    edge = 100.5 + old_risk + shift / 2     # без отступа дальше минимума, с отступом ближе
+    levels = _JUNE_LONG + [{"price": edge, "type": "resistance", "strength": "weak"},
+                           {"price": 104.0, "type": "resistance", "strength": "weak"}]
+    no_buf = spring_june.detect_spring(df, levels, trend="up", settings={"MIN_TP_R": 1.0})
+    assert abs(no_buf["take_profit"] - edge) < 1e-9          # фикстура различает варианты
+    st = {"MIN_TP_R": 1.0, "TP_BUFFER": 0.003}
+    sig = spring_june.detect_spring(df, levels, trend="up", settings=st)
+    assert abs(sig["take_profit"] - (104.0 - shift)) < 1e-9
+    ex = spring_june.explain(df, levels, "up", st)           # /analyze называет тот же тейк
+    assert abs(ex["sides"]["long"]["target"] - sig["take_profit"]) < 1e-9
+    assert ex["tp_buffer"] == 0.003
+
+
+def test_june_tp_buffer_short_and_fallback():
+    """Шорт — тейк ВЫШЕ поддержки на буфер. Запасная цель (уровня нет) — без отступа."""
+    sig = spring_june.detect_upthrust(_upthrust_df(), _JUNE_SHORT, trend="down",
+                                      settings={"TP_BUFFER": 0.003})
+    assert abs(sig["take_profit"] - (90.0 + 0.003 * 99.5)) < 1e-9
+    df = _spring_df()
+    levels = [{"price": 100.0, "type": "support", "strength": "strong"}]
+    sig = spring_june.detect_spring(df, levels, trend="up", settings={"TP_BUFFER": 0.003})
+    risk = 100.5 - sig["stop_loss"]
+    assert abs(sig["take_profit"] - (100.5 + risk * config.FALLBACK_RR)) < 1e-9
+
+
+def test_breakout_tp_buffer_and_min_after_offset():
+    """Пробой: тейк не доходя до уровня; уровень, ставший с отступом ближе 2 рисков,
+    пропускается, а нет другого — ровно 2 риска без отступа."""
+    df = _breakout_df()                     # закрытие 111.0
+    atr = pattern_detector._atr(df, 23)
+    risk = 111.0 - (107.5 - config.BREAKOUT_STOP_ATR * atr)
+    shift = 0.003 * 111.0
+    far = 111.0 + risk * (config.BREAKOUT_MIN_TP_R + 0.5)
+    sig = breakout.detect(df, _BRK_LEVELS + [
+        {"price": far, "type": "resistance", "strength": "weak"}], buffer_pct=0.003)[0]
+    assert abs(sig["take_profit"] - (far - shift)) < 1e-9
+    edge = 111.0 + risk * config.BREAKOUT_MIN_TP_R + shift / 2
+    levels = _BRK_LEVELS + [{"price": edge, "type": "resistance", "strength": "weak"}]
+    assert abs(breakout.detect(df, levels)[0]["take_profit"] - edge) < 1e-9
+    sig = breakout.detect(df, levels, buffer_pct=0.003)[0]
+    assert abs(sig["take_profit"] - (111.0 + config.BREAKOUT_MIN_TP_R * risk)) < 1e-9
+
+
+def test_ict_tp_buffer_stops_short_of_pool():
+    """ICT: тейк не доходя до пула ликвидности на буфер; запасные 2 риска — без отступа."""
+    rows = _ict_rows()
+    rows[10] = (100.0, 112.0, 99.5, 100.0, 100.0)      # ликвидность сверху: 112.0
+    df = _df(rows)
+    sig = ict.detect(df, buffer_pct=0.003)[0]
+    assert abs(sig["take_profit"] - (112.0 - 0.003 * sig["entry_price"])) < 1e-9
+    sig = ict.detect(_df(_ict_rows()), buffer_pct=0.003)[0]
+    risk = sig["entry_price"] - sig["stop_loss"]
+    assert abs(sig["take_profit"] - (sig["entry_price"] + config.ICT_FALLBACK_RR * risk)) < 1e-9
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     passed = 0

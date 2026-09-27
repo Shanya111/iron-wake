@@ -1078,7 +1078,9 @@ def _format_engine_view(info: dict, ex: dict, zones: list[dict], ob: dict | None
         lines += [f"     Стоп — за фитилём свечи плюс {config.JUNE_STOP_ATR:g} ATR",
                   "     Цель — ближайший встречный уровень" + (
                       f", но не ближе {min_tp_r:g} риска"
-                      if min_tp_r else ", какой есть")]
+                      if min_tp_r else ", какой есть") + (
+                      f"; тейк не доходя до уровня {ex['tp_buffer'] * 100:g}% цены"
+                      if ex.get("tp_buffer") else "")]
     else:
         f = ex["filters"]
         fl = ["вход у уровня " + (f"≤ {f['MAX_ENTRY_DIST_ATR']:g} ATR"
@@ -1201,6 +1203,8 @@ def _analysis_prompt(info: dict, ex: dict, zones: list[dict],
             f"свечи плюс {config.JUNE_STOP_ATR:g} ATR; цель — ближайший встречный уровень"
             + (f" не ближе {ex.get('min_tp_r', 0):g} риска сделки"
                if ex.get("min_tp_r") else ", какой есть")
+            + (f"; тейк стоит не доходя до уровня {ex['tp_buffer'] * 100:g}% цены"
+               if ex.get("tp_buffer") else "")
             + ". Силы отбоя, свежего пересечения, пулов ликвидности и ожидания "
             "возврата у него НЕТ — не упоминай их.")
     out.append("Прокомментируй расклад.")
@@ -1235,7 +1239,8 @@ async def _do_analyze(message: Message, code: str, user_id: int):
     # MIN_TP_R кладём сюда же: минимальная цель зависит от рынка (крипта / валюта /
     # товары) и должна быть той же, по которой уходит сигнал.
     settings = {**config.effective(database.get_user_settings(user_id)),
-                "MIN_TP_R": config.JUNE_MIN_TP_R.get(asset_class(code), 0.0)}
+                "MIN_TP_R": config.JUNE_MIN_TP_R.get(asset_class(code), 0.0),
+                "TP_BUFFER": config.TP_BUFFER_PCT.get(asset_class(code), 0.0)}
     # Разбор — по тем же правилам, по которым бот шлёт сигналы (с 15.09.2026 это
     # редакция 23 июня, см. engine.spring_rules).
     rules = engine.spring_rules()
